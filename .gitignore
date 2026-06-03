@@ -1,0 +1,16 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserdatad/
+xcuserdata/
+xcshareddata/
+
+# macOS
+.DS_Store
+
+# SwiftPM
+.build/
+Package.resolved
+
+# Temporary
+*.swp
