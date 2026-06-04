@@ -560,8 +560,11 @@ struct ContentView: View {
 		// Attach a WindowAccessor so we can set window-level defaults like
 		// preferring tabs for this app's windows.
 		.background(WindowAccessor { window in
-			// Prefer tabbed windows for the main content window as well.
+			// Shared tabbing identifier so the main window and folder windows
+			// (opened via openWindow(id: "folder", value: url)) group into the
+			// same NSWindow tab set instead of opening as separate windows.
 			window?.tabbingMode = .preferred
+			window?.tabbingIdentifier = "PictureViewerGallery"
 		})
 		.onAppear {
 			// Initialize displayed photos immediately so the UI shows
