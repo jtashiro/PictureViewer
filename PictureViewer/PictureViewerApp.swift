@@ -115,7 +115,7 @@ struct PictureViewerApp: App {
 			if requirePasswordAtLaunch {
 				if authManager.isAuthenticated {
 					if let url {
-						ContentView()
+						ContentView(initialFolder: url)
 							.environmentObject(authManager)
 					}
 				} else {
@@ -123,7 +123,7 @@ struct PictureViewerApp: App {
 				}
 			} else {
 				if let url {
-					ContentView()
+					ContentView(initialFolder: url)
 						.environmentObject(authManager)
 				}
 			}
