@@ -63,6 +63,13 @@ final class PhotoLibrary {
 		// work doesn't inherit the MainActor. UI updates (small publishes)
 		// are still performed on the main actor.
 		currentScan = Task.detached { [weak self] in
+			// Strongly capture self for the duration of this task where
+			// needed; if the Content object has been deallocated just
+			// return early.
+			guard let strongSelf = self else {
+				if startedAccess { folder.stopAccessingSecurityScopedResource() }
+				return
+			}
 			defer {
 				if startedAccess {
 					folder.stopAccessingSecurityScopedResource()
@@ -73,55 +80,46 @@ final class PhotoLibrary {
 
 				// Publish the batch to the UI on the main actor. Keep this
 				// as a small, single hop to avoid prolonged main-thread work.
-				await MainActor.run {
-					self?.photos.append(contentsOf: batch)
-				}
+				await MainActor.run { strongSelf.photos.append(contentsOf: batch) }
 
-				// Get the published total on the main actor so we don't
-				// reference main-actor-isolated state from this detached
-				// context. Then log on the main actor and update telemetry
-				// from the background task.
-				let total = await MainActor.run { self?.photos.count ?? 0 }
-				Self.logger.log("scan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)")
+				// Get the published total on the main actor and log on the
+				// main actor to satisfy Swift's actor isolation rules.
+				let total = await MainActor.run { strongSelf.photos.count }
+				await MainActor.run { Self.logger.log("scan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)") }
+
 				await Telemetry.shared.recordFound(batch.count)
 				await Telemetry.shared.recordBatchYield()
 
 				// Kick off face processing for this batch in background.
-				// Respect the user preference `enableFaceRecognition` (default
-				// disabled). The FaceProcessor itself limits concurrency so we
-				// can safely spawn a detached task per batch when enabled.
 				let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
 				if faceEnabled {
 					Task.detached(priority: .utility) {
-						Self.logger.log("scheduling face processing for batch of \(batch.count, privacy: .public) items")
+						await MainActor.run { Self.logger.log("scheduling face processing for batch of \(batch.count, privacy: .public) items") }
 						for item in batch {
 							if Task.isCancelled { break }
 							_ = await FaceProcessor.shared.process(file: item.url)
 						}
 					}
 				} else {
-					// Log that face processing was skipped due to user
-					// preference.
-					Self.logger.log("face processing skipped for batch (enableFaceRecognition=false)")
+					await MainActor.run { Self.logger.log("face processing skipped for batch (enableFaceRecognition=false)") }
 				}
 			}
 
 			// Finished scanning; update state on main actor.
 			await MainActor.run {
-				guard let self = self else { return }
-				self.isScanning = false
+				strongSelf.isScanning = false
 				if !Task.isCancelled {
 					let now = Date()
-					self.lastScanDate = now
-					self.lastScanDuration = now.timeIntervalSince(start)
+					strongSelf.lastScanDate = now
+					strongSelf.lastScanDuration = now.timeIntervalSince(start)
 					// Persist the discovered photo list to disk so the app can
 					// restore quickly on subsequent launches without re-scanning.
-					let snapshot = self.photos
-					let duration = self.lastScanDuration ?? 0
+					let snapshot = strongSelf.photos
+					let duration = strongSelf.lastScanDuration ?? 0
 					let snapshotCount = snapshot.count
 					Task.detached(priority: .background) {
 						PhotoLibrary.persistCachedSnapshot(snapshot, for: folder)
-						Self.logger.log("scan:finished photos=\(snapshotCount, privacy: .public) duration=\(duration, privacy: .public)")
+						await MainActor.run { Self.logger.log("scan:finished photos=\(snapshotCount, privacy: .public) duration=\(duration, privacy: .public)") }
 					}
 					Task.detached { await Telemetry.shared.finishScan() }
 				}
@@ -204,16 +202,18 @@ final class PhotoLibrary {
 	nonisolated func appendScan(folder: URL) {
 		let startedAccess = folder.startAccessingSecurityScopedResource()
 		Task.detached { [weak self] in
+			guard let strongSelf = self else {
+				if startedAccess { folder.stopAccessingSecurityScopedResource() }
+				return
+			}
 			defer {
 				if startedAccess { folder.stopAccessingSecurityScopedResource() }
 			}
 			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
 				if Task.isCancelled { break }
-				await MainActor.run {
-					self?.photos.append(contentsOf: batch)
-				}
-				let total = await MainActor.run { self?.photos.count ?? 0 }
-				Self.logger.log("appendScan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)")
+				await MainActor.run { strongSelf.photos.append(contentsOf: batch) }
+				let total = await MainActor.run { strongSelf.photos.count }
+				await MainActor.run { Self.logger.log("appendScan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)") }
 				await Telemetry.shared.recordFound(batch.count)
 			}
 		}
