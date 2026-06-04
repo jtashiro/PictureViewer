@@ -521,6 +521,9 @@ struct ContentView: View {
 	private static var didPerformLaunchRestore: Bool = false
 	// Names of the active folders (used for multi-folder tab title)
 	@State private var activeFolderNames: [String] = []
+	// Resolved URLs for each persisted bookmark; populated by reloadBookmarks()
+	// and consumed by the toolbar bookmark dropdown.
+	@State private var bookmarkURLs: [URL] = []
 
 	// Deduper used for multi-folder scans to avoid showing duplicate
 	// basenames when combining results from multiple folders. We perform
@@ -574,6 +577,7 @@ struct ContentView: View {
 			// startup "beach ball" when the system is busy handling the
 			// auth transition.
 			displayedPhotos = library.photos
+			reloadBookmarks()
 			// If this ContentView was opened with a seed folder
 			// (per-folder window opened via openWindow(id:"folder", value:url)),
 			// scan that folder directly and skip launch restoration.
@@ -1160,6 +1164,18 @@ struct ContentView: View {
 					Image(systemName: "person.2.fill")
 				}
 				.help("People")
+				if !bookmarkURLs.isEmpty {
+					Menu {
+						ForEach(bookmarkURLs, id: \.self) { url in
+							Button(url.lastPathComponent) {
+								openWindow(id: "folder", value: url)
+							}
+						}
+					} label: {
+						Image(systemName: "bookmark")
+					}
+					.help("Open a bookmarked folder in a new tab")
+				}
 				// Edit / selection controls
 				Button {
 					selectionMode.toggle()
@@ -1254,6 +1270,31 @@ struct ContentView: View {
 	
 	// MARK: - Actions
 
+	/// Resolve persisted folder bookmarks and start security-scoped access
+	/// for each. Populates `bookmarkURLs` for the toolbar dropdown.
+	private func reloadBookmarks() {
+		guard let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data], !arr.isEmpty else {
+			bookmarkURLs = []
+			return
+		}
+		var resolved: [URL] = []
+		for bm in arr {
+			var stale = false
+			do {
+				let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
+				if url.startAccessingSecurityScopedResource() {
+					if !Self.activeSecurityScopedURLs.contains(url) {
+						Self.activeSecurityScopedURLs.append(url)
+					}
+				}
+				resolved.append(url)
+			} catch {
+				logger.error("reloadBookmarks: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
+			}
+		}
+		bookmarkURLs = resolved
+	}
+
 	private func chooseFolder() {
 		let panel = NSOpenPanel()
 		panel.canChooseFiles = false
@@ -1282,6 +1323,7 @@ struct ContentView: View {
 				if let first = bookmarkDatas.first {
 					UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
 				}
+				reloadBookmarks()
 			}
 
 			// Try to start security access for each folder. Keep the first as
