@@ -9,23 +9,7 @@ actor FaceDatabaseActor {
 
 	init(baseURL: URL?) {
 		self.baseURL = baseURL
-		// Initialize with an empty database synchronously to satisfy
-		// the actor's invariant, then asynchronously load the on-disk
-		// copy. Loading may be main-actor-isolated; perform that work
-		// off this initializer and assign back to the actor when done.
-		self.db = FaceDatabase()
-
-		Task.detached { [weak self] in
-			// If FaceDatabase.load is main-actor-isolated, run it on the
-			// MainActor. Otherwise this simply executes the load.
-			let loaded = await MainActor.run { FaceDatabase.load(from: baseURL) }
-			// Assign back to the actor instance on its own isolation.
-			await self?.replaceDB(loaded)
-		}
-	}
-
-	private func replaceDB(_ newDB: FaceDatabase) {
-		self.db = newDB
+		self.db = FaceDatabase.load(from: baseURL)
 	}
 
 	func faceIDs(forPath path: String) -> [UUID] {
