@@ -194,7 +194,17 @@ final class ThumbnailCache: @unchecked Sendable {
 	}
 
 	private func cost(of image: NSImage) -> Int {
+		// Try to compute an accurate in-memory byte size by using a
+		// CGImage if available (provides bytesPerRow * height). Fall
+		// back to an NSBitmapImageRep if that is present, and finally
+		// to a conservative 4 bytes-per-pixel estimate.
+		if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+			return cg.bytesPerRow * cg.height
+		}
+		if let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) {
+			return rep.bytesPerRow * rep.pixelsHigh
+		}
 		let pixels = Int(image.size.width * image.size.height)
-		return pixels * 4
+		return max(1, pixels * 4)
 	}
 }
