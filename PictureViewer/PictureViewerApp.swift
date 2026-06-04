@@ -154,29 +154,5 @@ struct PictureViewerApp: App {
 				SettingsView()
 			}
 		}
-	
-		// Dedicated People window so users can open the People browser in a
-		// separate window rather than a sheet. Use Bool as the value type so
-		// it conforms to the required protocols; callers can pass `true` when
-		// opening the window.
-		WindowGroup(id: "people", for: Bool.self) { _ in
-			PeopleView()
-		}
-		.windowResizability(.contentSize)
-
-		Settings {
-			if requirePasswordAtLaunch {
-				if authManager.isAuthenticated {
-					SettingsView()
-				} else {
-					LockView()
-						.environmentObject(authManager)
-				}
-			} else {
-				// If password protection is disabled, allow access to Settings
-				// so the user can change other preferences.
-				SettingsView()
-			}
-		}
 	}
 }
