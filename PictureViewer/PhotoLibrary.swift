@@ -82,7 +82,7 @@ final class PhotoLibrary {
 				// context. Then log on the main actor and update telemetry
 				// from the background task.
 				let total = await MainActor.run { self?.photos.count ?? 0 }
-				await MainActor.run { Self.logger.log("scan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)") }
+				Self.logger.log("scan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)")
 				await Telemetry.shared.recordFound(batch.count)
 				await Telemetry.shared.recordBatchYield()
 
@@ -93,7 +93,7 @@ final class PhotoLibrary {
 				let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
 				if faceEnabled {
 					Task.detached(priority: .utility) {
-						await MainActor.run { Self.logger.log("scheduling face processing for batch of \(batch.count, privacy: .public) items") }
+						Self.logger.log("scheduling face processing for batch of \(batch.count, privacy: .public) items")
 						for item in batch {
 							if Task.isCancelled { break }
 							_ = await FaceProcessor.shared.process(file: item.url)
@@ -102,7 +102,7 @@ final class PhotoLibrary {
 				} else {
 					// Log that face processing was skipped due to user
 					// preference.
-					await MainActor.run { Self.logger.log("face processing skipped for batch (enableFaceRecognition=false)") }
+					Self.logger.log("face processing skipped for batch (enableFaceRecognition=false)")
 				}
 			}
 
@@ -121,7 +121,7 @@ final class PhotoLibrary {
 					let snapshotCount = snapshot.count
 					Task.detached(priority: .background) {
 						PhotoLibrary.persistCachedSnapshot(snapshot, for: folder)
-						await MainActor.run { Self.logger.log("scan:finished photos=\(snapshotCount, privacy: .public) duration=\(duration, privacy: .public)") }
+						Self.logger.log("scan:finished photos=\(snapshotCount, privacy: .public) duration=\(duration, privacy: .public)")
 					}
 					Task.detached { await Telemetry.shared.finishScan() }
 				}
@@ -213,7 +213,7 @@ final class PhotoLibrary {
 					self?.photos.append(contentsOf: batch)
 				}
 				let total = await MainActor.run { self?.photos.count ?? 0 }
-				await MainActor.run { Self.logger.log("appendScan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)") }
+				Self.logger.log("appendScan:batch yielded=\(batch.count, privacy: .public) total=\(total, privacy: .public)")
 				await Telemetry.shared.recordFound(batch.count)
 			}
 		}

@@ -136,20 +136,45 @@ final class MetadataCache {
 		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
 		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return nil }
 
-		// Create a local DateFormatter per call. Creating a formatter is
-		// somewhat expensive, but it's safer than sharing a single
-		// DateFormatter across threads. In practice the metadata read and
-		// image decoding dominate the cost.
-		let formatter = DateFormatter()
-		formatter.locale = Locale(identifier: "en_US_POSIX")
-		formatter.timeZone = .current
-		formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+		// Parse fixed EXIF date format "yyyy:MM:dd HH:mm:ss" manually
+		// to avoid allocating a DateFormatter on every metadata read.
+		func parseExifDateString(_ s: String) -> Date? {
+			// Expected length: 19
+			guard s.count >= 19 else { return nil }
+			// Fast manual parse by extracting numeric components
+			// yyyy:MM:dd HH:mm:ss
+			let chars = Array(s)
+			func num(_ i: Int, _ j: Int) -> Int? {
+				guard i >= 0, j < chars.count, i <= j else { return nil }
+				var v = 0
+				for k in i...j {
+					let c = chars[k]
+					guard let d = c.wholeNumberValue else { return nil }
+					v = v * 10 + d
+				}
+				return v
+			}
+
+			guard let year = num(0,3), let month = num(5,6), let day = num(8,9),
+				  let hour = num(11,12), let minute = num(14,15), let second = num(17,18)
+			else { return nil }
+
+			var comps = DateComponents()
+			comps.year = year
+			comps.month = month
+			comps.day = day
+			comps.hour = hour
+			comps.minute = minute
+			comps.second = second
+			comps.timeZone = TimeZone.current
+			return Calendar.current.date(from: comps)
+		}
 
 		if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] {
-			if let dt = exif[kCGImagePropertyExifDateTimeOriginal] as? String, let d = formatter.date(from: dt) { return d }
+			if let dt = exif[kCGImagePropertyExifDateTimeOriginal] as? String, let d = parseExifDateString(dt) { return d }
 		}
 		if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-			if let dt = tiff[kCGImagePropertyTIFFDateTime] as? String, let d = formatter.date(from: dt) { return d }
+			if let dt = tiff[kCGImagePropertyTIFFDateTime] as? String, let d = parseExifDateString(dt) { return d }
 		}
 		return nil
 	}
