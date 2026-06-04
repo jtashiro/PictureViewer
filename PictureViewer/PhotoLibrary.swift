@@ -233,7 +233,7 @@ final class PhotoLibrary {
 		return paths.map { URL(fileURLWithPath: $0) }
 	}
 
-	nonisolated private static func safeFilename(for key: String) -> String {
+	nonisolated static func safeFilename(for key: String) -> String {
 		// Base64 the path then make it URL-safe so it can be used as a file name.
 		let b64 = Data(key.utf8).base64EncodedString()
 		let safe = b64.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")

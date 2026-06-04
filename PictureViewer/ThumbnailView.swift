@@ -12,195 +12,199 @@ import os
 private let thumbViewLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-view")
 
 struct ThumbnailView: View {
-    let url: URL
-    let size: CGFloat
-    /// Bumping this value forces the thumbnail to be reloaded from source,
-    /// bypassing both memory and disk caches. Used by the "Refresh
-    /// Thumbnails" button.
-    let refreshToken: UUID
+	let url: URL
+	let size: CGFloat
+	/// Optional namespace (tab name) used to separate thumbnail caches per tab.
+	let namespace: String? = nil
+	/// Bumping this value forces the thumbnail to be reloaded from source,
+	/// bypassing both memory and disk caches. Used by the "Refresh
+	/// Thumbnails" button.
+	let refreshToken: UUID
 
-    @State private var image: NSImage?
-    @State private var loadFailed = false
-    @State private var metadataState: MetadataState = .none
-    @State private var embeddedKeywords: [String] = []
-    // Default to false so thumbnails load by default. Setting this to true
-    // defers thumbnail loading at app launch (can help avoid startup spikes).
-    @AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
+	@State private var image: NSImage?
+	@State private var loadFailed = false
+	@State private var metadataState: MetadataState = .none
+	@State private var embeddedKeywords: [String] = []
+	// Default to false so thumbnails load by default. Setting this to true
+	// defers thumbnail loading at app launch (can help avoid startup spikes).
+	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
 
-    var body: some View {
-        VStack(spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color(nsColor: .windowBackgroundColor))
+	var body: some View {
+		VStack(spacing: 4) {
+			ZStack {
+				RoundedRectangle(cornerRadius: 6)
+					.fill(Color(nsColor: .windowBackgroundColor))
 
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .padding(2)
-                } else if loadFailed {
-                    Image(systemName: "photo.badge.exclamationmark")
-                        .imageScale(.large)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
-            .frame(width: size, height: size)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-            )
-            .overlay(alignment: .topLeading) {
-                if metadataState == .embedded {
-                    Image(systemName: "tag.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.white)
-                        .padding(6)
-                        .background(Circle().fill(Color.green))
-                        .offset(x: 6, y: 6)
-                        .help("Embedded metadata present")
-                }
-            }
+				if let image {
+					Image(nsImage: image)
+						.resizable()
+						.scaledToFit()
+						.padding(2)
+				} else if loadFailed {
+					Image(systemName: "photo.badge.exclamationmark")
+						.imageScale(.large)
+						.foregroundStyle(.secondary)
+				} else {
+					ProgressView()
+						.controlSize(.small)
+				}
+			}
+			.frame(width: size, height: size)
+			.overlay(
+				RoundedRectangle(cornerRadius: 6)
+					.stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+			)
+			.overlay(alignment: .topLeading) {
+				if metadataState == .embedded {
+					Image(systemName: "tag.fill")
+						.font(.caption2)
+						.foregroundStyle(.white)
+						.padding(6)
+						.background(Circle().fill(Color.green))
+						.offset(x: 6, y: 6)
+						.help("Embedded metadata present")
+				}
+			}
 
-            // Filename and keywords shown below the thumbnail. Keywords are
-            // displayed on a separate, secondary-styled line.
-            Text(url.lastPathComponent)
-                .font(.caption2)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: size)
-                .foregroundStyle(.primary)
+			// Filename and keywords shown below the thumbnail. Keywords are
+			// displayed on a separate, secondary-styled line.
+			Text(url.lastPathComponent)
+				.font(.caption2)
+				.lineLimit(1)
+				.truncationMode(.middle)
+				.frame(maxWidth: size)
+				.foregroundStyle(.primary)
 
-            if !embeddedKeywords.isEmpty {
-                Text(embeddedKeywords.joined(separator: ", "))
-                    .font(.caption2)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: size)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .help(url.lastPathComponent)
-        .task(id: TaskID(url: url, refreshToken: refreshToken)) {
-            await loadThumbnail()
-            // Also update metadata indicator asynchronously
-            await updateMetadataState()
-        }
-    }
+			if !embeddedKeywords.isEmpty {
+				Text(embeddedKeywords.joined(separator: ", "))
+					.font(.caption2)
+					.lineLimit(1)
+					.truncationMode(.tail)
+					.frame(maxWidth: size)
+					.foregroundStyle(.secondary)
+			}
+		}
+		.help(url.lastPathComponent)
+		.task(id: ThumbnailTaskID(url: url, refreshToken: refreshToken, namespace: namespace)) {
+			await loadThumbnail()
+			// Also update metadata indicator asynchronously
+			await updateMetadataState()
+		}
+	}
 
-    private struct TaskID: Equatable, Hashable {
-        let url: URL
-        let refreshToken: UUID
-    }
+	private struct ThumbnailTaskID: Equatable, Hashable {
+		let url: URL
+		let refreshToken: UUID
+		let namespace: String?
+	}
 
-    private func loadThumbnail() async {
-        image = nil
-        loadFailed = false
+	private func loadThumbnail() async {
+		image = nil
+		loadFailed = false
 
-        if disableThumbnailLoadingAtLaunch {
-            thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")
-            return
-        }
+		if disableThumbnailLoadingAtLaunch {
+			thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")
+			return
+		}
 
-        let target = url
+		let target = url
 
-        // 1) Try the persistent cache off the main thread.
-        let cacheLookup = Task.detached(priority: .userInitiated) {
-            await ThumbnailCache.shared.image(for: target)
-        }
-        if let cached = await cacheLookup.value {
-            if Task.isCancelled { return }
-            image = cached
-            return
-        }
+		// 1) Try the persistent cache off the main thread.
+		let ns = namespace
+		let cacheLookup = Task.detached(priority: .userInitiated) {
+			await ThumbnailCache.shared.image(for: target, namespace: ns)
+		}
+		if let cached = await cacheLookup.value {
+			if Task.isCancelled { return }
+			image = cached
+			return
+		}
 
-        // 2) Start a small, fast low-resolution preview generation so the
-        // user sees something immediately while the high-quality QuickLook
-        // thumbnail is generated. Both tasks are child tasks of the view's
-        // `.task` so they are cancelled when the view is recycled.
-        Task.detached(priority: .utility) {
-            // Fast low-res thumbnail via ImageIO
-            if !Task.isCancelled {
-                if let src = CGImageSourceCreateWithURL(target as CFURL, nil) {
-                    let opts: [CFString: Any] = [
-                        kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-                        kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceThumbnailMaxPixelSize: 128
-                    ]
-                    if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
-                        let low = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                        await MainActor.run {
-                            if !Task.isCancelled && image == nil {
-                                image = low
-                            }
-                        }
-                    }
-                }
-            }
-        }
+		// 2) Start a small, fast low-resolution preview generation so the
+		// user sees something immediately while the high-quality QuickLook
+		// thumbnail is generated. Both tasks are child tasks of the view's
+		// `.task` so they are cancelled when the view is recycled.
+		Task.detached(priority: .utility) {
+			// Fast low-res thumbnail via ImageIO
+			if !Task.isCancelled {
+				if let src = CGImageSourceCreateWithURL(target as CFURL, nil) {
+					let opts: [CFString: Any] = [
+						kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+						kCGImageSourceCreateThumbnailWithTransform: true,
+						kCGImageSourceThumbnailMaxPixelSize: 128
+					]
+					if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+						let low = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+						await MainActor.run {
+							if !Task.isCancelled && image == nil {
+								image = low
+							}
+						}
+					}
+				}
+			}
+		}
 
-        // 3) Generate the high-quality thumbnail (QuickLook) in a child
-        // task so the UI remains responsive; when complete it replaces the
-        // low-res preview.
-        Task.detached(priority: .utility) {
-            do {
-                let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: target)
-                // Store to cache (mem+disk) off the main actor.
-                await ThumbnailCache.shared.store(nsImage, for: target)
-                // Publish to UI on the main actor if still relevant.
-                await MainActor.run {
-                    if !Task.isCancelled {
-                        image = nsImage
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    if !Task.isCancelled {
-                        loadFailed = true
-                    }
-                }
-            }
-        }
-    }
+		// 3) Generate the high-quality thumbnail (QuickLook) in a child
+		// task so the UI remains responsive; when complete it replaces the
+		// low-res preview.
+		Task.detached(priority: .utility) {
+			do {
+				let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: target)
+				// Store to cache (mem+disk) off the main actor.
+				await ThumbnailCache.shared.store(nsImage, for: target, namespace: namespace)
+				// Publish to UI on the main actor if still relevant.
+				await MainActor.run {
+					if !Task.isCancelled {
+						image = nsImage
+					}
+				}
+			} catch {
+				await MainActor.run {
+					if !Task.isCancelled {
+						loadFailed = true
+					}
+				}
+			}
+		}
+	}
 
-    private enum MetadataState {
-        case none
-        case embedded
-    }
+	private enum MetadataState {
+		case none
+		case embedded
+	}
 
-    private func updateMetadataState() async {
-        var foundEmbedded = false
-        var kws: [String] = []
-        if let src = CGImageSourceCreateWithURL(url as CFURL, nil), let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
-            // IPTC keywords
-            if let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any] {
-                if let arr = iptc[kCGImagePropertyIPTCKeywords] as? [Any] {
-                    for v in arr {
-                        if let s = v as? String, !s.isEmpty { kws.append(s) }
-                    }
-                }
-            }
+	private func updateMetadataState() async {
+		var foundEmbedded = false
+		var kws: [String] = []
+		if let src = CGImageSourceCreateWithURL(url as CFURL, nil), let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+			// IPTC keywords
+			if let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any] {
+				if let arr = iptc[kCGImagePropertyIPTCKeywords] as? [Any] {
+					for v in arr {
+						if let s = v as? String, !s.isEmpty { kws.append(s) }
+					}
+				}
+			}
 
-            // EXIF user comment (treat as a keyword-like freeform string)
-            if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any], let user = exif[kCGImagePropertyExifUserComment] as? String, !user.isEmpty {
-                foundEmbedded = true
-                kws.append(user)
-            }
+			// EXIF user comment (treat as a keyword-like freeform string)
+			if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any], let user = exif[kCGImagePropertyExifUserComment] as? String, !user.isEmpty {
+				foundEmbedded = true
+				kws.append(user)
+			}
 
-            // TIFF image description
-            if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any], let desc = tiff[kCGImagePropertyTIFFImageDescription] as? String, !desc.isEmpty {
-                foundEmbedded = true
-                kws.append(desc)
-            }
+			// TIFF image description
+			if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any], let desc = tiff[kCGImagePropertyTIFFImageDescription] as? String, !desc.isEmpty {
+				foundEmbedded = true
+				kws.append(desc)
+			}
 
-            if !kws.isEmpty { foundEmbedded = true }
-        }
+			if !kws.isEmpty { foundEmbedded = true }
+		}
 
-        await MainActor.run {
-            metadataState = foundEmbedded ? .embedded : .none
-            embeddedKeywords = kws
-        }
-    }
+		await MainActor.run {
+			metadataState = foundEmbedded ? .embedded : .none
+			embeddedKeywords = kws
+		}
+	}
 }
