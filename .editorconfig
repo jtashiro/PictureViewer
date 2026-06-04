@@ -1,0 +1,15 @@
+# EditorConfig helps maintain consistent coding styles between different editors
+# This project defaults to using tabs for indentation.
+root = true
+
+[*.{swift,swiftui}]
+indent_style = tab
+indent_size = tab
+insert_final_newline = true
+
+[*.{json,plist}]
+indent_style = space
+indent_size = 2
+
+[Makefile]
+indent_style = tab
