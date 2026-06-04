@@ -35,6 +35,12 @@ struct ContentView: View {
 		}
 	}
 
+	@State private var initialFolderURL: URL?
+
+	init(initialFolder: URL? = nil) {
+		_initialFolderURL = State(initialValue: initialFolder)
+	}
+
 	/// Restore a persisted security-scoped bookmark (if present) and start
 	/// accessing the resource so the app can write into the folder while
 	/// sandboxed. This is safe to call at startup.
@@ -66,93 +72,18 @@ struct ContentView: View {
 
 			guard !resolvedFolders.isEmpty else { return }
 
-			// If a combined snapshot exists that matches these folders, prefer
-			// restoring it as it provides a faster single-file restore path.
-			if let (combinedURLs, combinedFolders) = PhotoLibrary.loadCombinedSnapshot() {
-				let resolvedPaths = Set(resolvedFolders.map { $0.path })
-				let combinedFolderPaths = Set(combinedFolders.map { $0.path })
-				if combinedFolderPaths.isSubset(of: resolvedPaths) {
-					// Use the combined snapshot directly
-					await MainActor.run {
-						library.photos = combinedURLs.map { PhotoItem(url: $0) }
-						library.folderURL = resolvedFolders.first
-						// Reflect multi-folder selection in the UI title
-						activeFolderNames = resolvedFolders.map { $0.lastPathComponent }
-						library.lastScanDate = Date()
-					}
-					// Also kick off per-folder reconciliation scans in background
-					for folder in resolvedFolders {
-						library.appendScan(folder: folder)
-					}
-					return
-				}
-			}
-
-			Task.detached {
-				var combined: [URL] = []
-				var seen: Set<String> = []
-				for folder in resolvedFolders {
-					if let urls = PhotoLibrary.loadCachedSnapshot(for: folder) {
-						for u in urls {
-							let name = u.lastPathComponent.lowercased()
-							if seen.insert(name).inserted { combined.append(u) }
-						}
-					}
-				}
-
-				if combined.isEmpty {
-					// No snapshots available; publish primary folder only.
-					await MainActor.run { library.folderURL = resolvedFolders.first }
-					return
-				}
-
-				let batchSize = 256
-					await MainActor.run { library.photos = []; library.folderURL = resolvedFolders.first; activeFolderNames = resolvedFolders.map { $0.lastPathComponent } }
-				var idx = 0
-				while idx < combined.count {
-					let end = min(idx + batchSize, combined.count)
-					let slice = combined[idx..<end].map { PhotoItem(url: $0) }
-					await MainActor.run {
-						library.photos.append(contentsOf: slice)
-						library.lastScanDate = Date()
-					}
-
-					// Schedule face processing and warm thumbnails per-batch as before.
-					let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-					if faceEnabled {
-						Task.detached(priority: .utility) {
-							await MainActor.run { logger.log("scheduling face processing for restoration batch of \(slice.count, privacy: .public) items") }
-							for item in slice {
-								if Task.isCancelled { break }
-								_ = await FaceProcessor.shared.process(file: item.url)
-							}
-						}
-					} else {
-						await MainActor.run { logger.log("face processing for restoration skipped (enableFaceRecognition=false)") }
-					}
-
-					Task.detached(priority: .utility) {
-						for item in slice {
-							if Task.isCancelled { break }
-							do {
-								let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-								await ThumbnailCache.shared.store(img, for: item.url)
-							} catch { }
-						}
-					}
-
-					idx = end
-					try? await Task.sleep(nanoseconds: 10_000_000)
-				}
-
-				// For multi-folder restores we do not automatically kick off a
-				// full `library.scan(folder:)` because that API assumes a single
-				// canonical folder and would clobber the combined view. Instead
-				// start per-folder reconciliation scans that append discovered
-				// items into the combined view. This allows us to reconcile on
-				// disk changes without replacing the published list.
-				for folder in resolvedFolders {
-					library.appendScan(folder: folder)
+			// Multi-bookmark restore: seed the first bookmark into THIS
+			// ContentView and open additional folder windows for the rest, so
+			// each bookmark becomes its own tab instead of being combined.
+			let first = resolvedFolders[0]
+			let rest = Array(resolvedFolders.dropFirst())
+			await MainActor.run {
+				library.folderURL = first
+				activeFolderNames = [first.lastPathComponent]
+				library.scan(folder: first)
+				for url in rest {
+					logger.log("restoreFolderBookmarkIfNeeded: opening folder window for \(url.path, privacy: .public)")
+					openWindow(id: "folder", value: url)
 				}
 			}
 			return
@@ -640,6 +571,15 @@ struct ContentView: View {
 			// startup "beach ball" when the system is busy handling the
 			// auth transition.
 			displayedPhotos = library.photos
+			// If this ContentView was opened with a seed folder
+			// (per-folder window opened via openWindow(id:"folder", value:url)),
+			// scan that folder directly and skip launch restoration.
+			if let seed = initialFolderURL {
+				library.folderURL = seed
+				activeFolderNames = [seed.lastPathComponent]
+				library.scan(folder: seed)
+				return
+			}
 			// Defer work by a short amount; if responsiveness is still an
 			// issue we can increase the delay or gate more startup tasks.
 			Task.detached(priority: .utility) {
