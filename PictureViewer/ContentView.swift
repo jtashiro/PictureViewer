@@ -1,4 +1,3 @@
-//
 //  ContentView.swift
 //  PictureViewer
 //
@@ -39,7 +38,7 @@ struct ContentView: View {
 	/// Restore a persisted security-scoped bookmark (if present) and start
 	/// accessing the resource so the app can write into the folder while
 	/// sandboxed. This is safe to call at startup.
-	private static func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async {
+	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async {
 		let fm = FileManager.default
 
 		// Prefer multi-bookmark list if available.
@@ -77,6 +76,8 @@ struct ContentView: View {
 					await MainActor.run {
 						library.photos = combinedURLs.map { PhotoItem(url: $0) }
 						library.folderURL = resolvedFolders.first
+						// Reflect multi-folder selection in the UI title
+						activeFolderNames = resolvedFolders.map { $0.lastPathComponent }
 						library.lastScanDate = Date()
 					}
 					// Also kick off per-folder reconciliation scans in background
@@ -106,7 +107,7 @@ struct ContentView: View {
 				}
 
 				let batchSize = 256
-				await MainActor.run { library.photos = []; library.folderURL = resolvedFolders.first }
+					await MainActor.run { library.photos = []; library.folderURL = resolvedFolders.first; activeFolderNames = resolvedFolders.map { $0.lastPathComponent } }
 				var idx = 0
 				while idx < combined.count {
 					let end = min(idx + batchSize, combined.count)
@@ -176,6 +177,7 @@ struct ContentView: View {
 					// app can perform writes across multiple selected folders.
 					if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
 					library.folderURL = url
+					activeFolderNames = [url.lastPathComponent]
 				}
 				// Attempt to load a previously saved snapshot for this folder and
 				// publish it in small batches off the main actor. This avoids a
@@ -247,18 +249,21 @@ struct ContentView: View {
 								// Ensure we still have the same folder before
 								// starting a potentially expensive re-scan.
 								if library.folderURL == url {
-									if deferAtLaunchBackgroundWork {
-										logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag; skipping scan for folder=\(url.path, privacy: .public)")
-									} else {
-										library.scan(folder: url)
-									}
+												// Read the AppStorage-backed flag from UserDefaults here
+												// because this is a static context and instance
+												// properties (like @AppStorage) aren't available.
+												if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
+													logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag; skipping scan for folder=\(url.path, privacy: .public)")
+												} else {
+													library.scan(folder: url)
+												}
 								}
 							}
 						}
 					} else {
 						// No cached snapshot available; retain current behavior
 						// of not auto-scanning at launch.
-						await MainActor.run { library.folderURL = url }
+						await MainActor.run { library.folderURL = url; activeFolderNames = [url.lastPathComponent] }
 					}
 				}
 			} else {
@@ -579,6 +584,26 @@ struct ContentView: View {
 	static let kLastFolderBookmarks = "lastFolderBookmarks"
 	// Active resolved security-scoped URLs (kept open for the app lifetime)
 	private static var activeSecurityScopedURLs: [URL] = []
+	// Track whether we've already attempted the automatic launch-time
+	// restoration. Prevents new tabs created after launch from auto-loading
+	// cached snapshots — instead we will prompt the user to choose a folder.
+	private static var didPerformLaunchRestore: Bool = false
+	// Names of the active folders (used for multi-folder tab title)
+	@State private var activeFolderNames: [String] = []
+
+	// Deduper used for multi-folder scans to avoid showing duplicate
+	// basenames when combining results from multiple folders. We perform
+	// a cross-folder dedupe here because `PhotoLibrary.scanStream` only
+	// deduplicates within a single folder scan.
+	private actor MultiFolderDeduper {
+		private var seen: Set<String> = []
+		func isUnique(_ name: String) -> Bool {
+			let key = name.lowercased()
+			if seen.contains(key) { return false }
+			seen.insert(key)
+			return true
+		}
+	}
 	@State private var folderSecurityURL: URL? = nil // resolved security-scoped URL (if any)
 	@State private var repairResultMessage: String? = nil
 	@State private var showRepairResult: Bool = false
@@ -595,7 +620,9 @@ struct ContentView: View {
 				contentBody
 					.frame(maxWidth: .infinity, maxHeight: .infinity)
 			}
-			.navigationTitle(library.folderURL?.lastPathComponent ?? "Picture Viewer")
+						.navigationTitle(
+							activeFolderNames.isEmpty ? (library.folderURL?.lastPathComponent ?? "Picture Viewer") : (activeFolderNames.count == 1 ? activeFolderNames.first! : activeFolderNames.joined(separator: " · "))
+						)
 			.toolbar { toolbarItems }
 		}
 		.frame(minWidth: 760, minHeight: 540)
@@ -625,9 +652,17 @@ struct ContentView: View {
 				// app is sandboxed. Run this after a short delay so the UI
 				// can finish initial setup first.
 				Task {
-					await Self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
-					await MainActor.run {
-						restoreSavedWindowsIfNeeded()
+					// Only perform the automatic launch restore once. Subsequent
+					// ContentView instances (tabs/windows created after launch)
+					// should not re-load the cached snapshot; leave those
+					// instances blank instead.
+					let didRestore = await MainActor.run { Self.didPerformLaunchRestore }
+					if !didRestore {
+						await self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
+						await MainActor.run { Self.didPerformLaunchRestore = true }
+						await MainActor.run { restoreSavedWindowsIfNeeded() }
+					} else {
+						// No-op for subsequent ContentView instances.
 					}
 				}
 			}
@@ -1319,11 +1354,17 @@ struct ContentView: View {
 				}
 			}
 
+			// Update UI title to reflect selected folders
+			activeFolderNames = urls.map { $0.lastPathComponent }
+
 			// If only one folder selected, reuse the existing scan API which
 			// handles state, telemetry and persistence. For multiple folders
 			// we perform per-folder scans in the background and append the
 			// results into the library so the UI shows a combined view.
 			if urls.count == 1, let url = urls.first {
+				// Single-folder flow: set the active folder name and start
+				// the normal PhotoLibrary scan which handles persistence.
+				activeFolderNames = [url.lastPathComponent]
 				library.scan(folder: url)
 				return
 			}
@@ -1340,42 +1381,59 @@ struct ContentView: View {
 				}
 				let start = Date()
 
+				let crossDeduper = MultiFolderDeduper()
 				await withTaskGroup(of: Void.self) { group in
-					for folder in urls {
-						group.addTask {
-							let startedAccess = folder.startAccessingSecurityScopedResource()
-							defer { if startedAccess { folder.stopAccessingSecurityScopedResource() } }
-							for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
-								if Task.isCancelled { break }
-								await MainActor.run { library.photos.append(contentsOf: batch) }
-								// Background work: telemetry, face processing and
-								// thumbnail warming for each batch.
-								await MainActor.run { Self.logger.log("scan:batch yielded=\(batch.count, privacy: .public) total=\(library.photos.count, privacy: .public)") }
-								Task.detached { await Telemetry.shared.recordFound(batch.count) }
+								for folder in urls {
+										group.addTask {
+											let startedAccess = folder.startAccessingSecurityScopedResource()
+											defer { if startedAccess { folder.stopAccessingSecurityScopedResource() } }
+											for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+												if Task.isCancelled { break }
+												// Filter out items whose basenames were already seen from
+												// other folders.
+												var filtered: [PhotoItem] = []
+												for item in batch {
+													if Task.isCancelled { break }
+													if await crossDeduper.isUnique(item.url.lastPathComponent) {
+														filtered.append(item)
+													}
+												}
+												if filtered.isEmpty { continue }
+												// Capture an immutable copy for use in concurrently-executing tasks
+												let batchCopy = filtered
+												await MainActor.run { library.photos.append(contentsOf: batchCopy) }
+												// Background work: telemetry, face processing and
+												// thumbnail warming for each batch. Use the immutable copy
+												// to avoid capturing a mutable variable in concurrently
+												// executing code (Swift concurrency safety).
+												await MainActor.run { self.logger.log("scan:batch yielded=\(batchCopy.count, privacy: .public) total=\(library.photos.count, privacy: .public)") }
+												Task.detached { await Telemetry.shared.recordFound(batchCopy.count) }
 
-								let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-								if faceEnabled {
-									Task.detached(priority: .utility) {
-										for item in batch {
-											if Task.isCancelled { break }
-											_ = await FaceProcessor.shared.process(file: item.url)
+												let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
+												if faceEnabled {
+													let work = batchCopy
+													Task.detached(priority: .utility) {
+														for item in work {
+															if Task.isCancelled { break }
+															_ = await FaceProcessor.shared.process(file: item.url)
+														}
+													}
+												}
+
+												// Warm thumbnails for this batch.
+												let warm = batchCopy
+												Task.detached(priority: .utility) {
+													for item in warm {
+														if Task.isCancelled { break }
+														do {
+															let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
+															await ThumbnailCache.shared.store(img, for: item.url)
+														} catch { }
+													}
+												}
+											}
 										}
 									}
-								}
-
-								// Warm thumbnails for this batch.
-								Task.detached(priority: .utility) {
-									for item in batch {
-										if Task.isCancelled { break }
-										do {
-											let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-											await ThumbnailCache.shared.store(img, for: item.url)
-										} catch { }
-									}
-								}
-							}
-						}
-					}
 				}
 
 				await MainActor.run {
@@ -1435,9 +1493,10 @@ struct ContentView: View {
 				}
 
 				let res = success
+				let errorCopy = errorMsg
 				await MainActor.run {
 					deleteResults[u] = res
-					deleteErrorMessages[u] = errorMsg
+					deleteErrorMessages[u] = errorCopy
 					deleteProgressCount += 1
 					if res {
 						selectedItems.remove(u)
@@ -1448,8 +1507,8 @@ struct ContentView: View {
 			}
 
 			// Build an error summary for any failures so the UI can show it.
-			var summaryLines: [String] = []
 			await MainActor.run {
+				var summaryLines: [String] = []
 				for (u, msg) in deleteErrorMessages.sorted(by: { $0.key.lastPathComponent < $1.key.lastPathComponent }) {
 					if let m = msg {
 						summaryLines.append("\(u.lastPathComponent): \(m)")
@@ -1544,15 +1603,27 @@ struct ContentView: View {
 				}
 				filtered = matches
 			} else {
-				// Invalid regex: fallback to substring match on filename
+				// Invalid regex: fallback to case-insensitive substring match
+				// against filename _and_ embedded metadata. Previously we only
+				// matched the filename here which made invalid-regex cases
+				// miss metadata. Use the MetadataCache to obtain the cached
+				// candidate string (filename + metadata) for each item.
 				let needle = filter.lowercased()
-				filtered = photos.filter { $0.url.lastPathComponent.lowercased().contains(needle) }
-			}
-		}
+				var matches: [PhotoItem] = []
+				for p in photos {
+					let filename = p.url.lastPathComponent.lowercased()
+					if filename.contains(needle) { matches.append(p); continue }
+					// Check cached candidate string (may perform a lightweight
+					// ImageIO read if not present in the cache).
+					let full = await MetadataCache.shared.candidateString(for: p.url)
+									if full.lowercased().contains(needle) { matches.append(p) }
+									}
+									filtered = matches
+								}
+							}
 
-		// Now perform the requested sort on the filtered list.
-		return await Self.sortPhotos(filtered, mode: mode)
-	}
+							return await Self.sortPhotos(filtered, mode: mode)
+					}
 
 	private static func sortPhotos(_ photos: [PhotoItem], mode: SortMode) async -> [PhotoItem] {
 		switch mode {
@@ -1741,6 +1812,7 @@ struct ContentView: View {
 					await MainActor.run {
 						library.photos = []
 						library.folderURL = folder
+						activeFolderNames = [folder.lastPathComponent]
 					}
 					var idx = 0
 					while idx < deduped.count {
@@ -1801,7 +1873,7 @@ struct ContentView: View {
 							// Ensure we still have the same folder before
 							// starting a potentially expensive re-scan.
 							if library.folderURL == folder {
-								if deferAtLaunchBackgroundWork {
+								if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
 									logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag; skipping scan for folder=\(folder.path, privacy: .public)")
 								} else {
 									library.scan(folder: folder)
@@ -1814,6 +1886,7 @@ struct ContentView: View {
 					// of not auto-scanning at launch.
 					await MainActor.run {
 						library.folderURL = folder
+						activeFolderNames = [folder.lastPathComponent]
 					}
 				}
 			}

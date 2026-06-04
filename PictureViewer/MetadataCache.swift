@@ -92,12 +92,27 @@ final class MetadataCache {
 			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return parts.joined(separator: " ") }
 			guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return parts.joined(separator: " ") }
 
+			func appendValue(_ value: Any) {
+				if let s = value as? String {
+					parts.append(s)
+				} else if let arr = value as? [Any] {
+					for v in arr { appendValue(v) }
+				} else if let nsarr = value as? NSArray {
+					for v in nsarr { appendValue(v) }
+				} else if let dict = value as? [CFString: Any] {
+					for (_, v) in dict { appendValue(v) }
+				} else if let dict = value as? [String: Any] {
+					for (_, v) in dict { appendValue(v) }
+				} else if let num = value as? NSNumber {
+					parts.append(num.stringValue)
+				}
+			}
+
 			func appendDict(_ key: CFString) {
 				if let dict = props[key] as? [CFString: Any] {
-					for (_, value) in dict {
-						if let s = value as? String { parts.append(s) }
-						else if let arr = value as? [String] { parts.append(contentsOf: arr) }
-					}
+					for (_, value) in dict { appendValue(value) }
+				} else if let dict2 = props[key] as? [String: Any] {
+					for (_, value) in dict2 { appendValue(value) }
 				}
 			}
 
