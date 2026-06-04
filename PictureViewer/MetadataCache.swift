@@ -36,7 +36,7 @@ final class MetadataCache {
 		if let v = cacheQueue.sync(execute: { imageDateCache[key] }) { return v }
 
 		await limiter.acquire()
-		defer { limiter.release() }
+		defer { Task { await limiter.release() } }
 
 		// Telemetry: note we're doing a metadata read
 		Task { await Telemetry.shared.recordMetadataRead() }
@@ -59,7 +59,7 @@ final class MetadataCache {
 		if let v = cacheQueue.sync(execute: { fileDateCache[key] }) { return v }
 
 		await limiter.acquire()
-		defer { limiter.release() }
+		defer { Task { await limiter.release() } }
 
 		// Telemetry: note we're doing a metadata read
 		Task { await Telemetry.shared.recordMetadataRead() }
@@ -82,7 +82,7 @@ final class MetadataCache {
 		if let v = cacheQueue.sync(execute: { candidateCache[key] }) { return v }
 
 		await limiter.acquire()
-		defer { limiter.release() }
+		defer { Task { await limiter.release() } }
 
 		// Perform the ImageIO work off the calling thread.
 		let candidate = await Task.detached(priority: .utility) {
