@@ -783,6 +783,13 @@ struct ContentView: View {
 	@State private var vaultProgressCurrentFile: String = ""
 	@State private var showVaultAlert: Bool = false
 	@State private var vaultAlertMessage: String = ""
+	@State private var vaultStatus = PhotoVaultStatus(isConfigured: false, hasLocation: false, hasPassword: false, isUnlocked: false, locationPath: nil)
+	@State private var isShowingVaultUnlockPrompt: Bool = false
+	@State private var vaultUnlockPassword: String = ""
+	@State private var vaultUnlockConfirmation: String = ""
+	@State private var vaultUnlockMessage: String?
+	@State private var vaultStoreTask: Task<Void, Never>?
+	@State private var pendingVaultAutoOpen: Bool = false
 
 	var body: some View {
 		NavigationStack {
@@ -839,6 +846,7 @@ struct ContentView: View {
 				logger.log("launch folder restore: source=initial-folder-window storage=filesystem folder=\(seed.path, privacy: .public)")
 				library.folderURL = seed
 				activeFolderNames = [seed.lastPathComponent]
+				if tryOpenFolderAsVault(seed) { return }
 				library.scan(folder: seed)
 				return
 			}
@@ -1161,6 +1169,15 @@ struct ContentView: View {
 		} message: {
 			Text(vaultAlertMessage)
 		}
+		.sheet(isPresented: $isShowingVaultUnlockPrompt, onDismiss: clearVaultUnlockPrompt) {
+			vaultUnlockPromptView
+		}
+		.task {
+			await refreshVaultStatus()
+		}
+		.onReceive(NotificationCenter.default.publisher(for: .photoVaultStatusChanged)) { _ in
+			Task { await refreshVaultStatus() }
+		}
 		.sheet(isPresented: $isVaultWorking) {
 			VStack(spacing: 12) {
 				Text(vaultProgressMessage)
@@ -1171,16 +1188,28 @@ struct ContentView: View {
 						.font(.caption)
 						.foregroundStyle(.secondary)
 						.monospacedDigit()
-					if !vaultProgressCurrentFile.isEmpty {
-						Text(vaultProgressCurrentFile)
-							.font(.caption)
-							.foregroundStyle(.secondary)
-							.lineLimit(1)
-							.truncationMode(.middle)
-					}
 				} else {
 					ProgressView()
 						.controlSize(.large)
+					if vaultProgressCompleted > 0 {
+						Text("\(vaultProgressCompleted) photo\(vaultProgressCompleted == 1 ? "" : "s") found")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+							.monospacedDigit()
+					}
+				}
+				if !vaultProgressCurrentFile.isEmpty {
+					Text(vaultProgressCurrentFile)
+						.font(.caption)
+						.foregroundStyle(.secondary)
+						.lineLimit(1)
+						.truncationMode(.middle)
+				}
+				if let task = vaultStoreTask {
+					Button("Cancel", role: .cancel) {
+						task.cancel()
+					}
+					.disabled(task.isCancelled)
 				}
 			}
 			.padding()
@@ -1728,6 +1757,18 @@ struct ContentView: View {
 	private var toolbarItems: some ToolbarContent {
 		ToolbarItem(placement: .primaryAction) {
 			Button {
+				toggleVaultLock()
+			} label: {
+				Label(
+					vaultStatus.isUnlocked ? "Lock Vault" : "Unlock Vault",
+					systemImage: vaultStatus.isUnlocked ? "lock.open.fill" : "lock.fill"
+				)
+				.foregroundStyle(vaultStatus.isUnlocked ? Color.green : Color.secondary)
+			}
+			.help(vaultStatus.isUnlocked ? "Encrypted storage is unlocked — click to lock" : "Encrypted storage is locked — click to unlock")
+		}
+		ToolbarItem(placement: .primaryAction) {
+			Button {
 				chooseFolder()
 			} label: {
 				Label("Choose Folder", systemImage: "folder")
@@ -2271,48 +2312,68 @@ struct ContentView: View {
 		let folders = panel.urls
 		guard !folders.isEmpty else { return }
 
+		vaultStoreTask?.cancel()
 		isVaultWorking = true
 		vaultProgressMessage = "Scanning folders..."
-		Task.detached(priority: .userInitiated) {
+		vaultProgressCompleted = 0
+		vaultProgressTotal = 0
+		vaultProgressCurrentFile = ""
+		logger.log("vault import: start scan folders=\(folders.count, privacy: .public)")
+
+		let task = Task.detached(priority: .userInitiated) {
+			// Phase 1: scan folders, reporting the folder currently being walked
+			// and the running count of images discovered so the sheet shows
+			// activity rather than an indeterminate spinner.
 			var imageURLs: [URL] = []
 			for folder in folders {
+				if Task.isCancelled { break }
+				await MainActor.run { vaultProgressCurrentFile = folder.lastPathComponent }
 				let started = folder.startAccessingSecurityScopedResource()
 				defer { if started { folder.stopAccessingSecurityScopedResource() } }
 				for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+					if Task.isCancelled { break }
 					imageURLs.append(contentsOf: batch.map(\.url))
+					let count = imageURLs.count
+					await MainActor.run { vaultProgressCompleted = count }
 				}
 			}
 			let scannedURLs = imageURLs
-			await MainActor.run {
-				storeImagesInVault(scannedURLs, progressMessage: "Importing encrypted photos...")
+			if Task.isCancelled || scannedURLs.isEmpty {
+				let cancelled = Task.isCancelled
+				let found = scannedURLs.count
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					if cancelled {
+						vaultAlertMessage = "Cancelled before any photos were imported."
+					} else {
+						vaultAlertMessage = "No supported images were found in the selected folders."
+					}
+					showVaultAlert = true
+					logger.log("vault import: scan ended cancelled=\(cancelled, privacy: .public) found=\(found, privacy: .public)")
+				}
+				return
 			}
-		}
-	}
-
-	private func importSelectedImagesToVault() {
-		let urls = selectedPhotoURLs
-		logger.log("vault store selected: requested selectedCount=\(urls.count, privacy: .public) allDisplayedActive=\(isAllDisplayedSelectionActive, privacy: .public)")
-		guard !urls.isEmpty else { return }
-		storeImagesInVault(urls, progressMessage: "Storing selected photos...")
-	}
-
-	private func storeImagesInVault(_ urls: [URL], progressMessage: String) {
-		guard !urls.isEmpty else { return }
-		isVaultWorking = true
-		vaultProgressMessage = progressMessage
-		vaultProgressCompleted = 0
-		vaultProgressTotal = urls.count
-		vaultProgressCurrentFile = ""
-		logger.log("vault store: start count=\(urls.count, privacy: .public)")
-		Task.detached(priority: .userInitiated) {
+			await MainActor.run {
+				vaultProgressMessage = "Importing encrypted photos..."
+				vaultProgressCompleted = 0
+				vaultProgressTotal = scannedURLs.count
+				vaultProgressCurrentFile = ""
+				logger.log("vault import: scan complete scanned=\(scannedURLs.count, privacy: .public)")
+			}
+			// Phase 2: parallel encryption
 			do {
-				let workingURLs = try await PhotoVault.shared.importFiles(urls) { completed, total, currentFile in
+				let result = try await PhotoVault.shared.importFiles(scannedURLs) { completed, total, currentFile in
 					await MainActor.run {
 						vaultProgressCompleted = completed
 						vaultProgressTotal = total
 						vaultProgressCurrentFile = currentFile
 					}
 				}
+				let wasCancelled = Task.isCancelled
+				let workingURLs = result.workingURLs
+				let dupCount = result.duplicateCount
+				let failCount = result.failedCount
 				let photos = workingURLs.map { PhotoItem(url: $0) }
 				await MainActor.run {
 					let existing = Set(library.photos.map(\.url))
@@ -2324,20 +2385,255 @@ struct ContentView: View {
 					library.lastScanDuration = nil
 					clearSelection()
 					isVaultWorking = false
-					vaultAlertMessage = "Stored \(workingURLs.count) of \(urls.count) photo\(urls.count == 1 ? "" : "s") in encrypted storage."
+					vaultStoreTask = nil
+					vaultAlertMessage = vaultStoreSummary(
+						stored: workingURLs.count,
+						requested: scannedURLs.count,
+						duplicates: dupCount,
+						failures: failCount,
+						cancelled: wasCancelled
+					)
 					showVaultAlert = true
-					logger.log("vault store: complete requested=\(urls.count, privacy: .public) stored=\(workingURLs.count, privacy: .public)")
+					logger.log("vault store: complete requested=\(scannedURLs.count, privacy: .public) stored=\(workingURLs.count, privacy: .public) duplicates=\(dupCount, privacy: .public) failed=\(failCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public)")
+					scheduleSort()
+				}
+			} catch {
+				let msg = error.localizedDescription
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = msg
+					showVaultAlert = true
+					logger.error("vault store: failed error=\(msg, privacy: .public)")
+				}
+			}
+		}
+		vaultStoreTask = task
+	}
+
+	private func importSelectedImagesToVault() {
+		let urls = selectedPhotoURLs
+		logger.log("vault store selected: requested selectedCount=\(urls.count, privacy: .public) allDisplayedActive=\(isAllDisplayedSelectionActive, privacy: .public)")
+		guard !urls.isEmpty else { return }
+		storeImagesInVault(urls, progressMessage: "Storing selected photos...")
+	}
+
+	private func storeImagesInVault(_ urls: [URL], progressMessage: String) {
+		guard !urls.isEmpty else { return }
+		vaultStoreTask?.cancel()
+		isVaultWorking = true
+		vaultProgressMessage = progressMessage
+		vaultProgressCompleted = 0
+		vaultProgressTotal = urls.count
+		vaultProgressCurrentFile = ""
+		logger.log("vault store: start count=\(urls.count, privacy: .public)")
+		let task = Task.detached(priority: .userInitiated) {
+			do {
+				let result = try await PhotoVault.shared.importFiles(urls) { completed, total, currentFile in
+					await MainActor.run {
+						vaultProgressCompleted = completed
+						vaultProgressTotal = total
+						vaultProgressCurrentFile = currentFile
+					}
+				}
+				let wasCancelled = Task.isCancelled
+				let workingURLs = result.workingURLs
+				let dupCount = result.duplicateCount
+				let failCount = result.failedCount
+				let photos = workingURLs.map { PhotoItem(url: $0) }
+				await MainActor.run {
+					let existing = Set(library.photos.map(\.url))
+					let newPhotos = photos.filter { !existing.contains($0.url) }
+					library.photos.append(contentsOf: newPhotos)
+					library.folderURL = URL(fileURLWithPath: "Encrypted Storage")
+					activeFolderNames = ["Encrypted Storage"]
+					library.lastScanDate = Date()
+					library.lastScanDuration = nil
+					clearSelection()
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = vaultStoreSummary(
+						stored: workingURLs.count,
+						requested: urls.count,
+						duplicates: dupCount,
+						failures: failCount,
+						cancelled: wasCancelled
+					)
+					showVaultAlert = true
+					logger.log("vault store: complete requested=\(urls.count, privacy: .public) stored=\(workingURLs.count, privacy: .public) duplicates=\(dupCount, privacy: .public) failed=\(failCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public)")
 					scheduleSort()
 				}
 			} catch {
 				await MainActor.run {
 					isVaultWorking = false
+					vaultStoreTask = nil
 					vaultAlertMessage = error.localizedDescription
 					showVaultAlert = true
 					logger.error("vault store: failed error=\(error.localizedDescription, privacy: .public)")
 				}
 			}
 		}
+		vaultStoreTask = task
+	}
+
+	private func vaultStoreSummary(stored: Int, requested: Int, duplicates: Int, failures: Int, cancelled: Bool) -> String {
+		let photoSuffix = requested == 1 ? "" : "s"
+		var pieces: [String] = []
+		if cancelled {
+			pieces.append("Cancelled.")
+		}
+		pieces.append("Stored \(stored) of \(requested) photo\(photoSuffix) in encrypted storage.")
+		if duplicates > 0 {
+			pieces.append("Skipped \(duplicates) duplicate\(duplicates == 1 ? "" : "s").")
+		}
+		if failures > 0 {
+			pieces.append("\(failures) photo\(failures == 1 ? " was" : "s were") not imported due to errors.")
+		}
+		return pieces.joined(separator: " ")
+	}
+
+	private func refreshVaultStatus() async {
+		let status = await PhotoVault.shared.status()
+		await MainActor.run { vaultStatus = status }
+	}
+
+	private static func folderContainsEncryptedFiles(_ folder: URL) -> Bool {
+		let fm = FileManager.default
+		guard let contents = try? fm.contentsOfDirectory(
+			at: folder,
+			includingPropertiesForKeys: nil,
+			options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+		) else {
+			return false
+		}
+		return contents.contains { $0.pathExtension == PhotoVault.encryptedExtension }
+	}
+
+	/// If `folder` contains `.pvencrypted` files, point the vault at it and
+	/// either open it (when already unlocked) or prompt for the password.
+	/// Returns true when the folder was claimed as a vault.
+	@discardableResult
+	private func tryOpenFolderAsVault(_ folder: URL) -> Bool {
+		guard Self.folderContainsEncryptedFiles(folder) else { return false }
+		logger.log("vault auto-open: folder=\(folder.path, privacy: .public) contains encrypted files; switching to vault flow")
+		Task {
+			do {
+				try await PhotoVault.shared.setLocation(folder)
+				let status = await PhotoVault.shared.status()
+				await MainActor.run { vaultStatus = status }
+				if status.isUnlocked {
+					openVault()
+				} else {
+					pendingVaultAutoOpen = true
+					clearVaultUnlockPrompt()
+					isShowingVaultUnlockPrompt = true
+				}
+			} catch {
+				await MainActor.run {
+					vaultAlertMessage = error.localizedDescription
+					showVaultAlert = true
+				}
+			}
+		}
+		return true
+	}
+
+	private func toggleVaultLock() {
+		if vaultStatus.isUnlocked {
+			Task {
+				await PhotoVault.shared.lock()
+				await refreshVaultStatus()
+			}
+		} else {
+			clearVaultUnlockPrompt()
+			isShowingVaultUnlockPrompt = true
+		}
+	}
+
+	private func clearVaultUnlockPrompt() {
+		vaultUnlockPassword = ""
+		vaultUnlockConfirmation = ""
+		vaultUnlockMessage = nil
+	}
+
+	private func submitVaultUnlockPrompt() {
+		let password = vaultUnlockPassword
+		let confirmation = vaultUnlockConfirmation
+		let isSettingNewPassword = !vaultStatus.hasPassword
+		guard !password.isEmpty else {
+			vaultUnlockMessage = "Enter a password."
+			return
+		}
+		if isSettingNewPassword {
+			guard password == confirmation else {
+				vaultUnlockMessage = "Passwords do not match."
+				return
+			}
+		}
+		Task {
+			var unlocked = false
+			do {
+				let status = await PhotoVault.shared.status()
+				if status.hasPassword {
+					try await PhotoVault.shared.unlock(password: password)
+				} else {
+					try await PhotoVault.shared.configureNewVaultPassword(password)
+				}
+				clearVaultUnlockPrompt()
+				isShowingVaultUnlockPrompt = false
+				unlocked = true
+			} catch {
+				vaultUnlockMessage = error.localizedDescription
+			}
+			await refreshVaultStatus()
+			if unlocked, pendingVaultAutoOpen {
+				pendingVaultAutoOpen = false
+				openVault()
+			}
+		}
+	}
+
+	private var vaultUnlockPromptView: some View {
+		VStack(alignment: .leading, spacing: 14) {
+			Text(vaultStatus.hasPassword ? "Unlock Encrypted Storage" : "Set Encrypted Storage Password")
+				.font(.headline)
+
+			SecureField("Password", text: $vaultUnlockPassword)
+				.textFieldStyle(.roundedBorder)
+
+			if !vaultStatus.hasPassword {
+				SecureField("Re-enter password", text: $vaultUnlockConfirmation)
+					.textFieldStyle(.roundedBorder)
+			}
+
+			Text(pendingVaultAutoOpen
+				 ? "This folder contains encrypted photos. Enter the password to open it."
+				 : "After unlocking, choose Encrypted Storage → Open Encrypted Storage to view your photos.")
+				.font(.caption)
+				.foregroundStyle(.secondary)
+				.fixedSize(horizontal: false, vertical: true)
+
+			if let vaultUnlockMessage {
+				Text(vaultUnlockMessage)
+					.font(.caption)
+					.foregroundStyle(.red)
+			}
+
+			HStack {
+				Button("Cancel") {
+					pendingVaultAutoOpen = false
+					clearVaultUnlockPrompt()
+					isShowingVaultUnlockPrompt = false
+				}
+				Spacer()
+				Button(vaultStatus.hasPassword ? "Unlock" : "Set Password") {
+					submitVaultUnlockPrompt()
+				}
+				.keyboardShortcut(.defaultAction)
+			}
+		}
+		.padding()
+		.frame(width: 360)
 	}
 
 	private func openVault() {
@@ -2457,6 +2753,9 @@ struct ContentView: View {
 				// Single-folder flow: set the active folder name and start
 				// the normal PhotoLibrary scan which handles persistence.
 				activeFolderNames = [url.lastPathComponent]
+				// If the folder is an encrypted vault, open it directly
+				// (prompting for the password if needed) instead of scanning.
+				if tryOpenFolderAsVault(url) { return }
 				library.scan(folder: url)
 				return
 			}

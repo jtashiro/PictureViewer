@@ -129,6 +129,9 @@ struct SettingsView: View {
 		.task {
 			await refreshVaultStatus()
 		}
+		.onReceive(NotificationCenter.default.publisher(for: .photoVaultStatusChanged)) { _ in
+			Task { await refreshVaultStatus() }
+		}
 	}
 
 	private var performanceTab: some View {

@@ -9,6 +9,10 @@ import AppKit
 import UniformTypeIdentifiers
 import os
 
+extension Notification.Name {
+    nonisolated static let photoVaultStatusChanged = Notification.Name("com.example.PictureViewer.photoVaultStatusChanged")
+}
+
 enum PhotoVaultError: LocalizedError {
     case locationMissing
     case passwordMissing
@@ -35,6 +39,12 @@ struct PhotoVaultStatus: Sendable {
     let locationPath: String?
 }
 
+struct PhotoVaultImportResult: Sendable {
+    let workingURLs: [URL]
+    let duplicateCount: Int
+    let failedCount: Int
+}
+
 actor PhotoVault {
     static let shared = PhotoVault()
 
@@ -43,6 +53,7 @@ actor PhotoVault {
     static let passwordSaltKey = "photoVaultPasswordSalt"
     static let passwordVerifierKey = "photoVaultPasswordVerifier"
     static let workingMapKey = "photoVaultWorkingMap"
+    static let contentHashesKey = "photoVaultContentHashes"
     static let encryptedExtension = "pvencrypted"
 
     nonisolated static func clearWorkingCopiesOnDisk() {
@@ -58,8 +69,8 @@ actor PhotoVault {
         UserDefaults.standard.removeObject(forKey: workingMapKey)
     }
 
-    private let logger = Logger(subsystem: "com.example.PictureViewer", category: "vault")
-    private let magic = Data("PVENC1\n".utf8)
+    private nonisolated let logger = Logger(subsystem: "com.example.PictureViewer", category: "vault")
+    private nonisolated let magic = Data("PVENC1\n".utf8)
     private let keyIterations = 120_000
     private var key: SymmetricKey?
     private var locationURL: URL?
@@ -70,6 +81,8 @@ actor PhotoVault {
         let originalRelativePath: String?
         let importedAt: Date
         let contentTypeIdentifier: String?
+        // Optional so files written before this field existed still decode.
+        let contentHash: String?
     }
 
     private init() {}
@@ -93,6 +106,7 @@ actor PhotoVault {
         locationURL = url
         _ = url.startAccessingSecurityScopedResource()
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        postStatusChange()
     }
 
     func configureNewVaultPassword(_ password: String) throws {
@@ -107,6 +121,7 @@ actor PhotoVault {
         UserDefaults.standard.set(salt, forKey: Self.passwordSaltKey)
         UserDefaults.standard.set(verifier, forKey: Self.passwordVerifierKey)
         key = SymmetricKey(data: verifier)
+        postStatusChange()
     }
 
     func unlock(password: String) throws {
@@ -119,38 +134,132 @@ actor PhotoVault {
         let candidate = deriveKeyData(password: password, salt: salt, iterations: keyIterations)
         guard candidate == verifier else { throw PhotoVaultError.passwordIncorrect }
         key = SymmetricKey(data: candidate)
+        postStatusChange()
+    }
+
+    func lock() {
+        guard key != nil else { return }
+        key = nil
+        postStatusChange()
+    }
+
+    private nonisolated func postStatusChange() {
+        NotificationCenter.default.post(name: .photoVaultStatusChanged, object: nil)
     }
 
     func importFiles(
         _ urls: [URL],
         progress: (@Sendable (Int, Int, String) async -> Void)? = nil
-    ) async throws -> [URL] {
-        guard !urls.isEmpty else { return [] }
+    ) async throws -> PhotoVaultImportResult {
+        guard !urls.isEmpty else {
+            return PhotoVaultImportResult(workingURLs: [], duplicateCount: 0, failedCount: 0)
+        }
         let destination = try vaultLocation()
         let activeKey = try unlockedKey()
-        var workingURLs: [URL] = []
-        logger.log("vault import:start requested=\(urls.count, privacy: .public) destination=\(destination.path, privacy: .public)")
-        for (index, url) in urls.enumerated() {
-            if Task.isCancelled { break }
-            await progress?(index, urls.count, url.lastPathComponent)
-            do {
-                guard isImageFile(url) else {
-                    logger.error("vault import:unsupported file=\(url.path, privacy: .public)")
+        let totalCount = urls.count
+        let workers = max(1, min(totalCount, PhotoLibrary.workerCount))
+        logger.log("vault import:start requested=\(totalCount, privacy: .public) destination=\(destination.path, privacy: .public) workers=\(workers, privacy: .public)")
+
+        enum Outcome: Sendable {
+            case stored(URL)
+            case duplicate
+            case failed
+        }
+
+        var collected: [(Int, URL)] = []
+        var completedCount = 0
+        var duplicateCount = 0
+        var failedCount = 0
+
+        await withTaskGroup(of: (Int, Outcome).self) { group in
+            var nextIndex = 0
+
+            func startTask(at idx: Int) {
+                let src = urls[idx]
+                group.addTask { [self] in
+                    if Task.isCancelled { return (idx, .failed) }
+                    guard isImageFile(src) else {
+                        logger.error("vault import:unsupported file=\(src.path, privacy: .public)")
+                        return (idx, .failed)
+                    }
+                    // Read source once, hash it, then dedup before encrypt.
+                    let data: Data
+                    do {
+                        data = try Data(contentsOf: src)
+                    } catch {
+                        logger.error("vault import:read failed source=\(src.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                        return (idx, .failed)
+                    }
+                    let hash = Self.contentHash(of: data)
+                    let reserved = await tryReserveContentHash(hash)
+                    if !reserved {
+                        logger.log("vault import:duplicate source=\(src.lastPathComponent, privacy: .public) hash=\(hash, privacy: .public)")
+                        return (idx, .duplicate)
+                    }
+                    let contentType = (try? src.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+                    let encryptedURL = uniqueEncryptedURL(for: src.lastPathComponent, in: destination)
+                    do {
+                        try encryptData(
+                            data,
+                            originalFilename: src.lastPathComponent,
+                            contentTypeIdentifier: contentType?.identifier,
+                            contentHash: hash,
+                            to: encryptedURL,
+                            key: activeKey
+                        )
+                        if Task.isCancelled {
+                            try? FileManager.default.removeItem(at: encryptedURL)
+                            await releaseContentHash(hash)
+                            return (idx, .failed)
+                        }
+                        let workingURL = try decryptFile(at: encryptedURL, key: activeKey)
+                        await setEncryptedURL(encryptedURL, forWorkingURL: workingURL)
+                        logger.log("vault import:file success source=\(src.lastPathComponent, privacy: .public) encrypted=\(encryptedURL.lastPathComponent, privacy: .public)")
+                        return (idx, .stored(workingURL))
+                    } catch {
+                        try? FileManager.default.removeItem(at: encryptedURL)
+                        await releaseContentHash(hash)
+                        logger.error("vault import:file failed source=\(src.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                        return (idx, .failed)
+                    }
+                }
+            }
+
+            let initial = min(workers, totalCount)
+            for _ in 0..<initial {
+                startTask(at: nextIndex)
+                nextIndex += 1
+            }
+
+            while let result = await group.next() {
+                completedCount += 1
+                let (idx, outcome) = result
+                let src = urls[idx]
+                switch outcome {
+                case .stored(let url):
+                    collected.append((idx, url))
+                case .duplicate:
+                    duplicateCount += 1
+                case .failed:
+                    failedCount += 1
+                }
+                await progress?(completedCount, totalCount, src.lastPathComponent)
+
+                if Task.isCancelled {
+                    group.cancelAll()
                     continue
                 }
-                let encryptedURL = uniqueEncryptedURL(for: url.lastPathComponent, in: destination)
-                try encryptFile(at: url, to: encryptedURL, key: activeKey)
-                let workingURL = try decryptFile(at: encryptedURL, key: activeKey)
-                setEncryptedURL(encryptedURL, forWorkingURL: workingURL)
-                workingURLs.append(workingURL)
-                logger.log("vault import:file success source=\(url.lastPathComponent, privacy: .public) encrypted=\(encryptedURL.lastPathComponent, privacy: .public)")
-            } catch {
-                logger.error("vault import:file failed source=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                if nextIndex < totalCount {
+                    startTask(at: nextIndex)
+                    nextIndex += 1
+                }
             }
         }
-        await progress?(urls.count, urls.count, "")
-        logger.log("vault import:finished requested=\(urls.count, privacy: .public) stored=\(workingURLs.count, privacy: .public)")
-        return workingURLs
+
+        collected.sort { $0.0 < $1.0 }
+        let workingURLs = collected.map { $0.1 }
+        logger.log("vault import:finished requested=\(totalCount, privacy: .public) stored=\(workingURLs.count, privacy: .public) duplicates=\(duplicateCount, privacy: .public) failed=\(failedCount, privacy: .public) cancelled=\(Task.isCancelled, privacy: .public)")
+        return PhotoVaultImportResult(workingURLs: workingURLs, duplicateCount: duplicateCount, failedCount: failedCount)
     }
 
     func loadWorkingCopies() async throws -> [URL] {
@@ -158,6 +267,7 @@ actor PhotoVault {
         let activeKey = try unlockedKey()
         try clearWorkingDirectory()
         var urls: [URL] = []
+        var hashesToRegister: [String] = []
         let contents = try FileManager.default.contentsOfDirectory(
             at: destination,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -166,13 +276,20 @@ actor PhotoVault {
         for encryptedURL in contents where encryptedURL.pathExtension == Self.encryptedExtension {
             if Task.isCancelled { break }
             do {
-                let workingURL = try decryptFile(at: encryptedURL, key: activeKey)
+                let (data, header) = try decryptPayload(at: encryptedURL, key: activeKey)
+                let workingURL = try uniqueWorkingURL(for: header.originalFilename)
+                try data.write(to: workingURL, options: .atomic)
                 setEncryptedURL(encryptedURL, forWorkingURL: workingURL)
                 urls.append(workingURL)
+                // Migrate the dedup index: prefer the recorded hash, otherwise
+                // compute one from the decrypted bytes so future imports can
+                // dedup against this file as well.
+                hashesToRegister.append(header.contentHash ?? Self.contentHash(of: data))
             } catch {
                 logger.error("loadWorkingCopies: failed for \(encryptedURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
+        registerContentHashes(hashesToRegister)
         return urls.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
     }
 
@@ -211,6 +328,13 @@ actor PhotoVault {
 
     func deleteEncryptedCounterpartIfNeeded(for workingURL: URL) {
         guard let encryptedURL = encryptedURL(forWorkingURL: workingURL) else { return }
+        // Release the content hash so a future re-import of the same content
+        // is allowed. Prefer the header-recorded hash; fall back to hashing
+        // the decrypted payload if needed.
+        if let activeKey = key,
+           let (data, header) = try? decryptPayload(at: encryptedURL, key: activeKey) {
+            releaseContentHash(header.contentHash ?? Self.contentHash(of: data))
+        }
         try? FileManager.default.removeItem(at: encryptedURL)
         removeMapping(forWorkingURL: workingURL)
     }
@@ -219,20 +343,82 @@ actor PhotoVault {
         Self.clearWorkingCopiesOnDisk()
     }
 
-    private func encryptFile(at sourceURL: URL, to encryptedURL: URL, key: SymmetricKey) throws {
+    // MARK: - Content-hash dedup
+
+    nonisolated static func contentHash(of data: Data) -> String {
+        SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    private nonisolated func loadContentHashes() -> Set<String> {
+        Set(UserDefaults.standard.array(forKey: Self.contentHashesKey) as? [String] ?? [])
+    }
+
+    private nonisolated func persistContentHashes(_ hashes: Set<String>) {
+        UserDefaults.standard.set(Array(hashes), forKey: Self.contentHashesKey)
+    }
+
+    /// Atomically reserve a content hash. Returns true if the hash was newly
+    /// added (caller may proceed with import); false if the hash was already
+    /// known and the import should be skipped as a duplicate.
+    func tryReserveContentHash(_ hash: String) -> Bool {
+        var current = loadContentHashes()
+        if current.contains(hash) { return false }
+        current.insert(hash)
+        persistContentHashes(current)
+        return true
+    }
+
+    func releaseContentHash(_ hash: String) {
+        var current = loadContentHashes()
+        if current.remove(hash) != nil {
+            persistContentHashes(current)
+        }
+    }
+
+    private func registerContentHashes(_ hashes: [String]) {
+        guard !hashes.isEmpty else { return }
+        var current = loadContentHashes()
+        let before = current.count
+        current.formUnion(hashes)
+        if current.count != before {
+            persistContentHashes(current)
+        }
+    }
+
+    private nonisolated func encryptFile(at sourceURL: URL, to encryptedURL: URL, key: SymmetricKey) throws {
         let values = try sourceURL.resourceValues(forKeys: [.contentTypeKey])
         guard values.contentType?.conforms(to: .image) == true || isImageFile(sourceURL) else {
             throw PhotoVaultError.unsupportedFile
         }
         let data = try Data(contentsOf: sourceURL)
+        let hash = Self.contentHash(of: data)
+        try encryptData(
+            data,
+            originalFilename: sourceURL.lastPathComponent,
+            contentTypeIdentifier: values.contentType?.identifier,
+            contentHash: hash,
+            to: encryptedURL,
+            key: key
+        )
+    }
+
+    private nonisolated func encryptData(
+        _ data: Data,
+        originalFilename: String,
+        contentTypeIdentifier: String?,
+        contentHash: String?,
+        to encryptedURL: URL,
+        key: SymmetricKey
+    ) throws {
         let sealed = try AES.GCM.seal(data, using: key)
         guard let combined = sealed.combined else { throw PhotoVaultError.invalidEncryptedFile }
         let header = Header(
             version: 1,
-            originalFilename: sourceURL.lastPathComponent,
+            originalFilename: originalFilename,
             originalRelativePath: nil,
             importedAt: Date(),
-            contentTypeIdentifier: values.contentType?.identifier
+            contentTypeIdentifier: contentTypeIdentifier,
+            contentHash: contentHash
         )
         let headerData = try JSONEncoder().encode(header)
         var output = Data()
@@ -252,14 +438,14 @@ actor PhotoVault {
         try FileManager.default.moveItem(at: tempURL, to: encryptedURL)
     }
 
-    private func decryptFile(at encryptedURL: URL, key: SymmetricKey) throws -> URL {
+    private nonisolated func decryptFile(at encryptedURL: URL, key: SymmetricKey) throws -> URL {
         let (data, header) = try decryptPayload(at: encryptedURL, key: key)
         let workingURL = try uniqueWorkingURL(for: header.originalFilename)
         try data.write(to: workingURL, options: .atomic)
         return workingURL
     }
 
-    private func decryptPayload(at encryptedURL: URL, key: SymmetricKey) throws -> (Data, Header) {
+    private nonisolated func decryptPayload(at encryptedURL: URL, key: SymmetricKey) throws -> (Data, Header) {
         let fileData = try Data(contentsOf: encryptedURL)
         guard fileData.count > magic.count + MemoryLayout<UInt32>.size,
               fileData.prefix(magic.count) == magic
@@ -303,7 +489,7 @@ actor PhotoVault {
         }
     }
 
-    private func workingDirectory() throws -> URL {
+    private nonisolated func workingDirectory() throws -> URL {
         let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("PictureViewer/VaultWorking", isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -319,11 +505,11 @@ actor PhotoVault {
         UserDefaults.standard.removeObject(forKey: Self.workingMapKey)
     }
 
-    private func uniqueWorkingURL(for filename: String) throws -> URL {
+    private nonisolated func uniqueWorkingURL(for filename: String) throws -> URL {
         uniquePlainURL(for: "\(UUID().uuidString)_\(filename)", in: try workingDirectory())
     }
 
-    private func uniquePlainURL(for filename: String, in folder: URL) -> URL {
+    private nonisolated func uniquePlainURL(for filename: String, in folder: URL) -> URL {
         let cleanName = filename.isEmpty ? "photo" : filename
         let base = URL(fileURLWithPath: cleanName).deletingPathExtension().lastPathComponent
         let ext = URL(fileURLWithPath: cleanName).pathExtension
@@ -338,19 +524,23 @@ actor PhotoVault {
         return candidate
     }
 
-    private func uniqueEncryptedURL(for filename: String, in folder: URL) -> URL {
+    private nonisolated func uniqueEncryptedURL(for filename: String, in folder: URL) -> URL {
         let stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
         let safeStem = stem.isEmpty ? UUID().uuidString : PhotoLibrary.safeFilename(for: stem)
-        var candidate = folder.appendingPathComponent(safeStem).appendingPathExtension(Self.encryptedExtension)
+        // Always append a short random token so concurrent imports can never pick
+        // the same destination path. The original filename is preserved inside
+        // the encrypted file's header.
+        let token = String(UUID().uuidString.prefix(8))
+        var candidate = folder.appendingPathComponent("\(safeStem)-\(token)").appendingPathExtension(Self.encryptedExtension)
         var index = 1
         while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = folder.appendingPathComponent("\(safeStem)-\(index)").appendingPathExtension(Self.encryptedExtension)
+            candidate = folder.appendingPathComponent("\(safeStem)-\(token)-\(index)").appendingPathExtension(Self.encryptedExtension)
             index += 1
         }
         return candidate
     }
 
-    private func isImageFile(_ url: URL) -> Bool {
+    private nonisolated func isImageFile(_ url: URL) -> Bool {
         if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
            values.contentType?.conforms(to: .image) == true {
             return true
