@@ -37,6 +37,69 @@ private final class ThumbnailDraggingSource: NSObject, NSDraggingSource {
 	}
 }
 
+private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
+	let isEnabled: Bool
+	let action: () -> Void
+
+	func makeCoordinator() -> Coordinator {
+		Coordinator()
+	}
+
+	func makeNSView(context: Context) -> NSView {
+		let view = NSView(frame: .zero)
+		context.coordinator.view = view
+		context.coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
+			coordinator?.handle(event) ?? event
+		}
+		return view
+	}
+
+	func updateNSView(_ nsView: NSView, context: Context) {
+		context.coordinator.view = nsView
+		context.coordinator.isEnabled = isEnabled
+		context.coordinator.action = action
+	}
+
+	final class Coordinator {
+		weak var view: NSView?
+		var isEnabled = false
+		var action: (() -> Void)?
+		var monitor: Any?
+
+		deinit {
+			if let monitor {
+				NSEvent.removeMonitor(monitor)
+			}
+		}
+
+		func handle(_ event: NSEvent) -> NSEvent? {
+			guard isEnabled,
+				let window = view?.window,
+				window.isKeyWindow,
+				event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+				event.charactersIgnoringModifiers?.lowercased() == "a",
+				!isTextEditingFirstResponder(window.firstResponder)
+			else {
+				return event
+			}
+
+			action?()
+			return nil
+		}
+
+		private func isTextEditingFirstResponder(_ responder: NSResponder?) -> Bool {
+			var current = responder
+			while let candidate = current {
+				if candidate is NSTextView || candidate is NSTextField || candidate is NSSearchField {
+					return true
+				}
+				current = candidate.nextResponder
+			}
+			return false
+		}
+	}
+}
+
 struct ContentView: View {
 	@State private var library = PhotoLibrary()
 	@State private var thumbnailSize: CGFloat = 160
@@ -80,13 +143,9 @@ struct ContentView: View {
 				var stale = false
 				do {
 					let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
-					if stale { logger.log("restoreFolderBookmarkIfNeeded: bookmark is stale for \(url.path, privacy: .public)") }
 					if url.startAccessingSecurityScopedResource() {
-						logger.log("restoreFolderBookmarkIfNeeded: started security access for \(url.path, privacy: .public)")
 						resolvedFolders.append(url)
 						if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
-					} else {
-						logger.log("restoreFolderBookmarkIfNeeded: failed to start security access for \(url.path, privacy: .public)")
 					}
 				} catch {
 					logger.error("restoreFolderBookmarkIfNeeded: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
@@ -105,7 +164,6 @@ struct ContentView: View {
 				activeFolderNames = [first.lastPathComponent]
 				library.scan(folder: first)
 				for url in rest {
-					logger.log("restoreFolderBookmarkIfNeeded: opening folder window for \(url.path, privacy: .public)")
 					openWindow(id: "folder", value: url)
 				}
 			}
@@ -117,9 +175,7 @@ struct ContentView: View {
 		var stale = false
 		do {
 			let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
-			if stale { logger.log("restoreFolderBookmarkIfNeeded: bookmark is stale for \(url.path, privacy: .public)") }
 			if url.startAccessingSecurityScopedResource() {
-				logger.log("restoreFolderBookmarkIfNeeded: started security access for \(url.path, privacy: .public)")
 				// Don't start an immediate full scan at launch; doing so can
 				// block the UI while the scanner enumerates the filesystem. Instead,
 				// publish the folder and try to restore a cached snapshot (if any)
@@ -207,7 +263,7 @@ struct ContentView: View {
 												// because this is a static context and instance
 												// properties (like @AppStorage) aren't available.
 												if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
-													logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag; skipping scan for folder=\(url.path, privacy: .public)")
+																			logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag")
 												} else {
 													library.scan(folder: url)
 												}
@@ -220,8 +276,6 @@ struct ContentView: View {
 						await MainActor.run { library.folderURL = url; activeFolderNames = [url.lastPathComponent] }
 					}
 				}
-			} else {
-				logger.log("restoreFolderBookmarkIfNeeded: failed to start security access for \(url.path, privacy: .public)")
 			}
 		} catch {
 			logger.error("restoreFolderBookmarkIfNeeded: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
@@ -286,7 +340,6 @@ struct ContentView: View {
 				let appSidecar = sidecarDir.appendingPathComponent("\(digest).pvmeta.json")
 				try? fm.removeItem(at: appSidecar)
 			}
-			logger.log("repairMetadata: successfully repaired metadata for \(url.path, privacy: .public)")
 			return (true, nil)
 		}
 
@@ -323,12 +376,10 @@ struct ContentView: View {
 			try data.write(to: tempFile, options: .atomic)
 			if fm.fileExists(atPath: scURL.path) { try? fm.removeItem(at: scURL) }
 			try fm.moveItem(at: tempFile, to: scURL)
-			logger.log("writeSidecar: wrote sidecar for \(url.path, privacy: .public) -> \(scURL.path, privacy: .public)")
 			return true
 		} catch {
 			// Clean up any temp file we may have created
 			try? fm.removeItem(at: tempFile)
-			logger.error("writeSidecar: adjacent write failed for \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
 			// Attempt fallback to application-support sidecar store so we
 			// can persist metadata even when the target directory is not writable.
 			do {
@@ -347,11 +398,10 @@ struct ContentView: View {
 					try appData.write(to: tmp, options: .atomic)
 					if fm.fileExists(atPath: appSidecar.path) { try? fm.removeItem(at: appSidecar) }
 					try fm.moveItem(at: tmp, to: appSidecar)
-					logger.log("writeSidecar: wrote app-support sidecar for \(url.path, privacy: .public) -> \(appSidecar.path, privacy: .public)")
 					return true
 				}
 			} catch {
-				logger.error("writeSidecar: app-support fallback failed for \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+				logger.error("writeSidecar: app-support fallback failed: \(error.localizedDescription, privacy: .public)")
 			}
 			return false
 		}
@@ -379,9 +429,7 @@ struct ContentView: View {
 				var stale = false
 				do {
 					let resolved = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
-					if stale { logger.log("ensureSecurityScopedAccess: bookmark stale for \(resolved.path, privacy: .public)") }
 					if resolved.startAccessingSecurityScopedResource() {
-						logger.log("ensureSecurityScopedAccess: started security access for \(resolved.path, privacy: .public)")
 						if !Self.activeSecurityScopedURLs.contains(resolved) { Self.activeSecurityScopedURLs.append(resolved) }
 						if url.path.hasPrefix(resolved.path) { return true }
 					}
@@ -401,13 +449,11 @@ struct ContentView: View {
 		var stale = false
 		do {
 			let resolved = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
-			if stale { logger.log("ensureSecurityScopedAccess: bookmark stale for \(resolved.path, privacy: .public)") }
 				if resolved.startAccessingSecurityScopedResource() {
-					logger.log("ensureSecurityScopedAccess: started security access for \(resolved.path, privacy: .public)")
 					if !Self.activeSecurityScopedURLs.contains(resolved) { Self.activeSecurityScopedURLs.append(resolved) }
 					return url.path.hasPrefix(resolved.path)
 				} else {
-				logger.error("ensureSecurityScopedAccess: failed to start accessing security scoped resource for \(resolved.path, privacy: .public)")
+				logger.error("ensureSecurityScopedAccess: failed to start accessing security scoped resource")
 				return false
 			}
 		} catch {
@@ -424,17 +470,10 @@ struct ContentView: View {
 		guard deg != 0 else { return true }
 
 		// Ensure we have security-scoped access to the containing folder if available
-		let accessOk = await Self.ensureSecurityScopedAccess(for: url)
-		logger.log("rotateImageFile: security access for \(url.path, privacy: .public)=\(accessOk, privacy: .public)")
+		_ = await Self.ensureSecurityScopedAccess(for: url)
 
-		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let type = CGImageSourceGetType(src) else {
-			logger.log("rotateImageFile: cannot create CGImageSource for \(url.path, privacy: .public)")
-			return false
-		}
-		guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-			logger.log("rotateImageFile: cannot create CGImage for \(url.path, privacy: .public)")
-			return false
-		}
+		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let type = CGImageSourceGetType(src) else { return false }
+		guard let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
 
 		let radians = Double(deg) * Double.pi / 180.0
 		var destWidth = cg.width
@@ -444,15 +483,15 @@ struct ContentView: View {
 			destHeight = cg.width
 		}
 
-		guard let colorSpace = cg.colorSpace else { logger.log("rotateImageFile: missing colorSpace for \(url.path, privacy: .public)"); return false }
-		guard let ctx = CGContext(data: nil, width: destWidth, height: destHeight, bitsPerComponent: cg.bitsPerComponent, bytesPerRow: 0, space: colorSpace, bitmapInfo: cg.bitmapInfo.rawValue) else { logger.log("rotateImageFile: cannot create CGContext"); return false }
+		guard let colorSpace = cg.colorSpace else { return false }
+		guard let ctx = CGContext(data: nil, width: destWidth, height: destHeight, bitsPerComponent: cg.bitsPerComponent, bytesPerRow: 0, space: colorSpace, bitmapInfo: cg.bitmapInfo.rawValue) else { return false }
 
 		ctx.translateBy(x: CGFloat(destWidth)/2.0, y: CGFloat(destHeight)/2.0)
 		ctx.rotate(by: CGFloat(radians))
 		ctx.translateBy(x: -CGFloat(cg.width)/2.0, y: -CGFloat(cg.height)/2.0)
 		ctx.draw(cg, in: CGRect(x: 0, y: 0, width: CGFloat(cg.width), height: CGFloat(cg.height)))
 
-		guard let rotated = ctx.makeImage() else { logger.log("rotateImageFile: makeImage failed"); return false }
+		guard let rotated = ctx.makeImage() else { return false }
 
 		let fm = FileManager.default
 		let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
@@ -460,7 +499,7 @@ struct ContentView: View {
 		let tempURL = dir.appendingPathComponent(".pvtmp-\(UUID().uuidString)").appendingPathExtension(url.pathExtension)
 
 		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
-			logger.error("rotateImageFile: cannot create destination for tempURL=\(tempURL.path, privacy: .public)")
+			logger.error("rotateImageFile: cannot create destination")
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "CGImageDestinationCreateWithURL failed when attempting to rewrite image for rotation."])
 			// Embedded rewrite failed; do not fall back to sidecar per policy.
 			return false
@@ -472,7 +511,7 @@ struct ContentView: View {
 		}
 		if !CGImageDestinationFinalize(dest) {
 			try? fm.removeItem(at: tempURL)
-			logger.error("rotateImageFile: finalize failed for \(tempURL.path, privacy: .public)")
+			logger.error("rotateImageFile: finalize failed")
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "CGImageDestinationFinalize failed when attempting to rewrite image for rotation."])
 			// Do not persist sidecar; report failure to the caller.
 			return false
@@ -487,7 +526,7 @@ struct ContentView: View {
 			return true
 		} catch {
 			try? fm.removeItem(at: tempURL)
-			logger.error("rotateImageFile: failed to replace original file \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+			logger.error("rotateImageFile: failed to replace original file: \(error.localizedDescription, privacy: .public)")
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
 			// Do not fall back to sidecar; surface failure.
 			return false
@@ -505,7 +544,7 @@ struct ContentView: View {
 			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
 				  let type = CGImageSourceGetType(src),
 				  let cgIn = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-				logger.error("adjustBrightnessFile: cannot load image at \(url.path, privacy: .public)")
+				logger.error("adjustBrightnessFile: cannot load image")
 				return false
 			}
 
@@ -584,6 +623,17 @@ struct ContentView: View {
 	@State private var isApplyingKeywords: Bool = false
 	@State private var editProgressCount: Int = 0
 	@State private var editingResults: [URL: Bool?] = [:]
+	@State private var isAssigningPerson: Bool = false
+	@State private var assignPersonName: String = ""
+	@State private var existingPersonNames: [String] = []
+	@State private var isApplyingPersonAssignment: Bool = false
+	@State private var showPersonAssignmentResult: Bool = false
+	@State private var personAssignmentResultMessage: String = ""
+	@State private var isRescanningFaces: Bool = false
+	@State private var showFaceRescanResult: Bool = false
+	@State private var faceRescanResultMessage: String = ""
+	@State private var personFilterPaths: Set<String>? = nil
+	@State private var personFilterID: UUID? = nil
 	@State private var showDeleteConfirmation: Bool = false
 	@State private var isDeleting: Bool = false
 	@State private var deleteProgressCount: Int = 0
@@ -735,6 +785,12 @@ struct ContentView: View {
 		.onChange(of: library.photos) { _ in scheduleSort() }
 		.onChange(of: sortModeRaw) { _ in scheduleSort() }
 		.onChange(of: searchText) { _ in scheduleSort() }
+		.onChange(of: PersonFilterState.shared.active) { active in
+			applyPersonFilter(active)
+		}
+		.task {
+			applyPersonFilter(PersonFilterState.shared.active)
+		}
 		.sheet(isPresented: $showBookmarkManager) {
 			VStack(spacing: 12) {
 				Text("Manage Bookmarks")
@@ -855,7 +911,7 @@ struct ContentView: View {
 									await MainActor.run {
 										editingResults[u] = ok
 										editProgressCount += 1
-										logger.log("writeKeywords: url=\(u.path, privacy: .public) success=\(ok, privacy: .public)")
+													logger.log("writeKeywords: success=\(ok, privacy: .public)")
 									}
 								}
 								await MainActor.run {
@@ -874,6 +930,72 @@ struct ContentView: View {
 			}
 			.padding()
 			.frame(minWidth: 420, minHeight: 200)
+		}
+		.sheet(isPresented: $isAssigningPerson) {
+			VStack(spacing: 12) {
+				Text("Assign Person Name")
+					.font(.headline)
+				Text("Apply a person name to faces detected in \(faceActionTargetURLs.count) photo\(faceActionTargetURLs.count == 1 ? "" : "s").")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+					.multilineTextAlignment(.leading)
+				TextField("Person name", text: $assignPersonName)
+					.textFieldStyle(.roundedBorder)
+					.padding(.horizontal)
+				if !filteredPersonNameSuggestions.isEmpty {
+					VStack(alignment: .leading, spacing: 6) {
+						Text("Suggestions")
+							.font(.caption2)
+							.foregroundStyle(.secondary)
+						ForEach(filteredPersonNameSuggestions.prefix(6), id: \.self) { name in
+							Button(name) {
+								assignPersonName = name
+							}
+							.buttonStyle(.plain)
+						}
+					}
+					.padding(.horizontal)
+				}
+				if !existingPersonNames.isEmpty {
+					VStack(alignment: .leading, spacing: 6) {
+						Text("Existing names")
+							.font(.caption2)
+							.foregroundStyle(.secondary)
+						ScrollView(.horizontal, showsIndicators: false) {
+							HStack(spacing: 6) {
+								ForEach(existingPersonNames, id: \.self) { name in
+									Button(name) {
+										assignPersonName = name
+									}
+									.buttonStyle(.bordered)
+									.controlSize(.small)
+								}
+							}
+						}
+					}
+					.padding(.horizontal)
+				}
+				HStack {
+					Button("Cancel") {
+						if !isApplyingPersonAssignment { isAssigningPerson = false }
+					}
+					.disabled(isApplyingPersonAssignment)
+					Spacer()
+					if isApplyingPersonAssignment {
+						ProgressView().controlSize(.small)
+					}
+					Button("Apply") {
+						applyPersonAssignmentToSelection()
+					}
+					.disabled(faceActionTargetURLs.isEmpty || assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isApplyingPersonAssignment)
+				}
+				.padding(.horizontal)
+			}
+			.padding()
+			.frame(minWidth: 420, minHeight: 180)
+			.onAppear {
+				loadExistingPersonNamesForAssignment()
+			}
 		}
 		.confirmationDialog(
 			"Are you sure you want to delete \(pendingDeleteURLs.count) file\(pendingDeleteURLs.count == 1 ? "" : "s")?",
@@ -917,6 +1039,16 @@ struct ContentView: View {
 		}
 		.alert(isPresented: $showRepairResult) {
 			Alert(title: Text("Repair Metadata"), message: Text(repairResultMessage ?? ""), dismissButton: .default(Text("OK")))
+		}
+		.alert("Assign Person", isPresented: $showPersonAssignmentResult) {
+			Button("OK", role: .cancel) {}
+		} message: {
+			Text(personAssignmentResultMessage)
+		}
+		.alert("Rescan Facial Recognition", isPresented: $showFaceRescanResult) {
+			Button("OK", role: .cancel) {}
+		} message: {
+			Text(faceRescanResultMessage)
 		}
 		.onReceive(NotificationCenter.default.publisher(for: .embedWriteFailed)) { n in
 			if let info = n.userInfo as? [String: String] {
@@ -1260,23 +1392,55 @@ struct ContentView: View {
 
 	@ViewBuilder
 	private var contentBody: some View {
-		if library.folderURL == nil {
-			emptyState
-		} else if library.isScanning && library.photos.isEmpty {
-			VStack(spacing: 12) {
-				ProgressView()
-				Text("Scanning \(library.folderURL?.lastPathComponent ?? "")…")
-					.foregroundStyle(.secondary)
+		VStack(spacing: 0) {
+			personFilterBanner
+			Group {
+				if library.folderURL == nil {
+					emptyState
+				} else if library.isScanning && library.photos.isEmpty {
+					VStack(spacing: 12) {
+						ProgressView()
+						Text("Scanning \(library.folderURL?.lastPathComponent ?? "")…")
+							.foregroundStyle(.secondary)
+					}
+					.frame(maxWidth: .infinity, maxHeight: .infinity)
+				} else if library.photos.isEmpty {
+					ContentUnavailableView(
+						"No Photos Found",
+						systemImage: "photo.on.rectangle.angled",
+						description: Text("This folder doesn't contain any supported image files.")
+					)
+				} else {
+					photoGrid
+				}
 			}
-			.frame(maxWidth: .infinity, maxHeight: .infinity)
-		} else if library.photos.isEmpty {
-			ContentUnavailableView(
-				"No Photos Found",
-				systemImage: "photo.on.rectangle.angled",
-				description: Text("This folder doesn't contain any supported image files.")
-			)
-		} else {
-			photoGrid
+		}
+	}
+
+	@ViewBuilder
+	private var personFilterBanner: some View {
+		if let active = PersonFilterState.shared.active {
+			HStack(spacing: 8) {
+				Image(systemName: "person.crop.circle.fill")
+					.foregroundStyle(.tint)
+				Text("Showing photos of ")
+					.foregroundStyle(.secondary)
+				+ Text(active.personName)
+					.fontWeight(.semibold)
+				Spacer()
+				Button("Clear Filter") {
+					PersonFilterState.shared.clear()
+				}
+				.buttonStyle(.borderless)
+				.controlSize(.small)
+			}
+			.font(.callout)
+			.padding(.horizontal, 12)
+			.padding(.vertical, 6)
+			.background(.thinMaterial)
+			.overlay(alignment: .bottom) {
+				Divider()
+			}
 		}
 	}
 
@@ -1359,10 +1523,9 @@ struct ContentView: View {
 									if ok {
 										// Force a thumbnail refresh and log
 										refreshToken = UUID()
-										logger.log("Repair metadata succeeded for \(photo.url.path, privacy: .public)")
 										repairResultMessage = "Repair succeeded for \(photo.url.lastPathComponent)"
 									} else {
-										logger.error("Repair metadata failed for \(photo.url.path, privacy: .public): \(msg ?? "")")
+										logger.error("Repair metadata failed: \(msg ?? "")")
 										repairResultMessage = "Repair failed for \(photo.url.lastPathComponent): \(msg ?? "Unknown error")"
 									}
 									showRepairResult = true
@@ -1434,7 +1597,15 @@ struct ContentView: View {
 				.padding(.bottom, 12)
 			}
 		}
-	}
+			.overlay(alignment: .top) {
+				FaceScanProgressOverlay()
+			}
+			.background {
+				SelectAllKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) {
+					selectAllDisplayedPhotos()
+				}
+			}
+		}
 
 	@ToolbarContentBuilder
 	private var toolbarItems: some ToolbarContent {
@@ -1497,6 +1668,21 @@ struct ContentView: View {
 					Text(selectionMode ? "Done" : "Edit")
 				}
 				.help("Select multiple thumbnails for bulk operations")
+				Button(action: {
+					loadExistingPersonNamesForAssignment()
+					isAssigningPerson = true
+				}) {
+					Text("Assign Person")
+				}
+				.disabled(faceActionTargetURLs.isEmpty)
+				.help("Assign faces from selected photos, or all loaded photos when none are selected")
+				Button(action: {
+					rescanFaceRecognitionForSelection()
+				}) {
+					Text("Rescan Faces")
+				}
+				.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || FaceScanProgress.shared.isActive)
+				.help("Rescan selected photos, or all loaded photos when none are selected")
 				if selectionMode {
 					Button(action: {
 						// Show bulk edit keywords sheet
@@ -1554,8 +1740,7 @@ struct ContentView: View {
 					.disabled(selectedItems.isEmpty)
 					.help("Adjust brightness of selected photos")
 					Button(action: {
-						// Select all displayed
-						selectedItems = Set(displayedPhotos.map { $0.url })
+						selectAllDisplayedPhotos()
 					}) {
 						Text("Select All")
 					}
@@ -1589,6 +1774,87 @@ struct ContentView: View {
 	
 	
 	// MARK: - Actions
+
+	private var filteredPersonNameSuggestions: [String] {
+		let query = assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !query.isEmpty else { return [] }
+		return existingPersonNames.filter {
+			$0.localizedCaseInsensitiveContains(query) && $0.localizedCaseInsensitiveCompare(query) != .orderedSame
+		}
+	}
+
+	private func loadExistingPersonNamesForAssignment() {
+		Task.detached(priority: .utility) {
+			let names = await FaceProcessor.shared.personsList()
+				.compactMap { $0.name?.trimmingCharacters(in: .whitespacesAndNewlines) }
+				.filter { !$0.isEmpty }
+			let unique = Array(Set(names)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+			await MainActor.run { existingPersonNames = unique }
+		}
+	}
+
+	private var faceActionTargetURLs: [URL] {
+		if !selectedItems.isEmpty { return Array(selectedItems) }
+		return library.photos.map { $0.url }
+	}
+
+	private func selectAllDisplayedPhotos() {
+		selectionMode = true
+		selectedItems = Set(displayedPhotos.map { $0.url })
+	}
+
+	private func applyPersonAssignmentToSelection() {
+		let name = assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
+		let urls = faceActionTargetURLs
+		guard !name.isEmpty, !urls.isEmpty else { return }
+		let totalPhotos = urls.count
+		isApplyingPersonAssignment = true
+		Task.detached(priority: .utility) {
+			let result = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
+			await MainActor.run {
+				isApplyingPersonAssignment = false
+				isAssigningPerson = false
+				if result.facesAssigned > 0 {
+					let faces = result.facesAssigned
+					let photosUsed = result.photosWithFaces
+					let skipped = totalPhotos - photosUsed
+					var message = "Assigned \(faces) face\(faces == 1 ? "" : "s") from \(photosUsed) of \(totalPhotos) photo\(totalPhotos == 1 ? "" : "s") to \"\(name)\"."
+					if skipped > 0 {
+						message += " \(skipped) photo\(skipped == 1 ? "" : "s") had no detectable face."
+					}
+					personAssignmentResultMessage = message
+				} else {
+					personAssignmentResultMessage = "No detectable faces were found in the selected photos."
+				}
+				showPersonAssignmentResult = true
+			}
+		}
+	}
+
+	private func rescanFaceRecognitionForSelection() {
+		let urls = faceActionTargetURLs
+		guard !urls.isEmpty else { return }
+		isRescanningFaces = true
+		let rescanTask = Task.detached(priority: .utility) {
+			let rescanned = await FaceProcessor.shared.rescanFaceRecognition(forFiles: urls) { phase, completed, total in
+				Task { @MainActor in
+					FaceScanProgress.shared.update(completed: completed, total: total, status: phase)
+				}
+			}
+			let wasCancelled = Task.isCancelled
+			await MainActor.run {
+				FaceScanProgress.shared.end()
+				isRescanningFaces = false
+				if !wasCancelled {
+					faceRescanResultMessage = "Rescanned facial recognition for \(rescanned) file\(rescanned == 1 ? "" : "s")."
+					showFaceRescanResult = true
+				}
+			}
+		}
+		FaceScanProgress.shared.begin(title: "Rescanning Faces", total: urls.count) {
+			rescanTask.cancel()
+		}
+	}
 
 	private func handleThumbnailSingleClick(_ url: URL) {
 		selectionDragStart = nil
@@ -1802,7 +2068,7 @@ struct ContentView: View {
 					let bm = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
 					bookmarkDatas.append(bm)
 				} catch {
-					logger.error("chooseFolder: failed to create bookmark for \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+					logger.error("chooseFolder: failed to create bookmark: \(error.localizedDescription, privacy: .public)")
 				}
 			}
 			if !bookmarkDatas.isEmpty {
@@ -1821,10 +2087,7 @@ struct ContentView: View {
 					if url.startAccessingSecurityScopedResource() {
 						if i == 0 { folderSecurityURL = url }
 						if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
-						logger.log("chooseFolder: started security access for \(url.path, privacy: .public)")
-					} else {
-					logger.log("chooseFolder: failed to start security access for \(url.path, privacy: .public)")
-				}
+					}
 			}
 
 			// Update UI title to reflect selected folders
@@ -1964,7 +2227,7 @@ struct ContentView: View {
 				let exists = fm.fileExists(atPath: u.path)
 				let accessOk = await Self.ensureSecurityScopedAccess(for: u)
 				await MainActor.run {
-					self.logger.log("performDelete: item=\(u.path, privacy: .public) exists=\(exists, privacy: .public) accessOk=\(accessOk, privacy: .public)")
+					self.logger.log("performDelete: exists=\(exists, privacy: .public) accessOk=\(accessOk, privacy: .public)")
 				}
 				do {
 					if !exists {
@@ -1975,12 +2238,12 @@ struct ContentView: View {
 					}
 					try fm.removeItem(at: u)
 					success = true
-					await MainActor.run { self.logger.log("performDelete: deleted \(u.path, privacy: .public)") }
+					await MainActor.run { self.logger.log("performDelete: deleted item") }
 				} catch {
 					success = false
 					let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
 					errorMsg = localized.isEmpty ? "Unknown delete error." : localized
-					await MainActor.run { self.logger.error("performDelete: failed to trash \(u.path, privacy: .public): \(error.localizedDescription, privacy: .public)") }
+					await MainActor.run { self.logger.error("performDelete: failed to trash item: \(error.localizedDescription, privacy: .public)") }
 				}
 
 				let res = success
@@ -2026,6 +2289,25 @@ struct ContentView: View {
 
 	// MARK: - Sorting
 
+	private func applyPersonFilter(_ active: PersonFilterState.Active?) {
+		guard let active else {
+			personFilterID = nil
+			personFilterPaths = nil
+			scheduleSort()
+			return
+		}
+		personFilterID = active.personID
+		Task {
+			let paths = await FaceProcessor.shared.sourcePathsForPerson(personID: active.personID)
+			await MainActor.run {
+				// Ignore stale results if the filter changed while we were loading.
+				guard personFilterID == active.personID else { return }
+				personFilterPaths = Set(paths)
+				scheduleSort()
+			}
+		}
+	}
+
 	private func scheduleSort() {
 		// Cancel any in-flight sort work and start a new background task.
 		// Provide an immediate, cheap filename-only filter so the UI feels
@@ -2033,7 +2315,13 @@ struct ContentView: View {
 		// the background. Also debounce the full work to avoid starting a
 		// heavy task on every single keystroke.
 		sortTask?.cancel()
-		let photos = library.photos
+		let allPhotos = library.photos
+		let photos: [PhotoItem]
+		if let paths = personFilterPaths {
+			photos = allPhotos.filter { paths.contains($0.url.path) }
+		} else {
+			photos = allPhotos
+		}
 		let mode = SortMode(rawValue: sortModeRaw) ?? .alphaAsc
 		let filter = searchText
 
@@ -2208,16 +2496,15 @@ struct ContentView: View {
 	private static func writeKeywords(to url: URL, keywords: [String]) async -> Bool {
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 		// Ensure security-scoped access if available
-		let accessOk = await Self.ensureSecurityScopedAccess(for: url)
-		logger.log("writeKeywords: security access for \(url.path, privacy: .public)=\(accessOk, privacy: .public)")
+		_ = await Self.ensureSecurityScopedAccess(for: url)
 		// Read source
 		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let type = CGImageSourceGetType(src) else {
-			logger.log("writeKeywords: cannot create CGImageSource for \(url.path, privacy: .public)")
+			logger.log("writeKeywords: cannot create CGImageSource")
 			return false
 		}
 
 		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
-			logger.log("writeKeywords: cannot copy properties for \(url.path, privacy: .public)")
+			logger.log("writeKeywords: cannot copy properties")
 			return false
 		}
 
@@ -2235,7 +2522,7 @@ struct ContentView: View {
 		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(url.pathExtension)
 
 		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
-			logger.error("writeKeywords: cannot create CGImageDestination for tempURL=\(tempURL.path, privacy: .public) type=\(String(describing: type), privacy: .public)")
+			logger.error("writeKeywords: cannot create CGImageDestination")
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
 			// Embedded write failed; do not fall back to sidecar per policy.
 			return false
@@ -2243,7 +2530,7 @@ struct ContentView: View {
 
 		CGImageDestinationAddImageFromSource(dest, src, 0, metadata as CFDictionary)
 		if !CGImageDestinationFinalize(dest) {
-			logger.error("writeKeywords: CGImageDestinationFinalize failed for tempURL=\(tempURL.path, privacy: .public)")
+			logger.error("writeKeywords: CGImageDestinationFinalize failed")
 			try? fm.removeItem(at: tempURL)
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
 			// Finalize failed; do not write sidecar – report failure so caller
@@ -2260,7 +2547,7 @@ struct ContentView: View {
 			try? fm.removeItem(at: backupURL)
 			return true
 		} catch {
-			logger.error("writeKeywords: failed to replace original file \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+			logger.error("writeKeywords: failed to replace original file: \(error.localizedDescription, privacy: .public)")
 			// Attempt to cleanup
 			try? fm.removeItem(at: tempURL)
 			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
@@ -2373,7 +2660,7 @@ struct ContentView: View {
 							// starting a potentially expensive re-scan.
 							if library.folderURL == folder {
 								if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
-									logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag; skipping scan for folder=\(folder.path, privacy: .public)")
+									logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag")
 								} else {
 									library.scan(folder: folder)
 								}
@@ -2395,8 +2682,7 @@ struct ContentView: View {
 		// UI. Stagger window creation on a background task and limit the
 		// number of windows restored to a reasonable cap.
 		let saved = WindowStateStore.shared.openPhotoURLs()
-		let savedListString = saved.map { $0.path }.joined(separator: ",")
-		logger.log("restoreSavedWindowsIfNeeded: saved photo windows count=\(saved.count, privacy: .public) paths=\(savedListString, privacy: .public)")
+		logger.log("restoreSavedWindowsIfNeeded: saved photo windows count=\(saved.count, privacy: .public)")
 		let maxOpen = 8
 		if !saved.isEmpty && !disableAutoRestoreWindows {
 			logger.log("Restoring up to \(maxOpen) saved photo windows (total saved=\(saved.count))")
@@ -2408,7 +2694,7 @@ struct ContentView: View {
 					try? await Task.sleep(nanoseconds: delay)
 					await MainActor.run {
 						openWindow(id: "photo-viewer", value: url)
-						logger.log("restoreSavedWindowsIfNeeded: opening restored window for \(url.path, privacy: .public)")
+						logger.log("restoreSavedWindowsIfNeeded: opening restored window")
 					}
 				}
 				logger.log("Finished scheduling restored photo windows (scheduled=\(min(saved.count, maxOpen)))")

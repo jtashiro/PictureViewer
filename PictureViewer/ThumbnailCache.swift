@@ -52,7 +52,9 @@ final class ThumbnailCache: @unchecked Sendable {
 	/// maintain separate caches if desired. If nil the behaviour is the
 	/// same as before (keyed only by source path).
 	func image(for url: URL, namespace: String? = nil) -> NSImage? {
-		thumbnailLogger.log("thumbnailCache:image(for:) called for \(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
+		if AppLogLevel.current.allows(.debug) {
+			thumbnailLogger.debug("thumbnailCache:image(for:) called for \(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
+		}
 		let key = self.key(for: url, namespace: namespace)
 		if let mem = memCache.object(forKey: key as NSString) {
 			return mem

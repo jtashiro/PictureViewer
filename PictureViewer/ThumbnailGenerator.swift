@@ -61,7 +61,9 @@ final class ThumbnailGenerator: @unchecked Sendable {
 	/// generation is limited by the internal limiter. This function is
 	/// safe to call from background threads.
 	func generateThumbnail(for url: URL, scale: CGFloat? = nil) async throws -> NSImage {
-		qlLogger.log("generateThumbnail:start url=\(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
+		if AppLogLevel.current.allows(.debug) {
+			qlLogger.debug("generateThumbnail:start url=\(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
+		}
 		// Determine scale on main actor if needed.
 		let actualScale: CGFloat
 		if let s = scale {
@@ -77,7 +79,9 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		let request = QLThumbnailGenerator.Request(fileAt: url, size: pixelSize, scale: actualScale, representationTypes: .thumbnail)
 
 		let rep = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
-		qlLogger.log("generateThumbnail:finished url=\(url.path, privacy: .public)")
+		if AppLogLevel.current.allows(.debug) {
+			qlLogger.debug("generateThumbnail:finished url=\(url.path, privacy: .public)")
+		}
 		// Telemetry: count generated thumbnails
 		Task { await Telemetry.shared.recordThumbnail() }
 		return rep.nsImage

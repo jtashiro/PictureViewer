@@ -75,6 +75,51 @@ final class PhotoLibrary {
 					folder.stopAccessingSecurityScopedResource()
 				}
 			}
+
+			let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
+
+			// Set up a single face-processing task and progress UI for the
+			// duration of the scan. Items discovered in each batch are streamed
+			// into a TaskGroup so a single cancel from the progress UI stops
+			// all in-flight face work without affecting the file-system scan.
+			let faceCoordinator: FaceScanCoordinator?
+			let faceContinuation: AsyncStream<PhotoItem>.Continuation?
+			let faceProcessingTask: Task<Void, Never>?
+
+			if faceEnabled {
+				let coord = FaceScanCoordinator()
+				let pair = AsyncStream.makeStream(of: PhotoItem.self)
+				let stream = pair.stream
+				let task = Task.detached(priority: .utility) {
+					await withTaskGroup(of: Void.self) { group in
+						for await item in stream {
+							if Task.isCancelled { break }
+							group.addTask {
+								if Task.isCancelled { return }
+								_ = await FaceProcessor.shared.process(file: item.url)
+								await coord.recordCompletion()
+							}
+						}
+					}
+				}
+				faceCoordinator = coord
+				faceContinuation = pair.continuation
+				faceProcessingTask = task
+
+				await MainActor.run {
+					FaceScanProgress.shared.begin(title: "Scanning faces", total: 0) {
+						pair.continuation.finish()
+						task.cancel()
+						Task { await coord.markCancelled() }
+					}
+				}
+			} else {
+				faceCoordinator = nil
+				faceContinuation = nil
+				faceProcessingTask = nil
+				Self.logger.log("face processing disabled for scan (enableFaceRecognition=false)")
+			}
+
 			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
 				if Task.isCancelled { break }
 
@@ -90,19 +135,25 @@ final class PhotoLibrary {
 				await Telemetry.shared.recordFound(batch.count)
 				await Telemetry.shared.recordBatchYield()
 
-				// Kick off face processing for this batch in background.
-				let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-				if faceEnabled {
-					Task.detached(priority: .utility) {
-						Self.logger.log("scheduling face processing for batch of \(batch.count, privacy: .public) items")
+				// Feed this batch into the face-processing pipeline unless the
+				// user has cancelled face work for this scan.
+				if let coord = faceCoordinator, let cont = faceContinuation {
+					let alreadyCancelled = await coord.isCancelled()
+					if !alreadyCancelled {
+						await coord.addToTotal(batch.count)
 						for item in batch {
-							if Task.isCancelled { break }
-							_ = await FaceProcessor.shared.process(file: item.url)
+							cont.yield(item)
 						}
 					}
-				} else {
-					Self.logger.log("face processing skipped for batch (enableFaceRecognition=false)")
 				}
+			}
+
+			// Close the face stream and wait for in-flight work to finish or
+			// drain after cancellation before tearing down the progress UI.
+			faceContinuation?.finish()
+			if let task = faceProcessingTask {
+				_ = await task.value
+				await MainActor.run { FaceScanProgress.shared.end() }
 			}
 
 			// Finished scanning; update state on main actor.
