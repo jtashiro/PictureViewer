@@ -348,6 +348,7 @@ struct FullScreenPhotoView: View {
 
 		if let destinationURL = savedURL {
 			let previousURL = currentURL
+			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(destinationURL, sourceWorkingURL: previousURL)
 			currentURL = destinationURL
 			WindowStateStore.shared.recordClosedPhoto(previousURL)
 			WindowStateStore.shared.recordOpenPhoto(destinationURL)

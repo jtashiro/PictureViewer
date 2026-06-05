@@ -16,6 +16,26 @@ extension Notification.Name {
 	static let embedWriteFailed = Notification.Name("com.example.PictureViewer.embedWriteFailed")
 }
 
+struct VaultCommandActions {
+	let importFolders: () -> Void
+	let importSelected: () -> Void
+	let openVault: () -> Void
+	let exportPhotos: () -> Void
+	let canImportSelected: Bool
+	let canExport: Bool
+}
+
+private struct VaultCommandActionsKey: FocusedValueKey {
+	typealias Value = VaultCommandActions
+}
+
+extension FocusedValues {
+	var vaultCommandActions: VaultCommandActions? {
+		get { self[VaultCommandActionsKey.self] }
+		set { self[VaultCommandActionsKey.self] = newValue }
+	}
+}
+
 private struct ThumbnailFramePreferenceKey: PreferenceKey {
 	static var defaultValue: [URL: CGRect] = [:]
 
@@ -46,7 +66,7 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 	}
 
 	func makeNSView(context: Context) -> NSView {
-		let view = NSView(frame: .zero)
+		let view = SelectAllResponderView(frame: .zero)
 		context.coordinator.view = view
 		context.coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
 			coordinator?.handle(event) ?? event
@@ -58,6 +78,57 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 		context.coordinator.view = nsView
 		context.coordinator.isEnabled = isEnabled
 		context.coordinator.action = action
+		if let responderView = nsView as? SelectAllResponderView {
+			responderView.isSelectAllEnabled = isEnabled
+			responderView.selectAllAction = action
+			responderView.ensureMenuResponderIfAppropriate()
+		}
+	}
+
+	final class SelectAllResponderView: NSView, NSUserInterfaceValidations {
+		var isSelectAllEnabled = false
+		var selectAllAction: (() -> Void)?
+
+		override var acceptsFirstResponder: Bool { true }
+
+		override func viewDidMoveToWindow() {
+			super.viewDidMoveToWindow()
+			ensureMenuResponderIfAppropriate()
+		}
+
+		func ensureMenuResponderIfAppropriate() {
+			guard isSelectAllEnabled,
+				  let window,
+				  window.firstResponder == nil || !Self.isTextEditingFirstResponder(window.firstResponder)
+			else { return }
+			window.makeFirstResponder(self)
+		}
+
+		override func selectAll(_ sender: Any?) {
+			guard isSelectAllEnabled,
+				  let window,
+				  !Self.isTextEditingFirstResponder(window.firstResponder)
+			else { return }
+			selectAllAction?()
+		}
+
+		func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+			if item.action == #selector(selectAll(_:)) {
+				return isSelectAllEnabled
+			}
+			return false
+		}
+
+		static func isTextEditingFirstResponder(_ responder: NSResponder?) -> Bool {
+			var current = responder
+			while let candidate = current {
+				if candidate is NSTextView || candidate is NSTextField || candidate is NSSearchField {
+					return true
+				}
+				current = candidate.nextResponder
+			}
+			return false
+		}
 	}
 
 	final class Coordinator {
@@ -78,24 +149,13 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 				window.isKeyWindow,
 				event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
 				event.charactersIgnoringModifiers?.lowercased() == "a",
-				!isTextEditingFirstResponder(window.firstResponder)
+				!SelectAllResponderView.isTextEditingFirstResponder(window.firstResponder)
 			else {
 				return event
 			}
 
 			action?()
 			return nil
-		}
-
-		private func isTextEditingFirstResponder(_ responder: NSResponder?) -> Bool {
-			var current = responder
-			while let candidate = current {
-				if candidate is NSTextView || candidate is NSTextField || candidate is NSSearchField {
-					return true
-				}
-				current = candidate.nextResponder
-			}
-			return false
 		}
 	}
 }
@@ -130,21 +190,25 @@ struct ContentView: View {
 	/// Restore a persisted security-scoped bookmark (if present) and start
 	/// accessing the resource so the app can write into the folder while
 	/// sandboxed. This is safe to call at startup.
-	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async {
-		let fm = FileManager.default
-
+	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async -> Bool {
 		// Prefer multi-bookmark list if available.
 		if let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data], !arr.isEmpty {
-			// Resolve all bookmarks and attempt to restore cached snapshots
-			// for each. Combine and dedupe the restored file list before
-			// publishing to the UI.
 			var resolvedFolders: [URL] = []
+			var seenPaths: Set<String> = []
+			var duplicateCount = 0
 			for bm in arr {
 				var stale = false
 				do {
 					let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
 					if url.startAccessingSecurityScopedResource() {
-						resolvedFolders.append(url)
+						if seenPaths.insert(url.path).inserted {
+							resolvedFolders.append(url)
+							if AppLogLevel.current.allows(.debug) {
+								logger.debug("launch folder restore: resolved bookmark path=\(url.path, privacy: .public) stale=\(stale, privacy: .public)")
+							}
+						} else {
+							duplicateCount += 1
+						}
 						if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
 					}
 				} catch {
@@ -152,26 +216,34 @@ struct ContentView: View {
 				}
 			}
 
-			guard !resolvedFolders.isEmpty else { return }
+			guard !resolvedFolders.isEmpty else {
+				logger.log("launch folder restore: source=bookmark-list result=none bookmarkCount=\(arr.count, privacy: .public)")
+				return false
+			}
 
 			// Multi-bookmark restore: seed the first bookmark into THIS
 			// ContentView and open additional folder windows for the rest, so
 			// each bookmark becomes its own tab instead of being combined.
 			let first = resolvedFolders[0]
 			let rest = Array(resolvedFolders.dropFirst())
+			logger.log("launch folder restore: source=bookmark-list storage=filesystem bookmarkCount=\(arr.count, privacy: .public) uniqueFolders=\(resolvedFolders.count, privacy: .public) duplicatesRemoved=\(duplicateCount, privacy: .public) primaryFolder=\(first.path, privacy: .public)")
 			await MainActor.run {
 				library.folderURL = first
 				activeFolderNames = [first.lastPathComponent]
 				library.scan(folder: first)
 				for url in rest {
+					logger.log("launch folder restore: source=bookmark-list storage=filesystem action=open-tab folder=\(url.path, privacy: .public)")
 					openWindow(id: "folder", value: url)
 				}
 			}
-			return
+			return true
 		}
 
 		// Fallback to single-bookmark behavior for backward compatibility.
-		guard let bm = UserDefaults.standard.data(forKey: Self.kLastFolderBookmark) else { return }
+		guard let bm = UserDefaults.standard.data(forKey: Self.kLastFolderBookmark) else {
+			logger.log("launch folder restore: source=legacy-bookmark result=none")
+			return false
+		}
 		var stale = false
 		do {
 			let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
@@ -199,6 +271,12 @@ struct ContentView: View {
 						for u in urls {
 							let name = u.lastPathComponent.lowercased()
 							if seen.insert(name).inserted { deduped.append(u) }
+						}
+						deduped.sort {
+							$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+						}
+						await MainActor.run {
+							logger.log("launch folder restore: source=legacy-bookmark storage=cache folder=\(url.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
 						}
 						let batchSize = 256
 						await MainActor.run { library.photos = [] }
@@ -241,27 +319,34 @@ struct ContentView: View {
 								// Ensure we still have the same folder before
 								// starting a potentially expensive re-scan.
 								if library.folderURL == url {
-												// Read the AppStorage-backed flag from UserDefaults here
-												// because this is a static context and instance
-												// properties (like @AppStorage) aren't available.
-												if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
-																			logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag")
-												} else {
-													library.scan(folder: url)
-												}
+									// Read the AppStorage-backed flag from UserDefaults here
+									// because this is a static context and instance
+									// properties (like @AppStorage) aren't available.
+									if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
+										logger.log("launch folder refresh: source=legacy-bookmark storage=filesystem result=deferred folder=\(url.path, privacy: .public)")
+									} else {
+										logger.log("launch folder refresh: source=legacy-bookmark storage=filesystem result=started folder=\(url.path, privacy: .public)")
+										library.scan(folder: url)
+									}
 								}
 							}
 						}
 					} else {
 						// No cached snapshot available; retain current behavior
 						// of not auto-scanning at launch.
-						await MainActor.run { library.folderURL = url; activeFolderNames = [url.lastPathComponent] }
+						await MainActor.run {
+							logger.log("launch folder restore: source=legacy-bookmark storage=cache result=miss folder=\(url.path, privacy: .public)")
+							library.folderURL = url
+							activeFolderNames = [url.lastPathComponent]
+						}
 					}
 				}
+				return true
 			}
 		} catch {
 			logger.error("restoreFolderBookmarkIfNeeded: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
 		}
+		return false
 	}
 
 	/// Attempt to repair metadata for `url` by reading any existing sidecar
@@ -505,6 +590,7 @@ struct ContentView: View {
 			try fm.moveItem(at: url, to: backupURL)
 			try fm.moveItem(at: tempURL, to: url)
 			try? fm.removeItem(at: backupURL)
+			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
 			return true
 		} catch {
 			try? fm.removeItem(at: tempURL)
@@ -576,6 +662,7 @@ struct ContentView: View {
 				try fm.moveItem(at: url, to: backupURL)
 				try fm.moveItem(at: tempURL, to: url)
 				try? fm.removeItem(at: backupURL)
+				await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
 				return true
 			} catch {
 				try? fm.removeItem(at: tempURL)
@@ -593,6 +680,8 @@ struct ContentView: View {
 	@State private var isRefreshing = false
 	@State private var selectionMode: Bool = false
 	@State private var selectedItems: Set<URL> = []
+	@State private var isAllDisplayedSelectionActive: Bool = false
+	@State private var deselectedItemsFromAll: Set<URL> = []
 	@State private var thumbnailFrames: [URL: CGRect] = [:]
 	@State private var selectionDragStart: CGPoint? = nil
 	@State private var selectionDragCurrent: CGPoint? = nil
@@ -687,6 +776,13 @@ struct ContentView: View {
 	@State private var showEmbedWriteAlert: Bool = false
 	@State private var embedFailMessage: String? = nil
 	@State private var embedFailURL: URL? = nil
+	@State private var isVaultWorking: Bool = false
+	@State private var vaultProgressMessage: String = ""
+	@State private var vaultProgressCompleted: Int = 0
+	@State private var vaultProgressTotal: Int = 0
+	@State private var vaultProgressCurrentFile: String = ""
+	@State private var showVaultAlert: Bool = false
+	@State private var vaultAlertMessage: String = ""
 
 	var body: some View {
 		NavigationStack {
@@ -701,6 +797,14 @@ struct ContentView: View {
 							activeFolderNames.isEmpty ? (library.folderURL?.lastPathComponent ?? "Picture Viewer") : (activeFolderNames.count == 1 ? activeFolderNames.first! : activeFolderNames.joined(separator: " · "))
 						)
 			.toolbar { toolbarItems }
+			.focusedSceneValue(\.vaultCommandActions, VaultCommandActions(
+				importFolders: { importFolderToVault() },
+				importSelected: { importSelectedImagesToVault() },
+				openVault: { openVault() },
+				exportPhotos: { exportVaultSelection() },
+				canImportSelected: hasSelectedPhotos,
+				canExport: !library.photos.isEmpty
+			))
 		}
 		.frame(minWidth: 760, minHeight: 540)
 		// Attach a WindowAccessor so we can set window-level defaults like
@@ -732,6 +836,7 @@ struct ContentView: View {
 			// (per-folder window opened via openWindow(id:"folder", value:url)),
 			// scan that folder directly and skip launch restoration.
 			if let seed = initialFolderURL {
+				logger.log("launch folder restore: source=initial-folder-window storage=filesystem folder=\(seed.path, privacy: .public)")
 				library.folderURL = seed
 				activeFolderNames = [seed.lastPathComponent]
 				library.scan(folder: seed)
@@ -755,9 +860,9 @@ struct ContentView: View {
 					// instances blank instead.
 					let didRestore = await MainActor.run { Self.didPerformLaunchRestore }
 					if !didRestore {
-						await self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
+						let restoredBookmarks = await self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
 						await MainActor.run { Self.didPerformLaunchRestore = true }
-						await MainActor.run { restoreSavedWindowsIfNeeded() }
+						await MainActor.run { restoreSavedWindowsIfNeeded(skipSavedFolder: restoredBookmarks) }
 					} else {
 						// No-op for subsequent ContentView instances.
 					}
@@ -817,14 +922,14 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isEditingKeywords) {
 			VStack(spacing: 12) {
-				Text("Edit Keywords for \(selectedItems.count) photos")
+				Text("Edit Keywords for \(selectedPhotoCount) photos")
 					.font(.headline)
 				TextField("Keywords (comma-separated)", text: $editKeywordsText)
 					.textFieldStyle(.roundedBorder)
 					.padding(.horizontal)
 
 				// Results list + progress
-				let urls = Array(selectedItems)
+				let urls = selectedPhotoURLs
 				if !urls.isEmpty {
 					ProgressView(value: Double(editProgressCount), total: Double(urls.count))
 						.padding(.horizontal)
@@ -881,7 +986,7 @@ struct ContentView: View {
 							let parts = editKeywordsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
 							guard !parts.isEmpty else { return }
 							// Prepare progress state
-							let urls = Array(selectedItems)
+							let urls = selectedPhotoURLs
 							editingResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
 							editProgressCount = 0
 							isApplyingKeywords = true
@@ -899,13 +1004,13 @@ struct ContentView: View {
 								await MainActor.run {
 									// Remove successful items from selection to indicate completion
 									for (u, res) in editingResults {
-										if res == true { selectedItems.remove(u) }
+										if res == true { removeFromSelection(u) }
 									}
 									isApplyingKeywords = false
 								}
 							}
 						}
-						.disabled(editKeywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || selectedItems.isEmpty)
+						.disabled(editKeywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasSelectedPhotos)
 					}
 				}
 				.padding(.horizontal)
@@ -1051,6 +1156,36 @@ struct ContentView: View {
 				secondaryButton: .cancel(Text("OK"))
 			)
 		}
+		.alert("Encrypted Storage", isPresented: $showVaultAlert) {
+			Button("OK", role: .cancel) {}
+		} message: {
+			Text(vaultAlertMessage)
+		}
+		.sheet(isPresented: $isVaultWorking) {
+			VStack(spacing: 12) {
+				Text(vaultProgressMessage)
+					.font(.headline)
+				if vaultProgressTotal > 0 {
+					ProgressView(value: Double(vaultProgressCompleted), total: Double(vaultProgressTotal))
+					Text("\(vaultProgressCompleted) of \(vaultProgressTotal)")
+						.font(.caption)
+						.foregroundStyle(.secondary)
+						.monospacedDigit()
+					if !vaultProgressCurrentFile.isEmpty {
+						Text(vaultProgressCurrentFile)
+							.font(.caption)
+							.foregroundStyle(.secondary)
+							.lineLimit(1)
+							.truncationMode(.middle)
+					}
+				} else {
+					ProgressView()
+						.controlSize(.large)
+				}
+			}
+			.padding()
+			.frame(minWidth: 360, minHeight: 160)
+		}
 		// Show inline deletion progress while background delete runs
 		.sheet(isPresented: $isDeleting) {
 			VStack(spacing: 12) {
@@ -1113,10 +1248,10 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isShowingRotationSheet) {
 			VStack(spacing: 12) {
-				Text("Apply Rotations to \(selectedItems.count) photos")
+				Text("Apply Rotations to \(selectedPhotoCount) photos")
 					.font(.headline)
 
-				let urls = Array(selectedItems)
+				let urls = selectedPhotoURLs
 				if !urls.isEmpty {
 					ProgressView(value: Double(rotProgressCount), total: Double(urls.count))
 						.padding(.horizontal)
@@ -1157,7 +1292,7 @@ struct ContentView: View {
 						Button("Close") { isShowingRotationSheet = false }
 					} else {
 						Button("Apply") {
-							let urls = Array(selectedItems)
+							let urls = selectedPhotoURLs
 							rotationResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
 							rotProgressCount = 0
 							isApplyingRotations = true
@@ -1176,7 +1311,7 @@ struct ContentView: View {
 										rotProgressCount += 1
 										if ok {
 											// Update UI: remove from selection and refresh thumbnails
-											selectedItems.remove(u)
+											removeFromSelection(u)
 										}
 									}
 								}
@@ -1188,7 +1323,7 @@ struct ContentView: View {
 								}
 							}
 						}
-						.disabled(selectedItems.isEmpty)
+						.disabled(!hasSelectedPhotos)
 					}
 				}
 				.padding(.horizontal)
@@ -1198,7 +1333,7 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isShowingBrightnessSheet) {
 			VStack(spacing: 16) {
-				Text("Adjust Brightness for \(selectedItems.count) photo\(selectedItems.count == 1 ? "" : "s")")
+				Text("Adjust Brightness for \(selectedPhotoCount) photo\(selectedPhotoCount == 1 ? "" : "s")")
 					.font(.headline)
 
 				VStack(alignment: .leading, spacing: 6) {
@@ -1214,11 +1349,11 @@ struct ContentView: View {
 				.padding(.horizontal)
 
 				if isApplyingBrightness {
-					ProgressView(value: Double(brightnessProgressCount), total: Double(selectedItems.count))
+					ProgressView(value: Double(brightnessProgressCount), total: Double(selectedPhotoCount))
 						.padding(.horizontal)
 					ScrollView {
 						VStack(alignment: .leading, spacing: 8) {
-							ForEach(Array(selectedItems).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }), id: \.self) { u in
+							ForEach(selectedPhotoURLs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }), id: \.self) { u in
 								HStack {
 									Text(u.lastPathComponent)
 										.font(.caption)
@@ -1247,7 +1382,7 @@ struct ContentView: View {
 						Button("Close") { isShowingBrightnessSheet = false }
 					} else {
 						Button("Apply") {
-							let urls = Array(selectedItems)
+							let urls = selectedPhotoURLs
 							brightnessResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
 							brightnessProgressCount = 0
 							isApplyingBrightness = true
@@ -1268,7 +1403,7 @@ struct ContentView: View {
 								}
 							}
 						}
-						.disabled(selectedItems.isEmpty || brightnessAdjustment == 0)
+						.disabled(!hasSelectedPhotos || brightnessAdjustment == 0)
 					}
 				}
 				.padding(.horizontal)
@@ -1444,7 +1579,7 @@ struct ContentView: View {
 				spacing: 10
 			) {
 				ForEach(displayedPhotos) { photo in
-					let isSelected = selectedItems.contains(photo.url)
+					let isSelected = isPhotoSelected(photo.url)
 					ZStack(alignment: .topTrailing) {
 						VStack(spacing: 4) {
 							ThumbnailView(
@@ -1535,7 +1670,7 @@ struct ContentView: View {
 							}
 						}
 						selectionDragStart = value.startLocation
-						selectionDragBase = selectedItems
+						selectionDragBase = selectedSetForMarqueeBase()
 						selectionDragMode = marqueeSelectionModeForCurrentModifiers()
 					}
 					if suppressMarqueeDuringItemDrag { return }
@@ -1599,6 +1734,27 @@ struct ContentView: View {
 			}
 			.help("Choose a folder to browse")
 		}
+		ToolbarItem(placement: .primaryAction) {
+			Menu {
+				Button("Import Folder to Encrypted Storage…") {
+					importFolderToVault()
+				}
+				Button("Store Selected Images in Encrypted Storage") {
+					importSelectedImagesToVault()
+				}
+				.disabled(!hasSelectedPhotos)
+				Button("Open Encrypted Storage") {
+					openVault()
+				}
+				Button(hasSelectedPhotos ? "Export Selected…" : "Export All Displayed…") {
+					exportVaultSelection()
+				}
+				.disabled(library.photos.isEmpty)
+			} label: {
+				Label("Encrypted Storage", systemImage: "lock.doc")
+			}
+			.help("Import, open, or export encrypted photos")
+		}
 		ToolbarItem(placement: .automatic) {
 			HStack(spacing: 6) {
 				Image(systemName: "photo")
@@ -1645,7 +1801,7 @@ struct ContentView: View {
 				// Edit / selection controls
 				Button {
 					selectionMode.toggle()
-					if !selectionMode { selectedItems.removeAll() }
+					if !selectionMode { clearSelection() }
 				} label: {
 					Text(selectionMode ? "Done" : "Edit")
 				}
@@ -1673,11 +1829,11 @@ struct ContentView: View {
 					}) {
 						Text("Edit Keywords")
 					}
-					.disabled(selectedItems.isEmpty)
+					.disabled(!hasSelectedPhotos)
 					.help("Edit keyword metadata for selected photos")
 					Button(action: {
 						// Rotate selected thumbnails left
-						for u in selectedItems {
+						for u in selectedPhotoURLs {
 							let cur = selectedRotations[u] ?? 0
 							let next = (cur - 90) % 360
 							selectedRotations[u] = next < 0 ? next + 360 : next
@@ -1685,26 +1841,26 @@ struct ContentView: View {
 					}) {
 						Image(systemName: "rotate.left")
 					}
-					.disabled(selectedItems.isEmpty)
+					.disabled(!hasSelectedPhotos)
 					.help("Rotate selection left 90° (preview)")
 					Button(action: {
 						// Rotate selected thumbnails right
-						for u in selectedItems {
+						for u in selectedPhotoURLs {
 							let cur = selectedRotations[u] ?? 0
 							selectedRotations[u] = (cur + 90) % 360
 						}
 					}) {
 						Image(systemName: "rotate.right")
 					}
-					.disabled(selectedItems.isEmpty)
+					.disabled(!hasSelectedPhotos)
 					.help("Rotate selection right 90° (preview)")
 					Button(action: {
 						// Trigger delete confirmation
-						requestDeleteConfirmation(urls: Array(selectedItems), source: "toolbar")
+						requestDeleteConfirmation(urls: selectedPhotoURLs, source: "toolbar")
 					}) {
 						Image(systemName: "trash")
 					}
-					.disabled(selectedItems.isEmpty)
+					.disabled(!hasSelectedPhotos)
 					.help("Permanently delete selected files")
 					Button(action: {
 						// Show rotation apply sheet
@@ -1712,14 +1868,14 @@ struct ContentView: View {
 					}) {
 						Text("Apply Rotations")
 					}
-					.disabled(selectedItems.isEmpty || selectedRotations.filter { $0.value % 360 != 0 }.isEmpty)
+					.disabled(!hasSelectedPhotos || selectedRotations.filter { $0.value % 360 != 0 }.isEmpty)
 					.help("Persist rotations for selected files")
 					Button(action: {
 						isShowingBrightnessSheet = true
 					}) {
 						Image(systemName: "sun.max")
 					}
-					.disabled(selectedItems.isEmpty)
+					.disabled(!hasSelectedPhotos)
 					.help("Adjust brightness of selected photos")
 					Button(action: {
 						selectAllDisplayedPhotos()
@@ -1727,7 +1883,7 @@ struct ContentView: View {
 						Text("Select All")
 					}
 					.help("Select all displayed thumbnails")
-					Button(action: { selectedItems.removeAll() }) {
+					Button(action: { clearSelection() }) {
 						Text("Clear")
 					}
 					.help("Clear selection")
@@ -1765,6 +1921,50 @@ struct ContentView: View {
 		}
 	}
 
+	private var selectedPhotoCount: Int {
+		if isAllDisplayedSelectionActive {
+			return max(0, displayedPhotos.count - deselectedItemsFromAll.count)
+		}
+		return selectedItems.count
+	}
+
+	private var hasSelectedPhotos: Bool {
+		selectedPhotoCount > 0
+	}
+
+	private var selectedPhotoURLs: [URL] {
+		if isAllDisplayedSelectionActive {
+			let excluded = deselectedItemsFromAll
+			return displayedPhotos.map(\.url).filter { !excluded.contains($0) }
+		}
+		return Array(selectedItems)
+	}
+
+	private func isPhotoSelected(_ url: URL) -> Bool {
+		if isAllDisplayedSelectionActive {
+			return !deselectedItemsFromAll.contains(url)
+		}
+		return selectedItems.contains(url)
+	}
+
+	private func clearSelection() {
+		selectedItems.removeAll()
+		deselectedItemsFromAll.removeAll()
+		isAllDisplayedSelectionActive = false
+	}
+
+	private func removeFromSelection(_ url: URL) {
+		if isAllDisplayedSelectionActive {
+			deselectedItemsFromAll.insert(url)
+		} else {
+			selectedItems.remove(url)
+		}
+	}
+
+	private func selectedSetForMarqueeBase() -> Set<URL> {
+		Set(selectedPhotoURLs)
+	}
+
 	private func loadExistingPersonNamesForAssignment() {
 		Task.detached(priority: .utility) {
 			let names = await FaceProcessor.shared.personsList()
@@ -1776,13 +1976,14 @@ struct ContentView: View {
 	}
 
 	private var faceActionTargetURLs: [URL] {
-		if !selectedItems.isEmpty { return Array(selectedItems) }
+		if hasSelectedPhotos { return selectedPhotoURLs }
 		return library.photos.map { $0.url }
 	}
 
 	private func selectAllDisplayedPhotos() {
-		selectionMode = true
-		selectedItems = Set(displayedPhotos.map { $0.url })
+		selectedItems.removeAll()
+		deselectedItemsFromAll.removeAll()
+		isAllDisplayedSelectionActive = true
 	}
 
 	private func applyPersonAssignmentToSelection() {
@@ -1844,7 +2045,19 @@ struct ContentView: View {
 		selectionDragBase = []
 		selectionDragMode = .replace
 		suppressMarqueeDuringItemDrag = false
-		if selectedItems.contains(url) {
+		guard selectionMode else {
+			selectedItems = [url]
+			deselectedItemsFromAll.removeAll()
+			isAllDisplayedSelectionActive = false
+			return
+		}
+		if isAllDisplayedSelectionActive {
+			if deselectedItemsFromAll.contains(url) {
+				deselectedItemsFromAll.remove(url)
+			} else {
+				deselectedItemsFromAll.insert(url)
+			}
+		} else if selectedItems.contains(url) {
 			selectedItems.remove(url)
 		} else {
 			selectedItems.insert(url)
@@ -1865,6 +2078,8 @@ struct ContentView: View {
 			frame.intersects(selectionRect) ? url : nil
 		}
 		let hitSet = Set(hits)
+		isAllDisplayedSelectionActive = false
+		deselectedItemsFromAll.removeAll()
 		switch selectionDragMode {
 		case .replace:
 			selectedItems = hitSet
@@ -1925,8 +2140,8 @@ struct ContentView: View {
 	}
 
 	private func contextActionURLs(for photoURL: URL) -> [URL] {
-		if selectedItems.contains(photoURL), !selectedItems.isEmpty {
-			return selectedItems.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+		if isPhotoSelected(photoURL), hasSelectedPhotos {
+			return selectedPhotoURLs.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
 		}
 		return [photoURL]
 	}
@@ -2014,6 +2229,8 @@ struct ContentView: View {
 			return
 		}
 		var resolved: [URL] = []
+		var seenPaths: Set<String> = []
+		var resolvedData: [Data] = []
 		for bm in arr {
 			var stale = false
 			do {
@@ -2023,12 +2240,165 @@ struct ContentView: View {
 						Self.activeSecurityScopedURLs.append(url)
 					}
 				}
-				resolved.append(url)
+				if seenPaths.insert(url.path).inserted {
+					resolved.append(url)
+					resolvedData.append(bm)
+				}
 			} catch {
 				logger.error("reloadBookmarks: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
 			}
 		}
+		if resolvedData.count != arr.count {
+			logger.log("bookmark reload: removed duplicate bookmark entries originalCount=\(arr.count, privacy: .public) uniqueCount=\(resolvedData.count, privacy: .public)")
+			UserDefaults.standard.set(resolvedData, forKey: Self.kLastFolderBookmarks)
+			if let first = resolvedData.first {
+				UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
+			} else {
+				UserDefaults.standard.removeObject(forKey: Self.kLastFolderBookmark)
+			}
+		}
 		bookmarkURLs = resolved
+	}
+
+	private func importFolderToVault() {
+		let panel = NSOpenPanel()
+		panel.canChooseFiles = false
+		panel.canChooseDirectories = true
+		panel.allowsMultipleSelection = true
+		panel.message = "Choose one or more photo folders to import into encrypted storage"
+		panel.prompt = "Import"
+		guard panel.runModal() == .OK else { return }
+		let folders = panel.urls
+		guard !folders.isEmpty else { return }
+
+		isVaultWorking = true
+		vaultProgressMessage = "Scanning folders..."
+		Task.detached(priority: .userInitiated) {
+			var imageURLs: [URL] = []
+			for folder in folders {
+				let started = folder.startAccessingSecurityScopedResource()
+				defer { if started { folder.stopAccessingSecurityScopedResource() } }
+				for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+					imageURLs.append(contentsOf: batch.map(\.url))
+				}
+			}
+			let scannedURLs = imageURLs
+			await MainActor.run {
+				storeImagesInVault(scannedURLs, progressMessage: "Importing encrypted photos...")
+			}
+		}
+	}
+
+	private func importSelectedImagesToVault() {
+		let urls = selectedPhotoURLs
+		logger.log("vault store selected: requested selectedCount=\(urls.count, privacy: .public) allDisplayedActive=\(isAllDisplayedSelectionActive, privacy: .public)")
+		guard !urls.isEmpty else { return }
+		storeImagesInVault(urls, progressMessage: "Storing selected photos...")
+	}
+
+	private func storeImagesInVault(_ urls: [URL], progressMessage: String) {
+		guard !urls.isEmpty else { return }
+		isVaultWorking = true
+		vaultProgressMessage = progressMessage
+		vaultProgressCompleted = 0
+		vaultProgressTotal = urls.count
+		vaultProgressCurrentFile = ""
+		logger.log("vault store: start count=\(urls.count, privacy: .public)")
+		Task.detached(priority: .userInitiated) {
+			do {
+				let workingURLs = try await PhotoVault.shared.importFiles(urls) { completed, total, currentFile in
+					await MainActor.run {
+						vaultProgressCompleted = completed
+						vaultProgressTotal = total
+						vaultProgressCurrentFile = currentFile
+					}
+				}
+				let photos = workingURLs.map { PhotoItem(url: $0) }
+				await MainActor.run {
+					let existing = Set(library.photos.map(\.url))
+					let newPhotos = photos.filter { !existing.contains($0.url) }
+					library.photos.append(contentsOf: newPhotos)
+					library.folderURL = URL(fileURLWithPath: "Encrypted Storage")
+					activeFolderNames = ["Encrypted Storage"]
+					library.lastScanDate = Date()
+					library.lastScanDuration = nil
+					clearSelection()
+					isVaultWorking = false
+					vaultAlertMessage = "Stored \(workingURLs.count) of \(urls.count) photo\(urls.count == 1 ? "" : "s") in encrypted storage."
+					showVaultAlert = true
+					logger.log("vault store: complete requested=\(urls.count, privacy: .public) stored=\(workingURLs.count, privacy: .public)")
+					scheduleSort()
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultAlertMessage = error.localizedDescription
+					showVaultAlert = true
+					logger.error("vault store: failed error=\(error.localizedDescription, privacy: .public)")
+				}
+			}
+		}
+	}
+
+	private func openVault() {
+		isVaultWorking = true
+		vaultProgressMessage = "Opening encrypted storage..."
+		Task.detached(priority: .userInitiated) {
+			do {
+				let workingURLs = try await PhotoVault.shared.loadWorkingCopies()
+				let photos = workingURLs.map { PhotoItem(url: $0) }
+				await MainActor.run {
+					library.photos = photos
+					library.folderURL = URL(fileURLWithPath: "Encrypted Storage")
+					activeFolderNames = ["Encrypted Storage"]
+					library.lastScanDate = Date()
+					library.lastScanDuration = nil
+					selectedItems.removeAll()
+					isVaultWorking = false
+					scheduleSort()
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultAlertMessage = error.localizedDescription
+					showVaultAlert = true
+				}
+			}
+		}
+	}
+
+	private func exportVaultSelection() {
+		let panel = NSOpenPanel()
+		panel.canChooseFiles = false
+		panel.canChooseDirectories = true
+		panel.allowsMultipleSelection = false
+		panel.canCreateDirectories = true
+		panel.message = "Choose where exported photo files should be restored"
+		panel.prompt = "Export"
+		guard panel.runModal() == .OK, let folder = panel.url else { return }
+		let urls = selectedItems.isEmpty ? displayedPhotos.map(\.url) : Array(selectedItems)
+		guard !urls.isEmpty else { return }
+
+		isVaultWorking = true
+		vaultProgressMessage = "Exporting photos..."
+		Task.detached(priority: .userInitiated) {
+			let started = folder.startAccessingSecurityScopedResource()
+			defer { if started { folder.stopAccessingSecurityScopedResource() } }
+			do {
+				let count = try await PhotoVault.shared.exportFiles(urls, to: folder)
+				await MainActor.run {
+					isVaultWorking = false
+					vaultAlertMessage = "Exported \(count) photo\(count == 1 ? "" : "s")."
+					showVaultAlert = true
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultAlertMessage = error.localizedDescription
+					showVaultAlert = true
+				}
+			}
+		}
 	}
 
 	private func chooseFolder() {
@@ -2039,7 +2409,11 @@ struct ContentView: View {
 		panel.message = "Choose one or more folders containing photos"
 		panel.prompt = "Choose"
 		if panel.runModal() == .OK {
-			let urls = panel.urls
+			var urls: [URL] = []
+			var selectedPaths: Set<String> = []
+			for url in panel.urls where selectedPaths.insert(url.path).inserted {
+				urls.append(url)
+			}
 			guard !urls.isEmpty else { return }
 
 			// Create bookmarks for each selected folder and persist them as
@@ -2208,6 +2582,7 @@ struct ContentView: View {
 						throw NSError(domain: "PictureViewer.Delete", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing folder permission. Re-select the folder and try again."])
 					}
 					try fm.removeItem(at: u)
+					await PhotoVault.shared.deleteEncryptedCounterpartIfNeeded(for: u)
 					success = true
 					await MainActor.run { self.logger.log("performDelete: deleted item") }
 				} catch {
@@ -2299,7 +2674,14 @@ struct ContentView: View {
 		// Quick-pass: update displayedPhotos with a filename-only match
 		// performed on the main actor so typing feels snappy.
 		if filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-			displayedPhotos = photos
+			switch mode {
+			case .alphaAsc:
+				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending }
+			case .alphaDesc:
+				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedDescending }
+			case .fileDate, .imageDate:
+				displayedPhotos = photos
+			}
 		} else {
 			// Attempt to compile regex for filename-only check; if invalid,
 			// fall back to case-insensitive substring match.
@@ -2516,6 +2898,7 @@ struct ContentView: View {
 			try fm.moveItem(at: url, to: backupURL)
 			try fm.moveItem(at: tempURL, to: url)
 			try? fm.removeItem(at: backupURL)
+			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
 			return true
 		} catch {
 			logger.error("writeKeywords: failed to replace original file: \(error.localizedDescription, privacy: .public)")
@@ -2527,13 +2910,19 @@ struct ContentView: View {
 		}
 	}
 
-	private func restoreSavedWindowsIfNeeded() {
-		logger.log("restoreSavedWindowsIfNeeded called; saveOpenWindows=\(self.saveOpenWindows, privacy: .public) disableAutoRestore=\(self.disableAutoRestoreWindows, privacy: .public)")
+	private func restoreSavedWindowsIfNeeded(skipSavedFolder: Bool) {
+		logger.log("launch saved-state restore: saveOpenWindows=\(self.saveOpenWindows, privacy: .public) disableAutoRestore=\(self.disableAutoRestoreWindows, privacy: .public) skipSavedFolder=\(skipSavedFolder, privacy: .public)")
 		// Only the first ContentView at launch consumes the persisted
 		// session. New windows opened later (File → New, Cmd+N) start
 		// blank and prompt the user for a folder.
-		guard saveOpenWindows else { return }
-		guard WindowStateStore.shared.consumeLaunchRestoration() else { return }
+		guard saveOpenWindows else {
+			logger.log("launch saved-state restore: result=skipped reason=saveOpenWindows-disabled")
+			return
+		}
+		guard WindowStateStore.shared.consumeLaunchRestoration() else {
+			logger.log("launch saved-state restore: result=skipped reason=already-consumed")
+			return
+		}
 
 		// Quick test switch: if auto-restore of photo windows is disabled
 		// via the AppStorage flag, skip opening saved photo windows. This is
@@ -2541,10 +2930,12 @@ struct ContentView: View {
 		// startup. Set the UserDefault key "disableAutoRestoreWindows"
 		// to false to re-enable restoring windows.
 		if disableAutoRestoreWindows {
-			logger.log("Auto-restore of photo windows is disabled; skipping window restoration.")
+			logger.log("launch saved-state restore: photoWindowRestore=disabled")
 		}
 
-		if let folder = WindowStateStore.shared.resolveSavedFolder() {
+		if skipSavedFolder {
+			logger.log("launch folder restore: source=saved-window-state result=skipped reason=bookmark-restore-already-loaded-folder")
+		} else if let folder = WindowStateStore.shared.resolveSavedFolder() {
 			// Try to restore a previously saved snapshot of file paths for
 			// this folder so the UI can populate immediately without a
 			// potentially expensive re-scan. If no snapshot exists we fall
@@ -2564,6 +2955,12 @@ struct ContentView: View {
 							deduped.append(u)
 						}
 					}
+					deduped.sort {
+						$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+					}
+					await MainActor.run {
+						logger.log("launch folder restore: source=saved-window-state storage=cache folder=\(folder.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
+					}
 					// Publish in batches to avoid a big main-thread spike.
 					let batchSize = 256
 					await MainActor.run {
@@ -2579,7 +2976,7 @@ struct ContentView: View {
 							library.photos.append(contentsOf: slice)
 							library.lastScanDate = Date()
 						}
-							// Warm thumbnails for the restored batch in background so
+						// Warm thumbnails for the restored batch in background so
 						// the UI can display images quickly without waiting for
 						// on-demand generation. The ThumbnailGenerator itself
 						// limits concurrency so this is safe to run per-batch.
@@ -2613,8 +3010,9 @@ struct ContentView: View {
 							// starting a potentially expensive re-scan.
 							if library.folderURL == folder {
 								if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
-									logger.log("At-launch scan deferred by deferAtLaunchBackgroundWork flag")
+									logger.log("launch folder refresh: source=saved-window-state storage=filesystem result=deferred folder=\(folder.path, privacy: .public)")
 								} else {
+									logger.log("launch folder refresh: source=saved-window-state storage=filesystem result=started folder=\(folder.path, privacy: .public)")
 									library.scan(folder: folder)
 								}
 							}
@@ -2624,21 +3022,24 @@ struct ContentView: View {
 					// No cached snapshot available; retain current behavior
 					// of not auto-scanning at launch.
 					await MainActor.run {
+						logger.log("launch folder restore: source=saved-window-state storage=cache result=miss folder=\(folder.path, privacy: .public)")
 						library.folderURL = folder
 						activeFolderNames = [folder.lastPathComponent]
 					}
 				}
 			}
+		} else {
+			logger.log("launch folder restore: source=saved-window-state result=none")
 		}
 		// Restore previously-open photo windows but avoid creating a large
 		// number of windows synchronously at startup which can freeze the
 		// UI. Stagger window creation on a background task and limit the
 		// number of windows restored to a reasonable cap.
 		let saved = WindowStateStore.shared.openPhotoURLs()
-		logger.log("restoreSavedWindowsIfNeeded: saved photo windows count=\(saved.count, privacy: .public)")
+		logger.log("launch photo-window restore: source=saved-window-state count=\(saved.count, privacy: .public)")
 		let maxOpen = 8
 		if !saved.isEmpty && !disableAutoRestoreWindows {
-			logger.log("Restoring up to \(maxOpen) saved photo windows (total saved=\(saved.count))")
+			logger.log("launch photo-window restore: result=started scheduledLimit=\(maxOpen, privacy: .public) savedCount=\(saved.count, privacy: .public)")
 			Task.detached(priority: .background) {
 				for (i, url) in saved.prefix(maxOpen).enumerated() {
 					// Small stagger to avoid UI contention when creating many
@@ -2647,11 +3048,15 @@ struct ContentView: View {
 					try? await Task.sleep(nanoseconds: delay)
 					await MainActor.run {
 						openWindow(id: "photo-viewer", value: url)
-						logger.log("restoreSavedWindowsIfNeeded: opening restored window")
+						if AppLogLevel.current.allows(.debug) {
+							logger.debug("launch photo-window restore: opened path=\(url.path, privacy: .public)")
+						}
 					}
 				}
-				logger.log("Finished scheduling restored photo windows (scheduled=\(min(saved.count, maxOpen)))")
+				logger.log("launch photo-window restore: result=scheduled scheduledCount=\(min(saved.count, maxOpen), privacy: .public)")
 			}
+		} else if !saved.isEmpty {
+			logger.log("launch photo-window restore: result=skipped reason=disabled savedCount=\(saved.count, privacy: .public)")
 		}
 	}
 }

@@ -54,6 +54,7 @@ struct PictureViewerApp: App {
 		NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
 			let save = UserDefaults.standard.bool(forKey: "saveOpenWindows")
 			let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
+			PhotoVault.clearWorkingCopiesOnDisk()
 			// Log the titles and represented URLs of all windows for diagnostics
 			var windowEntries: [String] = []
 			for w in NSApplication.shared.windows {
@@ -62,10 +63,16 @@ struct PictureViewerApp: App {
 				windowEntries.append("\(title):\(path)")
 			}
 			if save {
-				logger.log("App will terminate; snapshotting open photo windows for restore; windows=\(windowEntries.joined(separator: ","), privacy: .public)")
+				logger.log("App will terminate; snapshotting open photo windows for restore; windowCount=\(windowEntries.count, privacy: .public)")
+				if AppLogLevel.current.allows(.debug) {
+					logger.debug("App will terminate; open photo window details=\(windowEntries.joined(separator: ","), privacy: .public)")
+				}
 				WindowStateStore.shared.snapshotOpenPhotosFromSystem()
 			} else {
-				logger.log("App will terminate; saveOpenWindows disabled — clearing saved open photos; windows=\(windowEntries.joined(separator: ","), privacy: .public)")
+				logger.log("App will terminate; saveOpenWindows disabled; clearing saved open photos; windowCount=\(windowEntries.count, privacy: .public)")
+				if AppLogLevel.current.allows(.debug) {
+					logger.debug("App will terminate; skipped open photo window details=\(windowEntries.joined(separator: ","), privacy: .public)")
+				}
 				WindowStateStore.shared.clearOpenPhotos()
 			}
 		}
@@ -87,6 +94,9 @@ struct PictureViewerApp: App {
 						.environmentObject(authManager)
 				}
 			}
+		}
+		.commands {
+			VaultFileCommands()
 		}
 
 		WindowGroup(id: "photo-viewer", for: URL.self) { $url in
@@ -153,6 +163,35 @@ struct PictureViewerApp: App {
 				// so the user can change other preferences.
 				SettingsView()
 			}
+		}
+	}
+}
+
+struct VaultFileCommands: Commands {
+	@FocusedValue(\.vaultCommandActions) private var vaultActions
+
+	var body: some Commands {
+		CommandGroup(after: .importExport) {
+			Divider()
+			Button("Import Folder to Encrypted Storage…") {
+				vaultActions?.importFolders()
+			}
+			.disabled(vaultActions == nil)
+
+			Button("Store Selected Images in Encrypted Storage") {
+				vaultActions?.importSelected()
+			}
+			.disabled(vaultActions?.canImportSelected != true)
+
+			Button("Open Encrypted Storage") {
+				vaultActions?.openVault()
+			}
+			.disabled(vaultActions == nil)
+
+			Button(vaultActions?.canImportSelected == true ? "Export Selected Photos…" : "Export Displayed Photos…") {
+				vaultActions?.exportPhotos()
+			}
+			.disabled(vaultActions?.canExport != true)
 		}
 	}
 }

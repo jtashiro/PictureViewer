@@ -155,7 +155,10 @@ final class WindowStateStore: @unchecked Sendable {
 			}
 		}
 		if !entries.isEmpty {
-			windowStateLogger.log("snapshotOpenPhotosFromSystem captured windows=\(entries.joined(separator: ","), privacy: .public)")
+			windowStateLogger.log("snapshotOpenPhotosFromSystem captured windowCount=\(entries.count, privacy: .public)")
+			if AppLogLevel.current.allows(.debug) {
+				windowStateLogger.debug("snapshotOpenPhotosFromSystem captured windows=\(entries.joined(separator: ","), privacy: .public)")
+			}
 		} else {
 			windowStateLogger.log("snapshotOpenPhotosFromSystem found no represented photo windows")
 		}
@@ -185,7 +188,10 @@ final class WindowStateStore: @unchecked Sendable {
 			}
 		}
 		if !entries.isEmpty {
-			windowStateLogger.log("snapshotTabs captured windows=\(entries.joined(separator: ","), privacy: .public)")
+			windowStateLogger.log("snapshotTabs captured windowCount=\(entries.count, privacy: .public)")
+			if AppLogLevel.current.allows(.debug) {
+				windowStateLogger.debug("snapshotTabs captured windows=\(entries.joined(separator: ","), privacy: .public)")
+			}
 		}
 		UserDefaults.standard.set(paths, forKey: openWindowsKey)
 	}
