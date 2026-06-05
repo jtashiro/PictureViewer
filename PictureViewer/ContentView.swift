@@ -515,6 +515,10 @@ struct ContentView: View {
 	static let kLastFolderBookmarks = "lastFolderBookmarks"
 	// Active resolved security-scoped URLs (kept open for the app lifetime)
 	private static var activeSecurityScopedURLs: [URL] = []
+	// First mounted gallery window. Subsequent windows are force-tabbed onto
+	// this one so bookmarks load as tabs of the main window instead of as
+	// standalone windows. Weak so it clears if the main window closes.
+	private static weak var mainGalleryWindow: NSWindow?
 	// Track whether we've already attempted the automatic launch-time
 	// restoration. Prevents new tabs created after launch from auto-loading
 	// cached snapshots — instead we will prompt the user to choose a folder.
@@ -563,11 +567,18 @@ struct ContentView: View {
 		// Attach a WindowAccessor so we can set window-level defaults like
 		// preferring tabs for this app's windows.
 		.background(WindowAccessor { window in
-			// Shared tabbing identifier so the main window and folder windows
-			// (opened via openWindow(id: "folder", value: url)) group into the
-			// same NSWindow tab set instead of opening as separate windows.
-			window?.tabbingMode = .preferred
-			window?.tabbingIdentifier = "PictureViewerGallery"
+			// Force every gallery window to live in the same NSWindow tab
+			// group. macOS only honors tabbingMode/Identifier when the system
+			// "Prefer tabs" preference allows tabbing, so we also explicitly
+			// add new windows to the main gallery window's tab set.
+			guard let window else { return }
+			window.tabbingMode = .preferred
+			window.tabbingIdentifier = "PictureViewerGallery"
+			if let main = ContentView.mainGalleryWindow, main !== window, main.isVisible {
+				main.addTabbedWindow(window, ordered: .above)
+			} else {
+				ContentView.mainGalleryWindow = window
+			}
 		})
 		.onAppear {
 			// Initialize displayed photos immediately so the UI shows
