@@ -24,6 +24,13 @@ private struct ThumbnailFramePreferenceKey: PreferenceKey {
 	}
 }
 
+private enum MarqueeSelectionMode {
+	case replace
+	case add
+	case subtract
+	case toggle
+}
+
 struct ContentView: View {
 	@State private var library = PhotoLibrary()
 	@State private var thumbnailSize: CGFloat = 160
@@ -562,6 +569,8 @@ struct ContentView: View {
 	@State private var thumbnailFrames: [URL: CGRect] = [:]
 	@State private var selectionDragStart: CGPoint? = nil
 	@State private var selectionDragCurrent: CGPoint? = nil
+	@State private var selectionDragBase: Set<URL> = []
+	@State private var selectionDragMode: MarqueeSelectionMode = .replace
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
 	@State private var isApplyingKeywords: Bool = false
@@ -1369,6 +1378,8 @@ struct ContentView: View {
 				.onChanged { value in
 					if selectionDragStart == nil {
 						selectionDragStart = value.startLocation
+						selectionDragBase = selectedItems
+						selectionDragMode = marqueeSelectionModeForCurrentModifiers()
 						selectionMode = true
 					}
 					selectionDragCurrent = value.location
@@ -1379,6 +1390,8 @@ struct ContentView: View {
 					selectionMode = !selectedItems.isEmpty
 					selectionDragStart = nil
 					selectionDragCurrent = nil
+					selectionDragBase = []
+					selectionDragMode = .replace
 				}
 		)
 		.overlay(alignment: .topLeading) {
@@ -1565,6 +1578,8 @@ struct ContentView: View {
 	private func handleThumbnailSingleClick(_ url: URL) {
 		selectionDragStart = nil
 		selectionDragCurrent = nil
+		selectionDragBase = []
+		selectionDragMode = .replace
 		if selectedItems.contains(url) {
 			selectedItems.remove(url)
 		} else {
@@ -1586,7 +1601,33 @@ struct ContentView: View {
 		let hits = thumbnailFrames.compactMap { (url, frame) -> URL? in
 			frame.intersects(selectionRect) ? url : nil
 		}
-		selectedItems = Set(hits)
+		let hitSet = Set(hits)
+		switch selectionDragMode {
+		case .replace:
+			selectedItems = hitSet
+		case .add:
+			selectedItems = selectionDragBase.union(hitSet)
+		case .subtract:
+			selectedItems = selectionDragBase.subtracting(hitSet)
+		case .toggle:
+			var next = selectionDragBase
+			for url in hitSet {
+				if next.contains(url) {
+					next.remove(url)
+				} else {
+					next.insert(url)
+				}
+			}
+			selectedItems = next
+		}
+	}
+
+	private func marqueeSelectionModeForCurrentModifiers() -> MarqueeSelectionMode {
+		let flags = NSEvent.modifierFlags
+		if flags.contains(.command) { return .toggle }
+		if flags.contains(.option) { return .subtract }
+		if flags.contains(.shift) { return .add }
+		return .replace
 	}
 
 	private func contextActionURLs(for photoURL: URL) -> [URL] {
@@ -1617,15 +1658,33 @@ struct ContentView: View {
 		let urls = contextActionURLs(for: photoURL)
 		let primaryURL = urls.first ?? photoURL
 		let provider = NSItemProvider(contentsOf: primaryURL) ?? NSItemProvider(object: primaryURL as NSURL)
+
+		// Provide broad URL/file-list representations; different macOS targets
+		// consume different type identifiers for multi-file drops.
+		let fileURLList = urls.map(\.absoluteString).joined(separator: "\n")
+		let uriList = urls.map(\.absoluteString).joined(separator: "\r\n") + "\r\n"
+
 		provider.registerDataRepresentation(forTypeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue, visibility: .all) { completion in
 			completion(primaryURL.absoluteString.data(using: .utf8), nil)
 			return nil
 		}
-		let urlList = urls.map(\.absoluteString).joined(separator: "\r\n") + "\r\n"
-		provider.registerDataRepresentation(forTypeIdentifier: "text/uri-list", visibility: .all) { completion in
-			completion(urlList.data(using: .utf8), nil)
+		provider.registerDataRepresentation(forTypeIdentifier: "public.utf8-plain-text", visibility: .all) { completion in
+			completion(fileURLList.data(using: .utf8), nil)
 			return nil
 		}
+		provider.registerDataRepresentation(forTypeIdentifier: "public.url", visibility: .all) { completion in
+			completion(primaryURL.absoluteString.data(using: .utf8), nil)
+			return nil
+		}
+		provider.registerDataRepresentation(forTypeIdentifier: "public.file-url", visibility: .all) { completion in
+			completion(fileURLList.data(using: .utf8), nil)
+			return nil
+		}
+		provider.registerDataRepresentation(forTypeIdentifier: "text/uri-list", visibility: .all) { completion in
+			completion(uriList.data(using: .utf8), nil)
+			return nil
+		}
+
 		return provider
 	}
 
