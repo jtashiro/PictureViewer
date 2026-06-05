@@ -21,7 +21,19 @@ final class ThumbnailCache: @unchecked Sendable {
 	/// per source file.
 	static let canonicalSize: CGFloat = 512
 
+	private final class PinnedImage {
+		let image: NSImage
+		let sourceModificationDate: Date?
+
+		init(image: NSImage, sourceModificationDate: Date?) {
+			self.image = image
+			self.sourceModificationDate = sourceModificationDate
+		}
+	}
+
 	private let memCache = NSCache<NSString, NSImage>()
+	private var pinnedImages: [String: PinnedImage] = [:]
+	private let pinnedImagesLock = NSLock()
 	let cacheDirectory: URL
 	private let writeQueue = DispatchQueue(
 		label: "ThumbnailCache.write",
@@ -56,7 +68,11 @@ final class ThumbnailCache: @unchecked Sendable {
 			thumbnailLogger.debug("thumbnailCache:image(for:) called for \(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
 		}
 		let key = self.key(for: url, namespace: namespace)
+		if let pinned = pinnedImage(forKey: key, source: url) {
+			return pinned
+		}
 		if let mem = memCache.object(forKey: key as NSString) {
+			pin(mem, forKey: key, source: url)
 			return mem
 		}
 		let file = cacheFile(forKey: key)
@@ -67,7 +83,22 @@ final class ThumbnailCache: @unchecked Sendable {
 		}
 		guard let image = NSImage(contentsOf: file) else { return nil }
 		memCache.setObject(image, forKey: key as NSString, cost: cost(of: image))
+		pin(image, forKey: key, source: url)
 		return image
+	}
+
+	/// Fast memory-only lookup used while creating recycled grid cells. This
+	/// never decodes an image from disk, so it can seed SwiftUI state synchronously.
+	func memoryImage(for url: URL, namespace: String? = nil) -> NSImage? {
+		let key = self.key(for: url, namespace: namespace)
+		if let pinned = pinnedImage(forKey: key, source: url) {
+			return pinned
+		}
+		if let mem = memCache.object(forKey: key as NSString) {
+			pin(mem, forKey: key, source: url)
+			return mem
+		}
+		return nil
 	}
 
 	/// Stores a thumbnail in both memory and disk caches. Disk write is
@@ -75,6 +106,7 @@ final class ThumbnailCache: @unchecked Sendable {
 	func store(_ image: NSImage, for url: URL, namespace: String? = nil) {
 		let key = self.key(for: url, namespace: namespace)
 		memCache.setObject(image, forKey: key as NSString, cost: cost(of: image))
+		pin(image, forKey: key, source: url)
 		let file = cacheFile(forKey: key)
 		writeQueue.async {
 			guard
@@ -89,6 +121,9 @@ final class ThumbnailCache: @unchecked Sendable {
 	/// Clears both memory and disk caches.
 	func clear() {
 		memCache.removeAllObjects()
+		pinnedImagesLock.lock()
+		pinnedImages.removeAll()
+		pinnedImagesLock.unlock()
 		let dir = cacheDirectory
 		writeQueue.async(flags: .barrier) {
 			try? FileManager.default.removeItem(at: dir)
@@ -124,6 +159,11 @@ final class ThumbnailCache: @unchecked Sendable {
 					self.memCache.setObject(img, forKey: newKeyStr, cost: self.cost(of: img))
 					self.memCache.removeObject(forKey: oldKeyStr)
 				}
+				self.pinnedImagesLock.lock()
+				if let pinned = self.pinnedImages.removeValue(forKey: oldKey) {
+					self.pinnedImages[newKey] = pinned
+				}
+				self.pinnedImagesLock.unlock()
 			}
 		}
 	}
@@ -193,6 +233,28 @@ final class ThumbnailCache: @unchecked Sendable {
 			return false
 		}
 		return cacheDate >= srcDate
+	}
+
+	private func pinnedImage(forKey key: String, source: URL) -> NSImage? {
+		pinnedImagesLock.lock()
+		defer { pinnedImagesLock.unlock() }
+		guard let pinned = pinnedImages[key] else { return nil }
+		guard pinned.sourceModificationDate == sourceModificationDate(for: source) else {
+			pinnedImages.removeValue(forKey: key)
+			memCache.removeObject(forKey: key as NSString)
+			return nil
+		}
+		return pinned.image
+	}
+
+	private func pin(_ image: NSImage, forKey key: String, source: URL) {
+		pinnedImagesLock.lock()
+		pinnedImages[key] = PinnedImage(image: image, sourceModificationDate: sourceModificationDate(for: source))
+		pinnedImagesLock.unlock()
+	}
+
+	private func sourceModificationDate(for source: URL) -> Date? {
+		(try? source.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
 	}
 
 	private func cost(of image: NSImage) -> Int {

@@ -37,7 +37,6 @@ struct SettingsView: View {
 	@AppStorage("saveOpenWindows") private var saveOpenWindows: Bool = false
 	@AppStorage("requirePasswordAtLaunch") private var requirePasswordAtLaunch: Bool = true
 	@AppStorage("deferAtLaunchBackgroundWork") private var deferAtLaunchBackgroundWork: Bool = true
-	@AppStorage("enableFaceRecognition") private var enableFaceRecognition: Bool = false
 	@AppStorage(AppLogLevel.userDefaultsKey) private var logLevelRaw: String = AppLogLevel.defaultLevel.rawValue
 
 	var body: some View {
@@ -95,11 +94,7 @@ struct SettingsView: View {
 				LabeledContent("Scanner threads",
 							   value: "\(PhotoLibrary.workerCount)")
 				Toggle("Defer at-launch background work (use cached snapshot, skip re-scan)", isOn: $deferAtLaunchBackgroundWork)
-				Text("When enabled, the app will populate the UI from the saved snapshot at launch but skip the potentially expensive background re-scan. Face processing for restored thumbnails may still run if scheduled.")
-					.font(.caption)
-					.foregroundStyle(.secondary)
-				Toggle("Enable face recognition (Vision)", isOn: $enableFaceRecognition)
-				Text("When enabled, the app will run face detection/recognition on photos as they are scanned or restored. This is disabled by default for performance and privacy reasons.")
+				Text("When enabled, the app will populate the UI from the saved snapshot at launch but skip the potentially expensive background re-scan.")
 					.font(.caption)
 					.foregroundStyle(.secondary)
 

@@ -29,6 +29,13 @@ struct ThumbnailView: View {
 	// defers thumbnail loading at app launch (can help avoid startup spikes).
 	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
 
+	init(url: URL, size: CGFloat, refreshToken: UUID) {
+		self.url = url
+		self.size = size
+		self.refreshToken = refreshToken
+		self._image = State(initialValue: ThumbnailCache.shared.memoryImage(for: url, namespace: nil))
+	}
+
 	var body: some View {
 		VStack(spacing: 4) {
 			ZStack {
@@ -99,8 +106,14 @@ struct ThumbnailView: View {
 	}
 
 	private func loadThumbnail() async {
-		image = nil
 		loadFailed = false
+
+		if let cached = ThumbnailCache.shared.memoryImage(for: url, namespace: namespace) {
+			image = cached
+			return
+		}
+
+		image = nil
 
 		if disableThumbnailLoadingAtLaunch {
 			thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")

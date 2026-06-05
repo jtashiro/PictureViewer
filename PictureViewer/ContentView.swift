@@ -210,24 +210,6 @@ struct ContentView: View {
 								library.photos.append(contentsOf: slice)
 								library.lastScanDate = Date()
 							}
-							// Schedule face processing for the restored batch so cached
-							// thumbnails get analyzed even when we don't run a full
-							// re-scan. FaceProcessor internally deduplicates/short-
-							// circuits via the DB actor, so it's safe to call for
-							// every restored item.
-							let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-							if faceEnabled {
-								Task.detached(priority: .utility) {
-									await MainActor.run { logger.log("scheduling face processing for restoration batch of \(slice.count, privacy: .public) items") }
-									for item in slice {
-										if Task.isCancelled { break }
-										_ = await FaceProcessor.shared.process(file: item.url)
-									}
-								}
-							} else {
-								await MainActor.run { logger.log("face processing for restoration skipped (enableFaceRecognition=false)") }
-							}
-
 							// Warm thumbnails for the restored batch in background so
 							// the UI can display images quickly without waiting for
 							// on-demand generation. The ThumbnailGenerator itself
@@ -2145,18 +2127,7 @@ struct ContentView: View {
 												await MainActor.run { self.logger.log("scan:batch yielded=\(batchCopy.count, privacy: .public) total=\(library.photos.count, privacy: .public)") }
 												Task.detached { await Telemetry.shared.recordFound(batchCopy.count) }
 
-												let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-												if faceEnabled {
-													let work = batchCopy
-													Task.detached(priority: .utility) {
-														for item in work {
-															if Task.isCancelled { break }
-															_ = await FaceProcessor.shared.process(file: item.url)
-														}
-													}
-												}
-
-												// Warm thumbnails for this batch.
+							// Warm thumbnails for this batch.
 												let warm = batchCopy
 												Task.detached(priority: .utility) {
 													for item in warm {
@@ -2608,25 +2579,7 @@ struct ContentView: View {
 							library.photos.append(contentsOf: slice)
 							library.lastScanDate = Date()
 						}
-						// Schedule face processing for the restored batch so cached
-						// thumbnails get analyzed even when we don't run a full
-						// re-scan. FaceProcessor internally deduplicates/short-
-						// circuits via the DB actor, so it's safe to call for
-						// every restored item.
-						let faceEnabled = UserDefaults.standard.bool(forKey: "enableFaceRecognition")
-						if faceEnabled {
-							Task.detached(priority: .utility) {
-								await MainActor.run { self.logger.log("scheduling face processing for restoration batch of \(slice.count, privacy: .public) items") }
-								for item in slice {
-									if Task.isCancelled { break }
-									_ = await FaceProcessor.shared.process(file: item.url)
-								}
-							}
-						} else {
-							await MainActor.run { self.logger.log("face processing for restoration skipped (enableFaceRecognition=false)") }
-						}
-
-						// Warm thumbnails for the restored batch in background so
+							// Warm thumbnails for the restored batch in background so
 						// the UI can display images quickly without waiting for
 						// on-demand generation. The ThumbnailGenerator itself
 						// limits concurrency so this is safe to run per-batch.
