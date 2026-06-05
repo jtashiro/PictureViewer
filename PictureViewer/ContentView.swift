@@ -571,6 +571,7 @@ struct ContentView: View {
 	@State private var selectionDragCurrent: CGPoint? = nil
 	@State private var selectionDragBase: Set<URL> = []
 	@State private var selectionDragMode: MarqueeSelectionMode = .replace
+	@State private var suppressMarqueeDuringItemDrag: Bool = false
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
 	@State private var isApplyingKeywords: Bool = false
@@ -1377,15 +1378,24 @@ struct ContentView: View {
 			DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
 				.onChanged { value in
 					if selectionDragStart == nil {
+						if let startURL = thumbnailURL(at: value.startLocation), selectedItems.contains(startURL) {
+							suppressMarqueeDuringItemDrag = true
+							return
+						}
 						selectionDragStart = value.startLocation
 						selectionDragBase = selectedItems
 						selectionDragMode = marqueeSelectionModeForCurrentModifiers()
 						selectionMode = true
 					}
+					if suppressMarqueeDuringItemDrag { return }
 					selectionDragCurrent = value.location
 					updateDragSelection()
 				}
 				.onEnded { _ in
+					if suppressMarqueeDuringItemDrag {
+						suppressMarqueeDuringItemDrag = false
+						return
+					}
 					updateDragSelection()
 					selectionMode = !selectedItems.isEmpty
 					selectionDragStart = nil
@@ -1580,6 +1590,7 @@ struct ContentView: View {
 		selectionDragCurrent = nil
 		selectionDragBase = []
 		selectionDragMode = .replace
+		suppressMarqueeDuringItemDrag = false
 		if selectedItems.contains(url) {
 			selectedItems.remove(url)
 		} else {
@@ -1628,6 +1639,13 @@ struct ContentView: View {
 		if flags.contains(.option) { return .subtract }
 		if flags.contains(.shift) { return .add }
 		return .replace
+	}
+
+	private func thumbnailURL(at point: CGPoint) -> URL? {
+		for (url, frame) in thumbnailFrames where frame.contains(point) {
+			return url
+		}
+		return nil
 	}
 
 	private func contextActionURLs(for photoURL: URL) -> [URL] {
