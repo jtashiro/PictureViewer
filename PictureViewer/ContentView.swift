@@ -31,6 +31,12 @@ private enum MarqueeSelectionMode {
 	case toggle
 }
 
+private final class ThumbnailDraggingSource: NSObject, NSDraggingSource {
+	func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+		.copy
+	}
+}
+
 struct ContentView: View {
 	@State private var library = PhotoLibrary()
 	@State private var thumbnailSize: CGFloat = 160
@@ -572,6 +578,7 @@ struct ContentView: View {
 	@State private var selectionDragBase: Set<URL> = []
 	@State private var selectionDragMode: MarqueeSelectionMode = .replace
 	@State private var suppressMarqueeDuringItemDrag: Bool = false
+	private let thumbnailDraggingSource = ThumbnailDraggingSource()
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
 	@State private var isApplyingKeywords: Bool = false
@@ -1333,9 +1340,6 @@ struct ContentView: View {
 					.onTapGesture(count: 2) {
 						openWindow(id: "photo-viewer", value: photo.url)
 					}
-					.onDrag {
-						dragItemProvider(for: photo.url)
-					}
 					.contextMenu {
 						let contextURLs = contextActionURLs(for: photo.url)
 						Button(contextURLs.count > 1 ? "Show Selected in Finder" : "Show in Finder") {
@@ -1378,14 +1382,16 @@ struct ContentView: View {
 			DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
 				.onChanged { value in
 					if selectionDragStart == nil {
-						if let startURL = thumbnailURL(at: value.startLocation), selectedItems.contains(startURL) {
-							suppressMarqueeDuringItemDrag = true
-							return
+						if let startURL = thumbnailURL(at: value.startLocation) {
+							let dragURLs = contextActionURLs(for: startURL)
+							if beginSystemFileDrag(urls: dragURLs) {
+								suppressMarqueeDuringItemDrag = true
+								return
+							}
 						}
 						selectionDragStart = value.startLocation
 						selectionDragBase = selectedItems
 						selectionDragMode = marqueeSelectionModeForCurrentModifiers()
-						selectionMode = true
 					}
 					if suppressMarqueeDuringItemDrag { return }
 					selectionDragCurrent = value.location
@@ -1397,7 +1403,6 @@ struct ContentView: View {
 						return
 					}
 					updateDragSelection()
-					selectionMode = !selectedItems.isEmpty
 					selectionDragStart = nil
 					selectionDragCurrent = nil
 					selectionDragBase = []
@@ -1596,7 +1601,6 @@ struct ContentView: View {
 		} else {
 			selectedItems.insert(url)
 		}
-		selectionMode = !selectedItems.isEmpty
 	}
 
 	private var currentSelectionRect: CGRect? {
@@ -1648,8 +1652,32 @@ struct ContentView: View {
 		return nil
 	}
 
+	private func beginSystemFileDrag(urls: [URL]) -> Bool {
+		guard !urls.isEmpty,
+			  let event = NSApp.currentEvent,
+			  let contentView = NSApp.keyWindow?.contentView
+		else {
+			return false
+		}
+
+		let origin = event.locationInWindow
+		let items: [NSDraggingItem] = urls.enumerated().map { (idx, url) in
+			let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+			let icon = NSWorkspace.shared.icon(forFile: url.path)
+			icon.size = NSSize(width: 48, height: 48)
+			let offset = CGFloat(min(idx, 10)) * 2.0
+			let frame = NSRect(x: origin.x + offset, y: origin.y - offset, width: 48, height: 48)
+			item.setDraggingFrame(frame, contents: icon)
+			return item
+		}
+
+		let session = contentView.beginDraggingSession(with: items, event: event, source: thumbnailDraggingSource)
+		session.animatesToStartingPositionsOnCancelOrFail = true
+		return true
+	}
+
 	private func contextActionURLs(for photoURL: URL) -> [URL] {
-		if selectionMode, selectedItems.contains(photoURL), !selectedItems.isEmpty {
+		if selectedItems.contains(photoURL), !selectedItems.isEmpty {
 			return selectedItems.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
 		}
 		return [photoURL]

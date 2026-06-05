@@ -28,7 +28,7 @@ This codebase is AI-maintained. Editing discipline matters — past sessions hav
 
 ## Git discipline
 
-9. **Commit after every successful item.** Use a descriptive message that includes the item number if one was assigned. Smaller commits make Path-B recovery cheap.
+9. **Commit and push to remote after every successful item.** Use a descriptive message that includes the item number if one was assigned. Smaller commits make Path-B recovery cheap.
 
 10. **Never `git add -A` or `git add .`** — stage only the files you intentionally changed. This prevents accidentally committing unrelated working-tree drift.
 
