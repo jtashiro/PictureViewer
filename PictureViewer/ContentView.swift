@@ -16,6 +16,14 @@ extension Notification.Name {
 	static let embedWriteFailed = Notification.Name("com.example.PictureViewer.embedWriteFailed")
 }
 
+private struct ThumbnailFramePreferenceKey: PreferenceKey {
+	static var defaultValue: [URL: CGRect] = [:]
+
+	static func reduce(value: inout [URL: CGRect], nextValue: () -> [URL: CGRect]) {
+		value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+	}
+}
+
 struct ContentView: View {
 	@State private var library = PhotoLibrary()
 	@State private var thumbnailSize: CGFloat = 160
@@ -551,6 +559,9 @@ struct ContentView: View {
 	@State private var isRefreshing = false
 	@State private var selectionMode: Bool = false
 	@State private var selectedItems: Set<URL> = []
+	@State private var thumbnailFrames: [URL: CGRect] = [:]
+	@State private var selectionDragStart: CGPoint? = nil
+	@State private var selectionDragCurrent: CGPoint? = nil
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
 	@State private var isApplyingKeywords: Bool = false
@@ -1299,6 +1310,12 @@ struct ContentView: View {
 							.padding(6)
 						}
 					}
+					.background {
+						GeometryReader { proxy in
+							Color.clear
+								.preference(key: ThumbnailFramePreferenceKey.self, value: [photo.url: proxy.frame(in: .named("photoGridArea"))])
+						}
+					}
 					.contentShape(Rectangle())
 					.onTapGesture {
 						handleThumbnailSingleClick(photo.url)
@@ -1342,6 +1359,39 @@ struct ContentView: View {
 				}
 			}
 			.padding(12)
+		}
+		.coordinateSpace(name: "photoGridArea")
+		.onPreferenceChange(ThumbnailFramePreferenceKey.self) { frames in
+			thumbnailFrames = frames
+		}
+		.simultaneousGesture(
+			DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
+				.onChanged { value in
+					if selectionDragStart == nil {
+						selectionDragStart = value.startLocation
+						selectionMode = true
+					}
+					selectionDragCurrent = value.location
+					updateDragSelection()
+				}
+				.onEnded { _ in
+					updateDragSelection()
+					selectionMode = !selectedItems.isEmpty
+					selectionDragStart = nil
+					selectionDragCurrent = nil
+				}
+		)
+		.overlay(alignment: .topLeading) {
+			if let rect = currentSelectionRect {
+				RoundedRectangle(cornerRadius: 6)
+					.fill(Color.accentColor.opacity(0.15))
+					.overlay {
+						RoundedRectangle(cornerRadius: 6)
+							.stroke(Color.accentColor.opacity(0.8), lineWidth: 1.5)
+					}
+					.frame(width: rect.width, height: rect.height)
+					.position(x: rect.midX, y: rect.midY)
+			}
 		}
 		.overlay(alignment: .bottom) {
 			if library.isScanning {
@@ -1513,12 +1563,30 @@ struct ContentView: View {
 	// MARK: - Actions
 
 	private func handleThumbnailSingleClick(_ url: URL) {
+		selectionDragStart = nil
+		selectionDragCurrent = nil
 		if selectedItems.contains(url) {
 			selectedItems.remove(url)
 		} else {
 			selectedItems.insert(url)
 		}
 		selectionMode = !selectedItems.isEmpty
+	}
+
+	private var currentSelectionRect: CGRect? {
+		guard let start = selectionDragStart, let current = selectionDragCurrent else { return nil }
+		let origin = CGPoint(x: min(start.x, current.x), y: min(start.y, current.y))
+		let size = CGSize(width: abs(current.x - start.x), height: abs(current.y - start.y))
+		if size.width < 2, size.height < 2 { return nil }
+		return CGRect(origin: origin, size: size)
+	}
+
+	private func updateDragSelection() {
+		guard let selectionRect = currentSelectionRect else { return }
+		let hits = thumbnailFrames.compactMap { (url, frame) -> URL? in
+			frame.intersects(selectionRect) ? url : nil
+		}
+		selectedItems = Set(hits)
 	}
 
 	private func contextActionURLs(for photoURL: URL) -> [URL] {
