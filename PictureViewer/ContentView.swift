@@ -10,6 +10,7 @@ import CoreImage
 import ImageIO
 import CryptoKit
 import os
+import UniformTypeIdentifiers
 
 extension Notification.Name {
 	static let embedWriteFailed = Notification.Name("com.example.PictureViewer.embedWriteFailed")
@@ -1269,51 +1270,57 @@ struct ContentView: View {
 				spacing: 10
 			) {
 				ForEach(displayedPhotos) { photo in
-					Button {
-						if selectionMode {
-							// Toggle selection
-							if selectedItems.contains(photo.url) {
-								selectedItems.remove(photo.url)
-							} else {
-								selectedItems.insert(photo.url)
-							}
-						} else {
-							openWindow(id: "photo-viewer", value: photo.url)
+					let isSelected = selectedItems.contains(photo.url)
+					ZStack(alignment: .topTrailing) {
+						VStack(spacing: 4) {
+							ThumbnailView(
+								url: photo.url,
+								size: thumbnailSize,
+								refreshToken: refreshToken
+							)
+							// Filename and keywords are rendered by ThumbnailView now.
 						}
-					} label: {
-						ZStack(alignment: .topTrailing) {
-							VStack(spacing: 4) {
-								ThumbnailView(
-									url: photo.url,
-									size: thumbnailSize,
-									refreshToken: refreshToken
-								)
-								// Filename and keywords are rendered by ThumbnailView now.
-							}
-							if selectionMode {
-								// Selection badge
-								Group {
-									if selectedItems.contains(photo.url) {
-										Image(systemName: "checkmark.circle.fill")
-											.foregroundStyle(.white, .blue)
-											.background(Circle().fill(Color.blue))
-									} else {
-										Image(systemName: "circle")
-											.foregroundStyle(.secondary)
-									}
+						.overlay {
+							RoundedRectangle(cornerRadius: 8)
+								.stroke(isSelected ? Color.accentColor : .clear, lineWidth: 3)
+						}
+						if selectionMode {
+							// Selection badge
+							Group {
+								if isSelected {
+									Image(systemName: "checkmark.circle.fill")
+										.foregroundStyle(.white, .blue)
+										.background(Circle().fill(Color.blue))
+								} else {
+									Image(systemName: "circle")
+										.foregroundStyle(.secondary)
 								}
-								.padding(6)
 							}
+							.padding(6)
 						}
 					}
-					.buttonStyle(.plain)
+					.contentShape(Rectangle())
+					.onTapGesture {
+						handleThumbnailSingleClick(photo.url)
+					}
+					.onTapGesture(count: 2) {
+						openWindow(id: "photo-viewer", value: photo.url)
+					}
+					.onDrag {
+						dragItemProvider(for: photo.url)
+					}
 					.contextMenu {
-						Button("Show in Finder") {
-							NSWorkspace.shared.activateFileViewerSelecting([photo.url])
+						let contextURLs = contextActionURLs(for: photo.url)
+						Button(contextURLs.count > 1 ? "Show Selected in Finder" : "Show in Finder") {
+							NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
 						}
-						Button("Open with Default App") {
-							NSWorkspace.shared.open(photo.url)
+						Button(contextURLs.count > 1 ? "Open Selected with Default App" : "Open with Default App") {
+							for url in contextURLs { NSWorkspace.shared.open(url) }
 						}
+						Button(contextURLs.count > 1 ? "Copy Selected Files" : "Copy File") {
+							copyFilesToPasteboard(contextURLs)
+						}
+						Divider()
 						Button("Repair metadata") {
 							Task.detached(priority: .utility) {
 								let (ok, msg) = await Self.repairMetadata(for: photo.url)
@@ -1504,6 +1511,55 @@ struct ContentView: View {
 	
 	
 	// MARK: - Actions
+
+	private func handleThumbnailSingleClick(_ url: URL) {
+		if selectedItems.contains(url) {
+			selectedItems.remove(url)
+		} else {
+			selectedItems.insert(url)
+		}
+		selectionMode = !selectedItems.isEmpty
+	}
+
+	private func contextActionURLs(for photoURL: URL) -> [URL] {
+		if selectionMode, selectedItems.contains(photoURL), !selectedItems.isEmpty {
+			return selectedItems.sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+		}
+		return [photoURL]
+	}
+
+	private func copyFilesToPasteboard(_ urls: [URL]) {
+		guard !urls.isEmpty else { return }
+		let copied = NSPasteboard.general
+		copied.clearContents()
+		let items: [NSPasteboardItem] = urls.map { url in
+			let item = NSPasteboardItem()
+			item.setString(url.absoluteString, forType: .fileURL)
+			item.setString(url.path, forType: .string)
+			return item
+		}
+		if copied.writeObjects(items) {
+			logger.log("copyFilesToPasteboard: copied \(urls.count, privacy: .public) file URL(s)")
+		} else {
+			logger.error("copyFilesToPasteboard: failed to write \(urls.count, privacy: .public) file URL(s) to pasteboard")
+		}
+	}
+
+	private func dragItemProvider(for photoURL: URL) -> NSItemProvider {
+		let urls = contextActionURLs(for: photoURL)
+		let primaryURL = urls.first ?? photoURL
+		let provider = NSItemProvider(contentsOf: primaryURL) ?? NSItemProvider(object: primaryURL as NSURL)
+		provider.registerDataRepresentation(forTypeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue, visibility: .all) { completion in
+			completion(primaryURL.absoluteString.data(using: .utf8), nil)
+			return nil
+		}
+		let urlList = urls.map(\.absoluteString).joined(separator: "\r\n") + "\r\n"
+		provider.registerDataRepresentation(forTypeIdentifier: "text/uri-list", visibility: .all) { completion in
+			completion(urlList.data(using: .utf8), nil)
+			return nil
+		}
+		return provider
+	}
 
 	/// Remove a bookmark by URL from the persisted multi-bookmark list and
 	/// stop security-scoped access for it. The legacy single-bookmark key is
