@@ -2,9 +2,9 @@ import Foundation
 import CoreGraphics
 import os
 
-private let faceDBLogger = Logger(subsystem: "com.example.PictureViewer", category: "face-db")
-
 actor FaceDatabaseActor {
+	nonisolated private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "face-db")
+
 	private var db: FaceDatabase
 	private let baseURL: URL?
 
@@ -35,7 +35,7 @@ actor FaceDatabaseActor {
         
 		db.records[path] = syntheticSurvivors + uniqueNewEntries
 		db.save(to: baseURL)
-		faceDBLogger.log("addRecords: added \(entries.count, privacy: .public) faces for path=\(path, privacy: .public)")
+		Self.logger.log("addRecords: added \(entries.count, privacy: .public) faces for path=\(path, privacy: .public)")
 	}
 
 	func allFaces() -> [PublicFace] {
@@ -60,7 +60,7 @@ actor FaceDatabaseActor {
 			db.personNames[pid] = "Person" // Assign default name if cluster ID is new
 		}
 		db.save(to: baseURL)
-		faceDBLogger.log("replacePersons: wrote \(persons.count, privacy: .public) person clusters")
+		Self.logger.log("replacePersons: wrote \(persons.count, privacy: .public) person clusters")
 	}
 
 	func personsList() -> [Person] {
@@ -256,7 +256,7 @@ actor FaceDatabaseActor {
 			db.persons[pid] = Array(current)
 		}
 		db.save(to: baseURL)
-		faceDBLogger.log("reattachSyntheticAssignments: restored \(mapping.count, privacy: .public) manual face assignments")
+		Self.logger.log("reattachSyntheticAssignments: restored \(mapping.count, privacy: .public) manual face assignments")
 	}
 
     private func ensurePerson(named name: String) -> String {

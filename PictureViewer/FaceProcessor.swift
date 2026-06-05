@@ -10,13 +10,12 @@ import CoreGraphics
 import UniformTypeIdentifiers
 import os
 
-private let faceLogger = Logger(subsystem: "com.example.PictureViewer", category: "face")
-
 /// FaceProcessor: detects faces in scanned image files, writes cropped
 /// face thumbnails to Application Support, stores a small JSON index, and
 /// provides clustering and person-management APIs.
 final class FaceProcessor {
-	static let shared = FaceProcessor()
+	nonisolated static let shared = FaceProcessor()
+	nonisolated private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "face")
 
 	// Face processing work is performed on detached tasks; database
 	// access is managed by an actor to avoid data races.
@@ -144,20 +143,20 @@ final class FaceProcessor {
 			return true
 		}
 		let started = Date()
-		faceLogger.log("clusterFaces:start entries=\(faceEntries.count, privacy: .public)")
+		Self.logger.log("clusterFaces:start entries=\(faceEntries.count, privacy: .public)")
 		let totalSteps = max(1, faceEntries.count * 2)
 		progress?(0, totalSteps, "Preparing feature extraction")
 
 		var features: [VNFeaturePrintObservation?] = Array(repeating: nil, count: faceEntries.count)
 		for (i, entry) in faceEntries.enumerated() {
 			if Task.isCancelled {
-				faceLogger.log("clusterFaces:cancelled during feature extraction")
+				Self.logger.log("clusterFaces:cancelled during feature extraction")
 				progress?(i, totalSteps, "Cancelled")
 				return false
 			}
 			if i % 25 == 0 {
 				let sourceName = URL(fileURLWithPath: entry.sourcePath).lastPathComponent
-				faceLogger.log("clusterFaces:extracting feature \(i + 1, privacy: .public)/\(faceEntries.count, privacy: .public) file=\(sourceName, privacy: .public)")
+				Self.logger.log("clusterFaces:extracting feature \(i + 1, privacy: .public)/\(faceEntries.count, privacy: .public) file=\(sourceName, privacy: .public)")
 			}
 			if i % 16 == 0 { await Task.yield() }
 			progress?(i + 1, totalSteps, "Extracting features \(i + 1)/\(faceEntries.count)")
@@ -181,7 +180,7 @@ final class FaceProcessor {
 
 		for i in 0..<n {
 			if Task.isCancelled {
-				faceLogger.log("clusterFaces:cancelled during clustering")
+				Self.logger.log("clusterFaces:cancelled during clustering")
 				progress?(faceEntries.count + i, totalSteps, "Cancelled")
 				return false
 			}
@@ -226,7 +225,7 @@ final class FaceProcessor {
 		for cluster in clusters { let pid = UUID().uuidString; persons[pid] = cluster.map { faceEntries[$0].id.uuidString } }
 		await dbActor.replacePersons(persons)
 		await dbActor.reattachSyntheticAssignments(combinedAssignments)
-		faceLogger.log("clusterFaces:done clusters=\(clusters.count, privacy: .public) elapsed_ms=\(Int(Date().timeIntervalSince(started) * 1000), privacy: .public)")
+		Self.logger.log("clusterFaces:done clusters=\(clusters.count, privacy: .public) elapsed_ms=\(Int(Date().timeIntervalSince(started) * 1000), privacy: .public)")
 		progress?(totalSteps, totalSteps, "Completed")
 		return true
 	}
