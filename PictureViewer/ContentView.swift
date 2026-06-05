@@ -6,6 +6,7 @@
 
 import SwiftUI
 import AppKit
+import CoreImage
 import ImageIO
 import CryptoKit
 import os
@@ -471,9 +472,78 @@ struct ContentView: View {
 		}
 	}
 
-	// Displayed (sorted) snapshot of photos. Computed in background when
-	// the underlying library or the sort mode changes.
-	@State private var displayedPhotos: [PhotoItem] = []
+		/// Adjust brightness of the image at `url` by `delta` (−1…+1, CIColorControls scale).
+		/// Returns true on success. Preserves original format and metadata when possible.
+		private static func adjustBrightnessFile(at url: URL, delta: Double) async -> Bool {
+			let logger = Logger(subsystem: "com.example.PictureViewer", category: "brightness")
+			guard delta != 0 else { return true }
+
+			_ = await Self.ensureSecurityScopedAccess(for: url)
+
+			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+				  let type = CGImageSourceGetType(src),
+				  let cgIn = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+				logger.error("adjustBrightnessFile: cannot load image at \(url.path, privacy: .public)")
+				return false
+			}
+
+			let ci = CIImage(cgImage: cgIn)
+			guard let filter = CIFilter(name: "CIColorControls") else {
+				logger.error("adjustBrightnessFile: CIColorControls unavailable")
+				return false
+			}
+			filter.setValue(ci, forKey: kCIInputImageKey)
+			filter.setValue(Float(delta), forKey: kCIInputBrightnessKey)
+			guard let ciOut = filter.outputImage else {
+				logger.error("adjustBrightnessFile: filter produced no output")
+				return false
+			}
+
+			let ctx = CIContext()
+			guard let cgOut = ctx.createCGImage(ciOut, from: ciOut.extent) else {
+				logger.error("adjustBrightnessFile: createCGImage failed")
+				return false
+			}
+
+			let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+			let fm = FileManager.default
+			let tempURL = url.deletingLastPathComponent()
+				.appendingPathComponent(".pvtmp-\(UUID().uuidString)")
+				.appendingPathExtension(url.pathExtension)
+			guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
+				logger.error("adjustBrightnessFile: cannot create destination")
+				NotificationCenter.default.post(name: .embedWriteFailed, object: nil,
+					userInfo: ["url": url.path, "op": "adjustBrightness",
+							   "message": "CGImageDestinationCreateWithURL failed"])
+				return false
+			}
+			CGImageDestinationAddImage(dest, cgOut, props as CFDictionary?)
+			guard CGImageDestinationFinalize(dest) else {
+				try? fm.removeItem(at: tempURL)
+				logger.error("adjustBrightnessFile: finalize failed")
+				NotificationCenter.default.post(name: .embedWriteFailed, object: nil,
+					userInfo: ["url": url.path, "op": "adjustBrightness",
+							   "message": "CGImageDestinationFinalize failed"])
+				return false
+			}
+
+			do {
+				let backupURL = url.appendingPathExtension("backup")
+				if fm.fileExists(atPath: backupURL.path) { try? fm.removeItem(at: backupURL) }
+				try fm.moveItem(at: url, to: backupURL)
+				try fm.moveItem(at: tempURL, to: url)
+				try? fm.removeItem(at: backupURL)
+				return true
+			} catch {
+				try? fm.removeItem(at: tempURL)
+				logger.error("adjustBrightnessFile: replace failed: \(error.localizedDescription, privacy: .public)")
+				return false
+			}
+		}
+
+		// Displayed (sorted) snapshot of photos. Computed in background when
+		// the underlying library or the sort mode changes.
+		@State private var displayedPhotos: [PhotoItem] = []
 	@State private var sortTask: Task<Void, Never>? = nil
 	@State private var refreshToken = UUID()
 	@State private var searchText: String = ""
@@ -498,6 +568,11 @@ struct ContentView: View {
 	@State private var isApplyingRotations: Bool = false
 	@State private var rotProgressCount: Int = 0
 	@State private var rotationResults: [URL: Bool?] = [:]
+	@State private var isShowingBrightnessSheet: Bool = false
+	@State private var isApplyingBrightness: Bool = false
+	@State private var brightnessAdjustment: Double = 0.2
+	@State private var brightnessProgressCount: Int = 0
+	@State private var brightnessResults: [URL: Bool?] = [:]
 	// Use a dedicated window for People; open via `openWindow(id:value:)`
 	@State private var lastRefreshDuration: TimeInterval?
 	@State private var lastRefreshDate: Date?
@@ -965,6 +1040,86 @@ struct ContentView: View {
 			.padding()
 			.frame(minWidth: 420, minHeight: 200)
 		}
+		.sheet(isPresented: $isShowingBrightnessSheet) {
+			VStack(spacing: 16) {
+				Text("Adjust Brightness for \(selectedItems.count) photo\(selectedItems.count == 1 ? "" : "s")")
+					.font(.headline)
+
+				VStack(alignment: .leading, spacing: 6) {
+					HStack {
+						Text("Brightness")
+						Spacer()
+						Text(String(format: "%+.2f", brightnessAdjustment))
+							.monospacedDigit()
+							.foregroundStyle(.secondary)
+					}
+					Slider(value: $brightnessAdjustment, in: -1.0...1.0, step: 0.05)
+				}
+				.padding(.horizontal)
+
+				if isApplyingBrightness {
+					ProgressView(value: Double(brightnessProgressCount), total: Double(selectedItems.count))
+						.padding(.horizontal)
+					ScrollView {
+						VStack(alignment: .leading, spacing: 8) {
+							ForEach(Array(selectedItems).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }), id: \.self) { u in
+								HStack {
+									Text(u.lastPathComponent)
+										.font(.caption)
+										.lineLimit(1)
+									Spacer()
+									if brightnessResults[u] == nil {
+										ProgressView().controlSize(.small)
+									} else if brightnessResults[u] == true {
+										Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+									} else {
+										Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+									}
+								}
+							}
+						}
+						.padding(.horizontal)
+					}
+					.frame(maxHeight: 200)
+				}
+
+				HStack {
+					Button("Cancel") { if !isApplyingBrightness { isShowingBrightnessSheet = false } }
+						.disabled(isApplyingBrightness)
+					Spacer()
+					if isApplyingBrightness {
+						Button("Close") { isShowingBrightnessSheet = false }
+					} else {
+						Button("Apply") {
+							let urls = Array(selectedItems)
+							brightnessResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
+							brightnessProgressCount = 0
+							isApplyingBrightness = true
+							let delta = brightnessAdjustment
+							Task.detached(priority: .utility) {
+								for u in urls {
+									if Task.isCancelled { break }
+									let ok = await Self.adjustBrightnessFile(at: u, delta: delta)
+									await MainActor.run {
+										brightnessResults[u] = ok
+										brightnessProgressCount += 1
+									}
+								}
+								await MainActor.run {
+									isApplyingBrightness = false
+									refreshToken = UUID()
+									isShowingBrightnessSheet = false
+								}
+							}
+						}
+						.disabled(selectedItems.isEmpty || brightnessAdjustment == 0)
+					}
+				}
+				.padding(.horizontal)
+			}
+			.padding()
+			.frame(minWidth: 380, minHeight: 220)
+		}
 	}
 
 	// MARK: - Status bar (single, compact line)
@@ -1293,6 +1448,13 @@ struct ContentView: View {
 					}
 					.disabled(selectedItems.isEmpty || selectedRotations.filter { $0.value % 360 != 0 }.isEmpty)
 					.help("Persist rotations for selected files")
+					Button(action: {
+						isShowingBrightnessSheet = true
+					}) {
+						Image(systemName: "sun.max")
+					}
+					.disabled(selectedItems.isEmpty)
+					.help("Adjust brightness of selected photos")
 					Button(action: {
 						// Select all displayed
 						selectedItems = Set(displayedPhotos.map { $0.url })
