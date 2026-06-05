@@ -528,6 +528,7 @@ struct ContentView: View {
 	// Resolved URLs for each persisted bookmark; populated by reloadBookmarks()
 	// and consumed by the toolbar bookmark dropdown.
 	@State private var bookmarkURLs: [URL] = []
+	@State private var showBookmarkManager: Bool = false
 
 	// Deduper used for multi-folder scans to avoid showing duplicate
 	// basenames when combining results from multiple folders. We perform
@@ -628,6 +629,48 @@ struct ContentView: View {
 		.onChange(of: library.photos) { _ in scheduleSort() }
 		.onChange(of: sortModeRaw) { _ in scheduleSort() }
 		.onChange(of: searchText) { _ in scheduleSort() }
+		.sheet(isPresented: $showBookmarkManager) {
+			VStack(spacing: 12) {
+				Text("Manage Bookmarks")
+					.font(.headline)
+				if bookmarkURLs.isEmpty {
+					Text("No bookmarks saved.")
+						.foregroundStyle(.secondary)
+						.frame(maxWidth: .infinity, maxHeight: .infinity)
+				} else {
+					List {
+						ForEach(bookmarkURLs, id: \.self) { url in
+							HStack {
+								VStack(alignment: .leading, spacing: 2) {
+									Text(url.lastPathComponent)
+									Text(url.path)
+										.font(.caption)
+										.foregroundStyle(.secondary)
+										.lineLimit(1)
+										.truncationMode(.middle)
+								}
+								Spacer()
+								Button(role: .destructive) {
+									deleteBookmark(url)
+								} label: {
+									Image(systemName: "trash")
+								}
+								.buttonStyle(.borderless)
+								.help("Remove this bookmark")
+							}
+						}
+					}
+					.frame(minHeight: 220)
+				}
+				HStack {
+					Spacer()
+					Button("Done") { showBookmarkManager = false }
+						.keyboardShortcut(.defaultAction)
+				}
+			}
+			.padding()
+			.frame(minWidth: 480, minHeight: 280)
+		}
 		.sheet(isPresented: $isEditingKeywords) {
 			VStack(spacing: 12) {
 				Text("Edit Keywords for \(selectedItems.count) photos")
@@ -1175,18 +1218,24 @@ struct ContentView: View {
 					Image(systemName: "person.2.fill")
 				}
 				.help("People")
-				if !bookmarkURLs.isEmpty {
-					Menu {
+				Menu {
+					if bookmarkURLs.isEmpty {
+						Text("No bookmarks")
+					} else {
 						ForEach(bookmarkURLs, id: \.self) { url in
 							Button(url.lastPathComponent) {
 								openWindow(id: "folder", value: url)
 							}
 						}
-					} label: {
-						Image(systemName: "bookmark")
+						Divider()
 					}
-					.help("Open a bookmarked folder in a new tab")
+					Button("Manage Bookmarks…") {
+						showBookmarkManager = true
+					}
+				} label: {
+					Image(systemName: "bookmark")
 				}
+				.help("Open or manage bookmarked folders")
 				// Edit / selection controls
 				Button {
 					selectionMode.toggle()
@@ -1280,6 +1329,30 @@ struct ContentView: View {
 	
 	
 	// MARK: - Actions
+
+	/// Remove a bookmark by URL from the persisted multi-bookmark list and
+	/// stop security-scoped access for it. The legacy single-bookmark key is
+	/// kept in sync with the first remaining entry.
+	private func deleteBookmark(_ url: URL) {
+		guard let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data] else { return }
+		let remaining: [Data] = arr.compactMap { data in
+			var stale = false
+			if let resolved = try? URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale) {
+				return resolved == url ? nil : data
+			}
+			// Keep entries we can't resolve so we don't silently drop user data.
+			return data
+		}
+		UserDefaults.standard.set(remaining, forKey: Self.kLastFolderBookmarks)
+		if let first = remaining.first {
+			UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
+		} else {
+			UserDefaults.standard.removeObject(forKey: Self.kLastFolderBookmark)
+		}
+		url.stopAccessingSecurityScopedResource()
+		Self.activeSecurityScopedURLs.removeAll { $0 == url }
+		reloadBookmarks()
+	}
 
 	/// Resolve persisted folder bookmarks and start security-scoped access
 	/// for each. Populates `bookmarkURLs` for the toolbar dropdown.
