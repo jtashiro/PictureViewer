@@ -562,7 +562,9 @@ struct ContentView: View {
 	@State private var deleteErrorMessages: [URL: String?] = [:]
 	@State private var showDeleteErrorSummary: Bool = false
 	@State private var deleteErrorSummary: String = ""
+	@State private var deleteHadFailures: Bool = false
 	@State private var deletingURLs: [URL] = []
+	@State private var pendingDeleteURLs: [URL] = []
 	@State private var selectedRotations: [URL: Int] = [:]
 	@State private var isShowingRotationSheet: Bool = false
 	@State private var isApplyingRotations: Bool = false
@@ -844,34 +846,45 @@ struct ContentView: View {
 			.padding()
 			.frame(minWidth: 420, minHeight: 200)
 		}
-		.alert(isPresented: $showDeleteConfirmation) {
-			Alert(
-				title: Text("Delete selected files?"),
-				message: Text("This will move the selected files to the Trash. You can recover them from the Trash if needed."),
-				primaryButton: .destructive(Text("Delete")) {
-					let urls = Array(selectedItems)
-					performDelete(urls: urls)
-				},
-				secondaryButton: .cancel()
-			)
+		.confirmationDialog(
+			"Are you sure you want to delete \(pendingDeleteURLs.count) file\(pendingDeleteURLs.count == 1 ? "" : "s")?",
+			isPresented: $showDeleteConfirmation,
+			titleVisibility: .visible
+		) {
+			Button("Delete", role: .destructive) {
+				let urls = pendingDeleteURLs
+				pendingDeleteURLs = []
+				performDelete(urls: urls)
+			}
+			Button("Cancel", role: .cancel) {
+				pendingDeleteURLs = []
+			}
+		} message: {
+			Text("This will permanently delete the selected files.")
 		}
 		.alert(isPresented: $showDeleteErrorSummary) {
-			// Offer a retry for failed deletions
-			Alert(
-				title: Text("Some deletions failed"),
-				message: Text(deleteErrorSummary),
-				primaryButton: .default(Text("Retry")) {
-					// Collect URLs that failed and retry
-					let failed = deleteResults.compactMap { (k, v) -> URL? in
-						if let ok = v, ok == false { return k }
-						return nil
-					}
-					if !failed.isEmpty {
-						performDelete(urls: failed)
-					}
-				},
-				secondaryButton: .cancel()
-			)
+			if deleteHadFailures {
+				Alert(
+					title: Text("Delete completed with issues"),
+					message: Text(deleteErrorSummary),
+					primaryButton: .default(Text("Retry Failed")) {
+						let failed = deleteResults.compactMap { (k, v) -> URL? in
+							if let ok = v, ok == false { return k }
+							return nil
+						}
+						if !failed.isEmpty {
+							requestDeleteConfirmation(urls: failed, source: "retry-alert")
+						}
+					},
+					secondaryButton: .default(Text("OK"))
+				)
+			} else {
+				Alert(
+					title: Text("Delete completed"),
+					message: Text(deleteErrorSummary),
+					dismissButton: .default(Text("OK"))
+				)
+			}
 		}
 		.alert(isPresented: $showRepairResult) {
 			Alert(title: Text("Repair Metadata"), message: Text(repairResultMessage ?? ""), dismissButton: .default(Text("OK")))
@@ -946,7 +959,7 @@ struct ContentView: View {
 							if let ok = v, ok == false { return k }
 							return nil
 						}
-						if !failed.isEmpty { performDelete(urls: failed) }
+						if !failed.isEmpty { requestDeleteConfirmation(urls: failed, source: "retry-sheet") }
 					}
 					.disabled(!deleteResults.values.contains { $0 == false })
 				}
@@ -1434,12 +1447,12 @@ struct ContentView: View {
 					.help("Rotate selection right 90° (preview)")
 					Button(action: {
 						// Trigger delete confirmation
-						showDeleteConfirmation = true
+						requestDeleteConfirmation(urls: Array(selectedItems), source: "toolbar")
 					}) {
 						Image(systemName: "trash")
 					}
 					.disabled(selectedItems.isEmpty)
-					.help("Move selected files to Trash")
+					.help("Permanently delete selected files")
 					Button(action: {
 						// Show rotation apply sheet
 						isShowingRotationSheet = true
@@ -1681,6 +1694,7 @@ struct ContentView: View {
 	}
 
 	private func refreshThumbnails() {
+		guard let folder = library.folderURL else { return }
 		isRefreshing = true
 		let start = Date()
 		Task {
@@ -1688,11 +1702,21 @@ struct ContentView: View {
 				await ThumbnailCache.shared.clear()
 			}
 			_ = await clear.value
+			// Trigger a fresh filesystem scan so newly added files appear in the grid.
+			library.scan(folder: folder)
 			lastRefreshDuration = Date().timeIntervalSince(start)
 			lastRefreshDate = Date()
 			isRefreshing = false
 			refreshToken = UUID()
 		}
+	}
+
+	private func requestDeleteConfirmation(urls: [URL], source: String) {
+		let unique = Array(Set(urls))
+		guard !unique.isEmpty else { return }
+		pendingDeleteURLs = unique
+		logger.log("requestDeleteConfirmation: source=\(source, privacy: .public) count=\(unique.count, privacy: .public)")
+		showDeleteConfirmation = true
 	}
 
 	private func performDelete(urls: [URL]) {
@@ -1701,25 +1725,32 @@ struct ContentView: View {
 		deleteProgressCount = 0
 		isDeleting = true
 		deletingURLs = urls
-		logger.log("performDelete: attempting to move \(urls.count) items to Trash")
+		logger.log("performDelete: attempting permanent delete of \(urls.count) items")
 		Task.detached(priority: .utility) {
 			let fm = FileManager.default
 			for u in urls {
 				if Task.isCancelled { break }
 				var success = false
 				var errorMsg: String? = nil
+				let exists = fm.fileExists(atPath: u.path)
+				let accessOk = await Self.ensureSecurityScopedAccess(for: u)
+				await MainActor.run {
+					self.logger.log("performDelete: item=\(u.path, privacy: .public) exists=\(exists, privacy: .public) accessOk=\(accessOk, privacy: .public)")
+				}
 				do {
-					var trashed: NSURL? = nil
-					try fm.trashItem(at: u, resultingItemURL: &trashed)
-					success = true
-					if let t = trashed {
-						await MainActor.run { self.logger.log("performDelete: trashed \(u.path, privacy: .public) -> \(t.path ?? "", privacy: .public)") }
-					} else {
-						await MainActor.run { self.logger.log("performDelete: trashed \(u.path, privacy: .public) (resulting URL unknown)") }
+					if !exists {
+						throw NSError(domain: "PictureViewer.Delete", code: 2, userInfo: [NSLocalizedDescriptionKey: "File does not exist on disk."])
 					}
+					if !accessOk {
+						throw NSError(domain: "PictureViewer.Delete", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing folder permission. Re-select the folder and try again."])
+					}
+					try fm.removeItem(at: u)
+					success = true
+					await MainActor.run { self.logger.log("performDelete: deleted \(u.path, privacy: .public)") }
 				} catch {
 					success = false
-					errorMsg = error.localizedDescription
+					let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+					errorMsg = localized.isEmpty ? "Unknown delete error." : localized
 					await MainActor.run { self.logger.error("performDelete: failed to trash \(u.path, privacy: .public): \(error.localizedDescription, privacy: .public)") }
 				}
 
@@ -1737,18 +1768,26 @@ struct ContentView: View {
 				}
 			}
 
-			// Build an error summary for any failures so the UI can show it.
+			// Build a review summary for all delete results so the user can
+			// always inspect what happened.
 			await MainActor.run {
-				var summaryLines: [String] = []
-				for (u, msg) in deleteErrorMessages.sorted(by: { $0.key.lastPathComponent < $1.key.lastPathComponent }) {
-					if let m = msg {
-						summaryLines.append("\(u.lastPathComponent): \(m)")
+				var successCount = 0
+				var failureCount = 0
+				var detailLines: [String] = []
+				for u in urls.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+					let res = deleteResults[u] ?? nil
+					if res == true {
+						successCount += 1
+						detailLines.append("[OK] \(u.lastPathComponent)")
+					} else {
+						failureCount += 1
+						let msg = (deleteErrorMessages[u] ?? nil) ?? "Unknown delete error."
+						detailLines.append("[FAIL] \(u.lastPathComponent): \(msg)")
 					}
 				}
-				if !summaryLines.isEmpty {
-					deleteErrorSummary = summaryLines.joined(separator: "\n")
-					showDeleteErrorSummary = true
-				}
+				deleteHadFailures = failureCount > 0
+				deleteErrorSummary = (["Requested: \(urls.count), Deleted: \(successCount), Failed: \(failureCount)"] + detailLines).joined(separator: "\n")
+				showDeleteErrorSummary = true
 				// clear deletingURLs when done
 				deletingURLs = []
 				isDeleting = false

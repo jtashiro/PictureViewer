@@ -156,6 +156,28 @@ final class PhotoLibrary {
 		}
 	}
 
+	/// Delete the per-folder snapshot JSON for `folder`, if any. Used when
+	/// a bookmark is removed so a future re-add starts from a fresh scan
+	/// instead of a stale cached file list.
+	nonisolated static func removeCachedSnapshot(for folder: URL) {
+		let fm = FileManager.default
+		guard let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) else { return }
+		let base = appSupport.appendingPathComponent("PictureViewer", isDirectory: true)
+		let key = Self.safeFilename(for: folder.path)
+		let fileURL = base.appendingPathComponent(key).appendingPathExtension("json")
+		try? fm.removeItem(at: fileURL)
+	}
+
+	/// Delete the combined multi-folder snapshot file. The set of saved
+	/// folders has changed, so any combined cache is now stale.
+	nonisolated static func removeCombinedSnapshot() {
+		let fm = FileManager.default
+		guard let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) else { return }
+		let base = appSupport.appendingPathComponent("PictureViewer", isDirectory: true)
+		let fileURL = base.appendingPathComponent("combined_snapshot").appendingPathExtension("json")
+		try? fm.removeItem(at: fileURL)
+	}
+
 	/// Persist a combined snapshot for multiple folders. This writes a
 	/// single JSON file containing the list of paths and the list of source
 	/// folder paths so the UI can restore a combined view quickly.

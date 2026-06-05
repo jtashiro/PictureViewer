@@ -59,6 +59,24 @@ final class WindowStateStore: @unchecked Sendable {
 		}
 	}
 
+	/// If the persisted "last active folder" bookmark resolves to `url`,
+	/// clear it so launch-time restoration won't reopen that folder. Also
+	/// drops the in-process `activeFolderURL` reference if it matches.
+	func clearSavedFolderIfMatches(_ url: URL) {
+		queueLock.lock()
+		defer { queueLock.unlock() }
+		if activeFolderURL == url {
+			activeFolderURL?.stopAccessingSecurityScopedResource()
+			activeFolderURL = nil
+		}
+		guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else { return }
+		var stale = false
+		if let resolved = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale),
+		   resolved == url {
+			UserDefaults.standard.removeObject(forKey: bookmarkKey)
+		}
+	}
+
 	/// Resolves the saved bookmark, activates the security scope, and
 	/// returns the URL. Returns nil if there's no saved bookmark or if it
 	/// can no longer be resolved (e.g. folder was moved/deleted).
