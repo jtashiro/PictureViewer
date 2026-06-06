@@ -20,6 +20,7 @@ struct ThumbnailView: View {
 	/// bypassing both memory and disk caches. Used by the "Refresh
 	/// Thumbnails" button.
 	let refreshToken: UUID
+	let forceLoad: Bool
 
 	@State private var image: NSImage?
 	@State private var loadFailed = false
@@ -29,10 +30,11 @@ struct ThumbnailView: View {
 	// defers thumbnail loading at app launch (can help avoid startup spikes).
 	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
 
-	init(url: URL, size: CGFloat, refreshToken: UUID) {
+	init(url: URL, size: CGFloat, refreshToken: UUID, forceLoad: Bool = false) {
 		self.url = url
 		self.size = size
 		self.refreshToken = refreshToken
+		self.forceLoad = forceLoad
 		self._image = State(initialValue: ThumbnailCache.shared.memoryImage(for: url, namespace: nil))
 	}
 
@@ -92,7 +94,7 @@ struct ThumbnailView: View {
 			}
 		}
 		.help(url.lastPathComponent)
-		.task(id: ThumbnailTaskID(url: url, refreshToken: refreshToken, namespace: namespace)) {
+		.task(id: ThumbnailTaskID(url: url, refreshToken: refreshToken, namespace: namespace, forceLoad: forceLoad)) {
 			await loadThumbnail()
 			// Also update metadata indicator asynchronously
 			await updateMetadataState()
@@ -103,6 +105,7 @@ struct ThumbnailView: View {
 		let url: URL
 		let refreshToken: UUID
 		let namespace: String?
+		let forceLoad: Bool
 	}
 
 	private func loadThumbnail() async {
@@ -115,7 +118,7 @@ struct ThumbnailView: View {
 
 		image = nil
 
-		if disableThumbnailLoadingAtLaunch {
+		if disableThumbnailLoadingAtLaunch && !forceLoad {
 			thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")
 			return
 		}

@@ -171,20 +171,42 @@ struct VaultFileCommands: Commands {
 	@FocusedValue(\.vaultCommandActions) private var vaultActions
 
 	var body: some Commands {
+		CommandGroup(after: .newItem) {
+			Button("New Vault…") {
+				vaultActions?.newVault()
+			}
+			.disabled(vaultActions == nil)
+
+			Button("Open Vault…") {
+				vaultActions?.chooseAndOpenVault()
+			}
+			.disabled(vaultActions == nil)
+
+			Button("Close Vault") {
+				vaultActions?.closeVault()
+			}
+			.disabled(vaultActions?.canCloseVault != true)
+
+			Button("Rename Vault…") {
+				vaultActions?.renameVault()
+			}
+			.disabled(vaultActions?.canRenameVault != true)
+		}
+
 		CommandGroup(after: .importExport) {
 			Divider()
-			Button("Import Folder to Encrypted Storage…") {
+			Button("Import Folder to Vault…") {
 				vaultActions?.importFolders()
 			}
 			.disabled(vaultActions == nil)
 
-			Button("Store Selected Images in Encrypted Storage") {
+			Button("Store Selected Images in Vault") {
 				vaultActions?.importSelected()
 			}
 			.disabled(vaultActions?.canImportSelected != true)
 
-			Button("Open Encrypted Storage") {
-				vaultActions?.openVault()
+			Button("Open Vault") {
+				vaultActions?.chooseAndOpenVault()
 			}
 			.disabled(vaultActions == nil)
 
@@ -192,6 +214,20 @@ struct VaultFileCommands: Commands {
 				vaultActions?.exportPhotos()
 			}
 			.disabled(vaultActions?.canExport != true)
+		}
+
+		CommandGroup(replacing: .pasteboard) {
+			Button("Copy") {
+				vaultActions?.copy()
+			}
+			.keyboardShortcut("c", modifiers: .command)
+			.disabled(vaultActions?.canCopy != true)
+
+			Button("Paste") {
+				vaultActions?.paste()
+			}
+			.keyboardShortcut("v", modifiers: .command)
+			.disabled(vaultActions?.canPaste != true)
 		}
 	}
 }
