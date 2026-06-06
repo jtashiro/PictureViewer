@@ -14,6 +14,7 @@ import os
 struct PictureViewerApp: App {
 	@StateObject private var authManager = AuthenticationManager.shared
 	@AppStorage("requirePasswordAtLaunch") private var requirePasswordAtLaunch: Bool = true
+	@State private var isShowingAboutSheet = false
 
 	init() {
 		// Touch the lazy CPU detection so the worker count is computed at launch.
@@ -94,9 +95,13 @@ struct PictureViewerApp: App {
 						.environmentObject(authManager)
 				}
 			}
+			.sheet(isPresented: $isShowingAboutSheet) {
+				AboutBuildView(isShowingAboutSheet: $isShowingAboutSheet)
+			}
 		}
 		.commands {
 			VaultFileCommands()
+			AboutCommands(isShowingAboutSheet: $isShowingAboutSheet)
 		}
 
 		WindowGroup(id: "photo-viewer", for: URL.self) { $url in
@@ -167,6 +172,62 @@ struct PictureViewerApp: App {
 	}
 }
 
+struct AboutBuildView: View {
+	@Binding var isShowingAboutSheet: Bool
+
+	var body: some View {
+		VStack(spacing: 18) {
+			Image(nsImage: NSApp.applicationIconImage)
+				.resizable()
+				.frame(width: 72, height: 72)
+				.clipShape(RoundedRectangle(cornerRadius: 14))
+
+			VStack(spacing: 4) {
+				Text("Picture Viewer")
+					.font(.title2)
+					.fontWeight(.semibold)
+				Text("Version \(BuildInfo.appVersion) (\(BuildInfo.bundleVersion))")
+					.foregroundStyle(.secondary)
+			}
+
+			Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+				GridRow {
+					Text("Build Date")
+						.foregroundStyle(.secondary)
+					Text(BuildInfo.buildTimestamp)
+						.textSelection(.enabled)
+				}
+				GridRow {
+					Text("Build ID")
+						.foregroundStyle(.secondary)
+					Text(BuildInfo.buildIdentifier)
+						.textSelection(.enabled)
+				}
+			}
+			.font(.system(.body, design: .monospaced))
+
+			Button("Done") {
+				isShowingAboutSheet = false
+			}
+			.keyboardShortcut(.defaultAction)
+		}
+		.padding(28)
+		.frame(width: 420)
+	}
+}
+
+struct AboutCommands: Commands {
+	@Binding var isShowingAboutSheet: Bool
+
+	var body: some Commands {
+		CommandGroup(after: .help) {
+			Button("About Picture Viewer…") {
+				isShowingAboutSheet = true
+			}
+		}
+	}
+}
+
 struct VaultFileCommands: Commands {
 	@FocusedValue(\.vaultCommandActions) private var vaultActions
 
@@ -191,6 +252,11 @@ struct VaultFileCommands: Commands {
 				vaultActions?.renameVault()
 			}
 			.disabled(vaultActions?.canRenameVault != true)
+
+			Button("Manage Vaults…") {
+				vaultActions?.manageVaults()
+			}
+			.disabled(vaultActions == nil)
 		}
 
 		CommandGroup(after: .importExport) {
@@ -214,6 +280,13 @@ struct VaultFileCommands: Commands {
 				vaultActions?.exportPhotos()
 			}
 			.disabled(vaultActions?.canExport != true)
+
+			Divider()
+
+			Button("Sync to Tab…") {
+				vaultActions?.syncToTab()
+			}
+			.disabled(vaultActions?.canSyncToTab != true)
 		}
 
 		CommandGroup(replacing: .pasteboard) {

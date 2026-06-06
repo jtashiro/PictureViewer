@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
 
 extension Notification.Name {
 	static let embedWriteFailed = Notification.Name("com.example.PictureViewer.embedWriteFailed")
+	static let galleryTabSyncImported = Notification.Name("com.example.PictureViewer.galleryTabSyncImported")
 }
 
 struct VaultCommandActions {
@@ -24,15 +25,47 @@ struct VaultCommandActions {
 	let openVault: () -> Void
 	let closeVault: () -> Void
 	let renameVault: () -> Void
+	let manageVaults: () -> Void
 	let exportPhotos: () -> Void
+	let syncToTab: () -> Void
 	let copy: () -> Void
 	let paste: () -> Void
 	let canCloseVault: Bool
 	let canRenameVault: Bool
 	let canImportSelected: Bool
 	let canExport: Bool
+	let canSyncToTab: Bool
 	let canCopy: Bool
 	let canPaste: Bool
+}
+
+private struct GalleryTabSnapshot: Identifiable, Hashable {
+	let id: UUID
+	let title: String
+	let folderURL: URL?
+	let isVault: Bool
+	let photoURLs: [URL]
+}
+
+@MainActor
+private final class GalleryTabRegistry {
+	static let shared = GalleryTabRegistry()
+
+	private var snapshots: [UUID: GalleryTabSnapshot] = [:]
+
+	func update(_ snapshot: GalleryTabSnapshot) {
+		snapshots[snapshot.id] = snapshot
+	}
+
+	func remove(id: UUID) {
+		snapshots.removeValue(forKey: id)
+	}
+
+	func targets(excluding id: UUID) -> [GalleryTabSnapshot] {
+		snapshots.values
+			.filter { $0.id != id && $0.folderURL != nil }
+			.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+	}
 }
 
 private struct VaultCommandActionsKey: FocusedValueKey {
@@ -192,6 +225,7 @@ struct ContentView: View {
 	}
 
 	@State private var initialFolderURL: URL?
+	@State private var tabID = UUID()
 
 	init(initialFolder: URL? = nil) {
 		_initialFolderURL = State(initialValue: initialFolder)
@@ -238,9 +272,11 @@ struct ContentView: View {
 			let rest = Array(resolvedFolders.dropFirst())
 			logger.log("launch folder restore: source=bookmark-list storage=filesystem bookmarkCount=\(arr.count, privacy: .public) uniqueFolders=\(resolvedFolders.count, privacy: .public) duplicatesRemoved=\(duplicateCount, privacy: .public) primaryFolder=\(first.path, privacy: .public)")
 			await MainActor.run {
-				library.folderURL = first
-				activeFolderNames = [first.lastPathComponent]
-				library.scan(folder: first)
+				if !tryOpenFolderAsVault(first) {
+					library.folderURL = first
+					activeFolderNames = [first.lastPathComponent]
+					library.scan(folder: first)
+				}
 				for url in rest {
 					logger.log("launch folder restore: source=bookmark-list storage=filesystem action=open-tab folder=\(url.path, privacy: .public)")
 					openWindow(id: "folder", value: url)
@@ -258,6 +294,11 @@ struct ContentView: View {
 		do {
 			let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
 			if url.startAccessingSecurityScopedResource() {
+				if await MainActor.run(body: { tryOpenFolderAsVault(url) }) {
+					if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
+					logger.log("launch folder restore: source=legacy-bookmark storage=vault action=prompt folder=\(url.path, privacy: .public)")
+					return true
+				}
 				// Don't start an immediate full scan at launch; doing so can
 				// block the UI while the scanner enumerates the filesystem. Instead,
 				// publish the folder and try to restore a cached snapshot (if any)
@@ -288,7 +329,7 @@ struct ContentView: View {
 						await MainActor.run {
 							logger.log("launch folder restore: source=legacy-bookmark storage=cache folder=\(url.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
 						}
-						let batchSize = 256
+						let batchSize = 512
 						await MainActor.run { library.photos = [] }
 						var idx = 0
 						while idx < deduped.count {
@@ -801,6 +842,8 @@ struct ContentView: View {
 	@State private var vaultUnlockMessage: String?
 	@State private var vaultStoreTask: Task<Void, Never>?
 	@State private var pendingVaultAutoOpen: Bool = false
+	@State private var isShowingVaultManager: Bool = false
+	@State private var knownVaults: [KnownVault] = []
 
 	private var isActiveVaultView: Bool {
 		activeFolderNames.count == 1 && activeFolderNames[0].hasSuffix("*")
@@ -845,13 +888,16 @@ struct ContentView: View {
 				openVault: { openVault() },
 				closeVault: { closeVault() },
 				renameVault: { renameVault() },
+				manageVaults: { showVaultManager() },
 				exportPhotos: { exportVaultSelection() },
+				syncToTab: { syncToAnotherTab() },
 				copy: { copySelectedFiles() },
 				paste: { pasteFilesToVault() },
 				canCloseVault: isActiveVaultView || vaultStatus.isUnlocked,
 				canRenameVault: isActiveVaultView && library.folderURL != nil,
 				canImportSelected: hasSelectedPhotos,
 				canExport: !library.photos.isEmpty,
+				canSyncToTab: !library.photos.isEmpty,
 				canCopy: hasSelectedPhotos,
 				canPaste: canPasteFilesToVault
 			))
@@ -874,6 +920,7 @@ struct ContentView: View {
 			}
 		})
 		.onAppear {
+			updateTabRegistry()
 			// Initialize displayed photos immediately so the UI shows
 			// something, but defer heavier startup work (sorting and
 			// session restoration) briefly to avoid blocking the main
@@ -921,7 +968,17 @@ struct ContentView: View {
 				}
 			}
 		}
-		.onChange(of: library.photos) { _ in scheduleSort() }
+		.onDisappear {
+			Task { @MainActor in
+				GalleryTabRegistry.shared.remove(id: tabID)
+			}
+		}
+		.onChange(of: library.photos) { _ in
+			scheduleSort()
+			updateTabRegistry()
+		}
+		.onChange(of: activeFolderNames) { _ in updateTabRegistry() }
+		.onChange(of: library.folderURL) { _ in updateTabRegistry() }
 		.onChange(of: sortModeRaw) { _ in scheduleSort() }
 		.onChange(of: searchText) { _ in scheduleSort() }
 		.onChange(of: PersonFilterState.shared.active) { active in
@@ -971,6 +1028,57 @@ struct ContentView: View {
 			}
 			.padding()
 			.frame(minWidth: 480, minHeight: 280)
+		}
+		.sheet(isPresented: $isShowingVaultManager) {
+			VStack(spacing: 12) {
+				Text("Manage Vaults")
+					.font(.headline)
+				if knownVaults.isEmpty {
+					Text("No vaults known.")
+						.foregroundStyle(.secondary)
+						.frame(maxWidth: .infinity, maxHeight: .infinity)
+				} else {
+					List {
+						ForEach(knownVaults) { vault in
+							HStack(spacing: 12) {
+								VStack(alignment: .leading, spacing: 2) {
+									Text(vault.displayName)
+									Text(vault.path)
+										.font(.caption)
+										.foregroundStyle(.secondary)
+										.lineLimit(1)
+										.truncationMode(.middle)
+								}
+								Spacer()
+								Button("Rename") {
+									renameKnownVault(vault)
+								}
+								.buttonStyle(.borderless)
+								Button("Move") {
+									moveKnownVault(vault)
+								}
+								.buttonStyle(.borderless)
+								Button(role: .destructive) {
+									deleteKnownVault(vault)
+								} label: {
+									Image(systemName: "trash")
+								}
+								.buttonStyle(.borderless)
+								.help("Delete this vault")
+							}
+						}
+					}
+					.frame(minHeight: 260)
+				}
+				HStack {
+					Button("Refresh") { reloadKnownVaults() }
+					Spacer()
+					Button("Done") { isShowingVaultManager = false }
+						.keyboardShortcut(.defaultAction)
+				}
+			}
+			.padding()
+			.frame(minWidth: 680, minHeight: 340)
 		}
 		.sheet(isPresented: $isEditingKeywords) {
 			VStack(spacing: 12) {
@@ -1221,6 +1329,9 @@ struct ContentView: View {
 		}
 		.onReceive(NotificationCenter.default.publisher(for: .photoVaultStatusChanged)) { _ in
 			Task { await refreshVaultStatus() }
+		}
+		.onReceive(NotificationCenter.default.publisher(for: .galleryTabSyncImported)) { notification in
+			receiveSyncedFiles(notification)
 		}
 		.sheet(isPresented: $isVaultWorking) {
 			VStack(spacing: 12) {
@@ -2271,6 +2382,224 @@ struct ContentView: View {
 		}
 	}
 
+	private func updateTabRegistry() {
+		let title = activeFolderNames.isEmpty
+			? (library.folderURL?.lastPathComponent ?? "Picture Viewer")
+			: (activeFolderNames.count == 1 ? activeFolderNames[0] : activeFolderNames.joined(separator: " · "))
+		let snapshot = GalleryTabSnapshot(
+			id: tabID,
+			title: title,
+			folderURL: library.folderURL,
+			isVault: isActiveVaultView,
+			photoURLs: library.photos.map(\.url)
+		)
+		Task { @MainActor in
+			GalleryTabRegistry.shared.update(snapshot)
+		}
+	}
+
+	private func syncToAnotherTab() {
+		let targets = GalleryTabRegistry.shared.targets(excluding: tabID)
+		guard !targets.isEmpty else {
+			vaultAlertMessage = "Open another folder or vault tab before syncing."
+			showVaultAlert = true
+			return
+		}
+
+		let alert = NSAlert()
+		alert.messageText = "Sync to Tab"
+		alert.informativeText = "Copy files missing from this tab into the selected target tab."
+		alert.addButton(withTitle: "Sync")
+		alert.addButton(withTitle: "Cancel")
+		let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 26), pullsDown: false)
+		for target in targets {
+			popup.addItem(withTitle: target.title)
+		}
+		let ignoreDuplicates = NSButton(checkboxWithTitle: "Ignore duplicates", target: nil, action: nil)
+		ignoreDuplicates.state = .on
+		let stack = NSStackView(views: [popup, ignoreDuplicates])
+		stack.orientation = .vertical
+		stack.alignment = .leading
+		stack.spacing = 8
+		stack.frame = NSRect(x: 0, y: 0, width: 340, height: 60)
+		alert.accessoryView = stack
+		guard alert.runModal() == .alertFirstButtonReturn else { return }
+		let target = targets[popup.indexOfSelectedItem]
+		performSync(to: target, ignoreDuplicates: ignoreDuplicates.state == .on)
+	}
+
+	private func performSync(to target: GalleryTabSnapshot, ignoreDuplicates: Bool) {
+		let sourceURLs = library.photos.map(\.url)
+		let syncURLs: [URL]
+		if ignoreDuplicates {
+			let targetNames = Set(target.photoURLs.map { $0.lastPathComponent.lowercased() })
+			syncURLs = sourceURLs.filter { !targetNames.contains($0.lastPathComponent.lowercased()) }
+		} else {
+			syncURLs = sourceURLs
+		}
+		guard !syncURLs.isEmpty else {
+			vaultAlertMessage = "The target tab is already synchronized."
+			showVaultAlert = true
+			return
+		}
+
+		if target.isVault {
+			syncFilesToVault(syncURLs, target: target, ignoreDuplicates: ignoreDuplicates)
+		} else {
+			syncFilesToFolder(syncURLs, target: target)
+		}
+	}
+
+	private func syncFilesToFolder(_ sourceURLs: [URL], target: GalleryTabSnapshot) {
+		guard let folder = target.folderURL else { return }
+		isVaultWorking = true
+		vaultProgressMessage = "Syncing files..."
+		vaultProgressCompleted = 0
+		vaultProgressTotal = sourceURLs.count
+		vaultStoreTask?.cancel()
+		let task = Task.detached(priority: .userInitiated) {
+			let started = folder.startAccessingSecurityScopedResource()
+			defer { if started { folder.stopAccessingSecurityScopedResource() } }
+			var copiedURLs: [URL] = []
+			var failedCount = 0
+			for (index, sourceURL) in sourceURLs.enumerated() {
+				if Task.isCancelled { break }
+				do {
+					let destinationURL = Self.uniqueSyncDestinationURL(for: sourceURL.lastPathComponent, in: folder)
+					try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+					copiedURLs.append(destinationURL)
+				} catch {
+					failedCount += 1
+					logger.error("sync folder: failed source=\(sourceURL.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				}
+				if index + 1 == sourceURLs.count || (index + 1) % 128 == 0 {
+					let completed = index + 1
+					await MainActor.run {
+						vaultProgressCompleted = completed
+						vaultProgressTotal = sourceURLs.count
+					}
+				}
+			}
+			let wasCancelled = Task.isCancelled
+			let finalCopiedURLs = copiedURLs
+			let finalFailedCount = failedCount
+			await MainActor.run {
+				isVaultWorking = false
+				vaultStoreTask = nil
+				postSyncedFiles(finalCopiedURLs, to: target)
+				vaultAlertMessage = "Synced \(finalCopiedURLs.count) of \(sourceURLs.count) file\(sourceURLs.count == 1 ? "" : "s").\(finalFailedCount > 0 ? " \(finalFailedCount) failed." : "")\(wasCancelled ? " Cancelled." : "")"
+				showVaultAlert = true
+			}
+		}
+		vaultStoreTask = task
+	}
+
+	private func syncFilesToVault(_ sourceURLs: [URL], target: GalleryTabSnapshot, ignoreDuplicates: Bool) {
+		guard let folder = target.folderURL else { return }
+		guard let password = promptForVaultPassword(title: "Unlock \(target.title)", message: "Enter the target vault password to sync encrypted files.") else {
+			return
+		}
+		isVaultWorking = true
+		vaultProgressMessage = "Syncing encrypted files..."
+		vaultProgressCompleted = 0
+		vaultProgressTotal = sourceURLs.count
+		vaultStoreTask?.cancel()
+		let task = Task.detached(priority: .userInitiated) {
+			do {
+				try await PhotoVault.shared.setLocation(folder)
+				try await PhotoVault.shared.unlock(password: password)
+				let result = try await PhotoVault.shared.importFiles(sourceURLs, ignoreDuplicates: false) { completed, total, _ in
+					if completed == total || completed % 128 == 0 {
+						await MainActor.run {
+							vaultProgressCompleted = completed
+							vaultProgressTotal = total
+						}
+					}
+				}
+				let wasCancelled = Task.isCancelled
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					postSyncedFiles(result.workingURLs, to: target)
+					vaultAlertMessage = vaultStoreSummary(
+						stored: result.workingURLs.count,
+						requested: sourceURLs.count,
+						duplicates: result.duplicateCount,
+						failures: result.failedCount,
+						cancelled: wasCancelled
+					)
+					showVaultAlert = true
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = error.localizedDescription
+					showVaultAlert = true
+				}
+			}
+		}
+		vaultStoreTask = task
+	}
+
+	private func promptForVaultPassword(title: String, message: String) -> String? {
+		let alert = NSAlert()
+		alert.messageText = title
+		alert.informativeText = message
+		alert.addButton(withTitle: "Sync")
+		alert.addButton(withTitle: "Cancel")
+		let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+		alert.accessoryView = field
+		guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+		return field.stringValue
+	}
+
+	private func postSyncedFiles(_ urls: [URL], to target: GalleryTabSnapshot) {
+		guard !urls.isEmpty else { return }
+		NotificationCenter.default.post(
+			name: .galleryTabSyncImported,
+			object: nil,
+			userInfo: [
+				"tabID": target.id.uuidString,
+				"urls": urls,
+				"isVault": target.isVault
+			]
+		)
+	}
+
+	private func receiveSyncedFiles(_ notification: Notification) {
+		guard let targetID = notification.userInfo?["tabID"] as? String,
+			  targetID == tabID.uuidString,
+			  let urls = notification.userInfo?["urls"] as? [URL]
+		else { return }
+		let existing = Set(library.photos.map(\.url))
+		let newPhotos = urls.filter { !existing.contains($0) }.map { PhotoItem(url: $0) }
+		guard !newPhotos.isEmpty else { return }
+		library.photos.append(contentsOf: newPhotos)
+		forceThumbnailLoading = (notification.userInfo?["isVault"] as? Bool) == true
+		refreshToken = UUID()
+		scheduleSort()
+		updateTabRegistry()
+	}
+
+	private nonisolated static func uniqueSyncDestinationURL(for filename: String, in folder: URL) -> URL {
+		let cleanName = filename.isEmpty ? "photo" : URL(fileURLWithPath: filename).lastPathComponent
+		let sourceURL = URL(fileURLWithPath: cleanName)
+		let base = sourceURL.deletingPathExtension().lastPathComponent
+		let ext = sourceURL.pathExtension
+		var candidate = folder.appendingPathComponent(cleanName)
+		var index = 1
+		while FileManager.default.fileExists(atPath: candidate.path) {
+			let name = "\(base)-\(index)"
+			candidate = folder.appendingPathComponent(name)
+			if !ext.isEmpty {
+				candidate = candidate.appendingPathExtension(ext)
+			}
+			index += 1
+		}
+		return candidate
+	}
+
 	private func dragItemProvider(for photoURL: URL) -> NSItemProvider {
 		let urls = contextActionURLs(for: photoURL)
 		let primaryURL = urls.first ?? photoURL
@@ -2368,6 +2697,20 @@ struct ContentView: View {
 		bookmarkURLs = resolved
 	}
 
+	private func promptForVaultImportDuplicateOption(folderCount: Int) -> Bool? {
+		let alert = NSAlert()
+		alert.messageText = "Import Folder to Vault"
+		alert.informativeText = "Import photos from \(folderCount) selected folder\(folderCount == 1 ? "" : "s") into the current vault."
+		alert.addButton(withTitle: "Import")
+		alert.addButton(withTitle: "Cancel")
+		let checkbox = NSButton(checkboxWithTitle: "Ignore duplicates", target: nil, action: nil)
+		checkbox.state = .on
+		checkbox.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+		alert.accessoryView = checkbox
+		guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+		return checkbox.state == .on
+	}
+
 	private func importFolderToVault() {
 		let panel = NSOpenPanel()
 		panel.canChooseFiles = false
@@ -2378,6 +2721,7 @@ struct ContentView: View {
 		guard panel.runModal() == .OK else { return }
 		let folders = panel.urls
 		guard !folders.isEmpty else { return }
+		guard let ignoreDuplicates = promptForVaultImportDuplicateOption(folderCount: folders.count) else { return }
 
 		vaultStoreTask?.cancel()
 		isVaultWorking = true
@@ -2385,23 +2729,29 @@ struct ContentView: View {
 		vaultProgressCompleted = 0
 		vaultProgressTotal = 0
 		vaultProgressCurrentFile = ""
-		logger.log("vault import: start scan folders=\(folders.count, privacy: .public)")
+		logger.log("vault import: start scan folders=\(folders.count, privacy: .public) ignoreDuplicates=\(ignoreDuplicates, privacy: .public)")
 
 		let task = Task.detached(priority: .userInitiated) {
 			do {
+				let scopedFolders = folders.map { folder in
+					(url: folder, started: folder.startAccessingSecurityScopedResource())
+				}
+				defer {
+					for scopedFolder in scopedFolders where scopedFolder.started {
+						scopedFolder.url.stopAccessingSecurityScopedResource()
+					}
+				}
 				var totalToImport = 0
-				for folder in folders {
+				var importURLs: [URL] = []
+				for folder in scopedFolders.map(\.url) {
 					if Task.isCancelled { break }
-					do {
-						let started = folder.startAccessingSecurityScopedResource()
-						defer { if started { folder.stopAccessingSecurityScopedResource() } }
-						for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 512) {
-							if Task.isCancelled { break }
-							totalToImport += batch.count
-							if totalToImport % 512 == 0 {
-								let counted = totalToImport
-								await MainActor.run { vaultProgressCompleted = counted }
-							}
+					for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 512) {
+						if Task.isCancelled { break }
+						totalToImport += batch.count
+						importURLs.append(contentsOf: batch.map(\.url))
+						if totalToImport % 512 == 0 {
+							let counted = totalToImport
+							await MainActor.run { vaultProgressCompleted = counted }
 						}
 					}
 				}
@@ -2431,42 +2781,19 @@ struct ContentView: View {
 						logger.log("vault import: count complete total=\(totalImportCount, privacy: .public)")
 					}
 
-				var requestedCount = 0
-				var storedCount = 0
-				var duplicateCount = 0
-				var failedCount = 0
-				var workingURLs: [URL] = []
-
-				for folder in folders {
-					if Task.isCancelled { break }
-					do {
-						let started = folder.startAccessingSecurityScopedResource()
-						defer { if started { folder.stopAccessingSecurityScopedResource() } }
-						for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
-							if Task.isCancelled { break }
-							let batchURLs = batch.map(\.url)
-							guard !batchURLs.isEmpty else { continue }
-
-							requestedCount += batchURLs.count
-							let completedBeforeBatch = storedCount + duplicateCount + failedCount
-							let batchCount = batchURLs.count
-							let result = try await PhotoVault.shared.importFiles(batchURLs) { completed, _, _ in
-								let overallCompleted = completedBeforeBatch + completed
-								if completed == batchCount || overallCompleted % 128 == 0 {
-										await MainActor.run {
-											vaultProgressCompleted = overallCompleted
-											vaultProgressTotal = totalImportCount
-										}
-									}
-								}
-
-							workingURLs.append(contentsOf: result.workingURLs)
-							storedCount += result.workingURLs.count
-							duplicateCount += result.duplicateCount
-							failedCount += result.failedCount
+				let requestedCount = importURLs.count
+				let result = try await PhotoVault.shared.importFiles(importURLs, ignoreDuplicates: ignoreDuplicates) { completed, total, _ in
+					if completed == total || completed % 128 == 0 {
+						await MainActor.run {
+							vaultProgressCompleted = completed
+							vaultProgressTotal = totalImportCount
 						}
 					}
 				}
+				let workingURLs = result.workingURLs
+				let storedCount = result.workingURLs.count
+				let duplicateCount = result.duplicateCount
+				let failedCount = result.failedCount
 
 				if requestedCount == 0 {
 					await MainActor.run {
@@ -2733,6 +3060,149 @@ struct ContentView: View {
 		}
 	}
 
+	private func showVaultManager() {
+		reloadKnownVaults()
+		isShowingVaultManager = true
+	}
+
+	private func reloadKnownVaults() {
+		Task {
+			let vaults = await PhotoVault.shared.knownVaults()
+			await MainActor.run {
+				knownVaults = vaults
+			}
+		}
+	}
+
+	private func renameKnownVault(_ vault: KnownVault) {
+		let alert = NSAlert()
+		alert.messageText = "Rename Vault"
+		alert.informativeText = "Enter a new folder name for \(vault.url.lastPathComponent)."
+		alert.addButton(withTitle: "Rename")
+		alert.addButton(withTitle: "Cancel")
+		let field = NSTextField(string: vault.url.lastPathComponent)
+		field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+		alert.accessoryView = field
+		guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+		let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !newName.isEmpty, newName != vault.url.lastPathComponent else { return }
+		let destination = vault.url.deletingLastPathComponent().appendingPathComponent(newName, isDirectory: true)
+		guard !FileManager.default.fileExists(atPath: destination.path) else {
+			vaultAlertMessage = "A folder named \(newName) already exists."
+			showVaultAlert = true
+			return
+		}
+
+		let scoped = vault.url.startAccessingSecurityScopedResource()
+		defer { if scoped { vault.url.stopAccessingSecurityScopedResource() } }
+		do {
+			try FileManager.default.moveItem(at: vault.url, to: destination)
+		} catch {
+			vaultAlertMessage = error.localizedDescription
+			showVaultAlert = true
+			return
+		}
+
+		Task {
+			await finishKnownVaultMove(from: vault.url, to: destination)
+		}
+	}
+
+	private func moveKnownVault(_ vault: KnownVault) {
+		let panel = NSOpenPanel()
+		panel.title = "Move Vault"
+		panel.message = "Choose the destination folder for \(vault.displayName)."
+		panel.canChooseFiles = false
+		panel.canChooseDirectories = true
+		panel.allowsMultipleSelection = false
+		panel.canCreateDirectories = true
+		guard panel.runModal() == .OK, let destinationFolder = panel.url else { return }
+
+		let destination = destinationFolder.appendingPathComponent(vault.url.lastPathComponent, isDirectory: true)
+		guard destination.standardizedFileURL.path != vault.url.standardizedFileURL.path else { return }
+		guard !FileManager.default.fileExists(atPath: destination.path) else {
+			vaultAlertMessage = "A vault or folder already exists at the destination."
+			showVaultAlert = true
+			return
+		}
+
+		let sourceScoped = vault.url.startAccessingSecurityScopedResource()
+		let destinationScoped = destinationFolder.startAccessingSecurityScopedResource()
+		defer {
+			if sourceScoped { vault.url.stopAccessingSecurityScopedResource() }
+			if destinationScoped { destinationFolder.stopAccessingSecurityScopedResource() }
+		}
+		do {
+			try FileManager.default.moveItem(at: vault.url, to: destination)
+		} catch {
+			vaultAlertMessage = error.localizedDescription
+			showVaultAlert = true
+			return
+		}
+
+		Task {
+			await finishKnownVaultMove(from: vault.url, to: destination)
+		}
+	}
+
+	private func deleteKnownVault(_ vault: KnownVault) {
+		let alert = NSAlert()
+		alert.alertStyle = .critical
+		alert.messageText = "Delete Vault?"
+		alert.informativeText = "This permanently deletes the vault folder and its encrypted files:\n\(vault.path)"
+		alert.addButton(withTitle: "Delete")
+		alert.addButton(withTitle: "Cancel")
+		guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+		let scoped = vault.url.startAccessingSecurityScopedResource()
+		defer { if scoped { vault.url.stopAccessingSecurityScopedResource() } }
+		do {
+			try FileManager.default.removeItem(at: vault.url)
+		} catch {
+			vaultAlertMessage = error.localizedDescription
+			showVaultAlert = true
+			return
+		}
+
+		Task {
+			await PhotoVault.shared.removeKnownVault(vault.url)
+			await refreshVaultStatus()
+			await MainActor.run {
+				if library.folderURL?.standardizedFileURL.path == vault.url.standardizedFileURL.path {
+					library.photos = []
+					displayedPhotos = []
+					library.folderURL = nil
+					activeFolderNames = []
+					clearSelection()
+					refreshToken = UUID()
+				}
+				reloadKnownVaults()
+			}
+		}
+	}
+
+	private func finishKnownVaultMove(from oldURL: URL, to newURL: URL) async {
+		do {
+			try await PhotoVault.shared.replaceKnownVault(oldURL: oldURL, newURL: newURL)
+			await refreshVaultStatus()
+			await MainActor.run {
+				if library.folderURL?.standardizedFileURL.path == oldURL.standardizedFileURL.path {
+					library.folderURL = newURL
+					activeFolderNames = [Self.vaultDisplayName(for: newURL)]
+					openVault()
+				}
+				reloadKnownVaults()
+			}
+		} catch {
+			await MainActor.run {
+				vaultAlertMessage = error.localizedDescription
+				showVaultAlert = true
+				reloadKnownVaults()
+			}
+		}
+	}
+
 	private func refreshVaultStatus() async {
 		let status = await PhotoVault.shared.status()
 		await MainActor.run { vaultStatus = status }
@@ -2757,6 +3227,12 @@ struct ContentView: View {
 	private func tryOpenFolderAsVault(_ folder: URL) -> Bool {
 		guard Self.folderContainsEncryptedFiles(folder) else { return false }
 		logger.log("vault auto-open: folder=\(folder.path, privacy: .public) contains encrypted files; switching to vault flow")
+		library.photos = []
+		displayedPhotos = []
+		library.folderURL = folder
+		activeFolderNames = [Self.vaultDisplayName(for: folder)]
+		forceThumbnailLoading = true
+		refreshToken = UUID()
 		Task {
 			do {
 				try await PhotoVault.shared.setLocation(folder)
@@ -3047,7 +3523,7 @@ struct ContentView: View {
 										group.addTask {
 											let startedAccess = folder.startAccessingSecurityScopedResource()
 											defer { if startedAccess { folder.stopAccessingSecurityScopedResource() } }
-											for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+											for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 512) {
 												if Task.isCancelled { break }
 												// Filter out items whose basenames were already seen from
 												// other folders.
@@ -3566,7 +4042,7 @@ struct ContentView: View {
 						logger.log("launch folder restore: source=saved-window-state storage=cache folder=\(folder.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
 					}
 					// Publish in batches to avoid a big main-thread spike.
-					let batchSize = 256
+					let batchSize = 512
 					await MainActor.run {
 						library.photos = []
 						library.folderURL = folder

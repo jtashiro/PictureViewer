@@ -78,7 +78,7 @@ final class PhotoLibrary {
 
 				Self.logger.log("face processing skipped for library scan; use the Rescan Faces button to run detection")
 
-			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 512) {
 				if Task.isCancelled { break }
 
 				// Publish the batch to the UI on the main actor. Keep this
@@ -221,7 +221,7 @@ final class PhotoLibrary {
 			defer {
 				if startedAccess { folder.stopAccessingSecurityScopedResource() }
 			}
-			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 256) {
+			for await batch in PhotoLibrary.scanStream(folder: folder, batchSize: 512) {
 				if Task.isCancelled { break }
 				await MainActor.run { strongSelf.photos.append(contentsOf: batch) }
 				let total = await MainActor.run { strongSelf.photos.count }

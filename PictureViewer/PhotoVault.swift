@@ -39,10 +39,39 @@ struct PhotoVaultStatus: Sendable {
     let locationPath: String?
 }
 
+struct KnownVault: Identifiable, Hashable, Sendable {
+    let url: URL
+
+    var id: String { url.standardizedFileURL.path }
+    var displayName: String {
+        let name = url.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "Vault*" : "\(name)*"
+    }
+    var path: String { url.path }
+}
+
 struct PhotoVaultImportResult: Sendable {
     let workingURLs: [URL]
     let duplicateCount: Int
     let failedCount: Int
+}
+
+private actor ContentHashReservation {
+    private var hashes: Set<String>
+
+    init(_ hashes: Set<String>) {
+        self.hashes = hashes
+    }
+
+    func reserve(_ hash: String) -> Bool {
+        if hashes.contains(hash) { return false }
+        hashes.insert(hash)
+        return true
+    }
+
+    func release(_ hash: String) {
+        hashes.remove(hash)
+    }
 }
 
 actor PhotoVault {
@@ -52,6 +81,7 @@ actor PhotoVault {
     static let locationPathKey = "photoVaultLocationPath"
     static let passwordSaltKey = "photoVaultPasswordSalt"
     static let passwordVerifierKey = "photoVaultPasswordVerifier"
+    static let knownVaultBookmarksKey = "photoVaultKnownVaultBookmarks"
     static let workingMapKey = "photoVaultWorkingMap"
     static let workingMapFilename = "photoVaultWorkingMap.json"
     static let contentHashesKey = "photoVaultContentHashes"
@@ -120,6 +150,7 @@ actor PhotoVault {
         let bookmark = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
         UserDefaults.standard.set(bookmark, forKey: Self.locationBookmarkKey)
         UserDefaults.standard.set(url.path, forKey: Self.locationPathKey)
+        try registerKnownVault(url)
         locationURL = url
         if previousPath != url.standardizedFileURL.path {
             key = nil
@@ -127,6 +158,74 @@ actor PhotoVault {
         _ = url.startAccessingSecurityScopedResource()
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         postStatusChange()
+    }
+
+    func knownVaults() -> [KnownVault] {
+        let bookmarks = knownVaultBookmarkData()
+        var resolvedBookmarks: [Data] = []
+        var vaults: [KnownVault] = []
+        var seenPaths: Set<String> = []
+
+        for bookmark in bookmarks {
+            guard let url = resolveBookmark(bookmark) else { continue }
+            let path = url.standardizedFileURL.path
+            guard seenPaths.insert(path).inserted else { continue }
+            _ = url.startAccessingSecurityScopedResource()
+            vaults.append(KnownVault(url: url))
+            if let refreshedBookmark = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                resolvedBookmarks.append(refreshedBookmark)
+            } else {
+                resolvedBookmarks.append(bookmark)
+            }
+        }
+
+        if let currentURL = resolvedLocationURL() {
+            let currentPath = currentURL.standardizedFileURL.path
+            if seenPaths.insert(currentPath).inserted {
+                _ = currentURL.startAccessingSecurityScopedResource()
+                vaults.append(KnownVault(url: currentURL))
+                if let currentBookmark = try? currentURL.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                    resolvedBookmarks.append(currentBookmark)
+                }
+            }
+        }
+
+        if resolvedBookmarks.count != bookmarks.count {
+            UserDefaults.standard.set(resolvedBookmarks, forKey: Self.knownVaultBookmarksKey)
+        }
+
+        return vaults.sorted {
+            $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending
+        }
+    }
+
+    func removeKnownVault(_ url: URL) {
+        let removedPath = url.standardizedFileURL.path
+        let remainingBookmarks = knownVaultBookmarkData().filter { bookmark in
+            guard let resolvedURL = resolveBookmark(bookmark) else { return false }
+            return resolvedURL.standardizedFileURL.path != removedPath
+        }
+        UserDefaults.standard.set(remainingBookmarks, forKey: Self.knownVaultBookmarksKey)
+
+        let currentPath = resolvedLocationURL()?.standardizedFileURL.path
+        if currentPath == removedPath {
+            key = nil
+            locationURL = nil
+            UserDefaults.standard.removeObject(forKey: Self.locationBookmarkKey)
+            UserDefaults.standard.removeObject(forKey: Self.locationPathKey)
+            postStatusChange()
+        }
+    }
+
+    func replaceKnownVault(oldURL: URL, newURL: URL) throws {
+        let oldPath = oldURL.standardizedFileURL.path
+        let currentPath = resolvedLocationURL()?.standardizedFileURL.path
+        removeKnownVault(oldURL)
+        if currentPath == oldPath {
+            try setLocation(newURL)
+        } else {
+            try registerKnownVault(newURL)
+        }
     }
 
     func configureNewVaultPassword(_ password: String) throws {
@@ -221,6 +320,7 @@ actor PhotoVault {
 
     func importFiles(
         _ urls: [URL],
+        ignoreDuplicates: Bool = true,
         progress: (@Sendable (Int, Int, String) async -> Void)? = nil
     ) async throws -> PhotoVaultImportResult {
         guard !urls.isEmpty else {
@@ -230,7 +330,9 @@ actor PhotoVault {
         let activeKey = try unlockedKey()
         let totalCount = urls.count
         let workers = max(1, min(totalCount, Self.importWorkerCount))
-        logger.log("vault import:start requested=\(totalCount, privacy: .public) destination=\(destination.path, privacy: .public) workers=\(workers, privacy: .public)")
+        let existingHashes = ignoreDuplicates ? await currentVaultContentHashes(in: destination, key: activeKey) : []
+        let reservations = ContentHashReservation(existingHashes)
+        logger.log("vault import:start requested=\(totalCount, privacy: .public) destination=\(destination.path, privacy: .public) workers=\(workers, privacy: .public) ignoreDuplicates=\(ignoreDuplicates, privacy: .public) currentVaultHashes=\(existingHashes.count, privacy: .public)")
 
         enum Outcome: Sendable {
             case stored(URL)
@@ -263,7 +365,7 @@ actor PhotoVault {
                         return (idx, .failed)
                     }
                     let hash = Self.contentHash(of: data)
-                    let reserved = await tryReserveContentHash(hash)
+                    let reserved = ignoreDuplicates ? await reservations.reserve(hash) : true
                     if !reserved {
                         logger.log("vault import:duplicate source=\(src.lastPathComponent, privacy: .public) hash=\(hash, privacy: .public)")
                         return (idx, .duplicate)
@@ -282,7 +384,9 @@ actor PhotoVault {
                         try preserveFileDates(from: src, to: encryptedURL)
                         if Task.isCancelled {
                             try? FileManager.default.removeItem(at: encryptedURL)
-                            await releaseReservedContentHash(hash)
+                            if ignoreDuplicates {
+                                await reservations.release(hash)
+                            }
                             return (idx, .failed)
                         }
                         let workingURL = try writeWorkingCopy(data, originalFilename: src.lastPathComponent)
@@ -291,7 +395,9 @@ actor PhotoVault {
                         return (idx, .stored(workingURL))
                     } catch {
                         try? FileManager.default.removeItem(at: encryptedURL)
-                        await releaseReservedContentHash(hash)
+                        if ignoreDuplicates {
+                            await reservations.release(hash)
+                        }
                         logger.error("vault import:file failed source=\(src.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
                         return (idx, .failed)
                     }
@@ -328,7 +434,6 @@ actor PhotoVault {
                 }
             }
         }
-        persistContentHashesIfNeeded()
 
         collected.sort { $0.0 < $1.0 }
         let workingURLs = collected.map { $0.1 }
@@ -539,6 +644,55 @@ actor PhotoVault {
         return hashes
     }
 
+    private func currentVaultContentHashes(in destination: URL, key: SymmetricKey) async -> Set<String> {
+        guard let encryptedFiles = try? FileManager.default.contentsOfDirectory(
+            at: destination,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter({ $0.pathExtension == Self.encryptedExtension }) else {
+            return []
+        }
+
+        let workers = max(1, min(encryptedFiles.count, Self.importWorkerCount))
+        guard workers > 0 else { return [] }
+
+        return await withTaskGroup(of: String?.self) { group in
+            var hashes: Set<String> = []
+            var nextIndex = 0
+
+            func startTask(at index: Int) {
+                let encryptedURL = encryptedFiles[index]
+                group.addTask { [self] in
+                    do {
+                        let (data, header) = try decryptPayload(at: encryptedURL, key: key)
+                        return header.contentHash ?? Self.contentHash(of: data)
+                    } catch {
+                        logger.error("vault duplicate scan: failed file=\(encryptedURL.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                        return nil
+                    }
+                }
+            }
+
+            let initial = min(workers, encryptedFiles.count)
+            for _ in 0..<initial {
+                startTask(at: nextIndex)
+                nextIndex += 1
+            }
+
+            while let hash = await group.next() {
+                if let hash {
+                    hashes.insert(hash)
+                }
+                if nextIndex < encryptedFiles.count {
+                    startTask(at: nextIndex)
+                    nextIndex += 1
+                }
+            }
+
+            return hashes
+        }
+    }
+
     private func persistContentHashesIfNeeded() {
         guard contentHashesNeedsSave, let contentHashesCache else { return }
         persistContentHashes(contentHashesCache)
@@ -583,6 +737,14 @@ actor PhotoVault {
             contentHashesCache = current
             contentHashesNeedsSave = true
             persistContentHashesIfNeeded()
+        }
+    }
+
+    private func registerContentHash(_ hash: String) {
+        var current = currentContentHashes()
+        if current.insert(hash).inserted {
+            contentHashesCache = current
+            contentHashesNeedsSave = true
         }
     }
 
@@ -703,6 +865,34 @@ actor PhotoVault {
         } catch {
             return nil
         }
+    }
+
+    private func registerKnownVault(_ url: URL) throws {
+        let newPath = url.standardizedFileURL.path
+        var bookmarks = knownVaultBookmarkData()
+        let alreadyKnown = bookmarks.contains { bookmark in
+            guard let resolvedURL = resolveBookmark(bookmark) else { return false }
+            return resolvedURL.standardizedFileURL.path == newPath
+        }
+        guard !alreadyKnown else { return }
+
+        let bookmark = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+        bookmarks.append(bookmark)
+        UserDefaults.standard.set(bookmarks, forKey: Self.knownVaultBookmarksKey)
+    }
+
+    private func knownVaultBookmarkData() -> [Data] {
+        UserDefaults.standard.array(forKey: Self.knownVaultBookmarksKey) as? [Data] ?? []
+    }
+
+    private func resolveBookmark(_ bookmark: Data) -> URL? {
+        var stale = false
+        return try? URL(
+            resolvingBookmarkData: bookmark,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        )
     }
 
     private nonisolated func workingDirectory() throws -> URL {

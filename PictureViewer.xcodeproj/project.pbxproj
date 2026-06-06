@@ -52,6 +52,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 363361832FD0B21600D431EE /* Build configuration list for PBXNativeTarget "PictureViewer" */;
 			buildPhases = (
+				3658E2B82FD456430045F497 /* Generate Build Info */,
 				363361742FD0B21400D431EE /* Sources */,
 				363361752FD0B21400D431EE /* Frameworks */,
 				363361762FD0B21400D431EE /* Resources */,
@@ -113,6 +114,30 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		3658E2B82FD456430045F497 /* Generate Build Info */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/update_build_info.sh",
+			);
+			name = "Generate Build Info";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/PictureViewer/BuildInfo.swift",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "# Type a script or drag a script file from your workspace to insert its path.\n/bin/sh \"$SRCROOT/update_build_info.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		363361742FD0B21400D431EE /* Sources */ = {
