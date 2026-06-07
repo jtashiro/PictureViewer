@@ -120,6 +120,11 @@ private struct ThumbnailFramePreferenceKey: PreferenceKey {
 	}
 }
 
+private struct PhotoGridScrollRequest: Equatable {
+	let id = UUID()
+	let url: URL
+}
+
 private enum MarqueeSelectionMode {
 	case replace
 	case add
@@ -952,6 +957,7 @@ struct ContentView: View {
 	@State private var selectionAutoScrollTask: Task<Void, Never>? = nil
 	@State private var pendingSQLiteFocusFilename: String? = nil
 	@State private var pendingSQLiteFocusTask: Task<Void, Never>? = nil
+	@State private var photoGridScrollRequest: PhotoGridScrollRequest? = nil
 	private let thumbnailDraggingSource = ThumbnailDraggingSource()
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
@@ -2115,172 +2121,184 @@ struct ContentView: View {
 	}
 
 	private var photoGrid: some View {
-		ScrollView {
-			LazyVGrid(
-				columns: [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.4), spacing: 10)],
-				spacing: 10
-			) {
-				ForEach(displayedPhotos) { photo in
-					let isSelected = isPhotoSelected(photo.url)
-					ZStack(alignment: .topTrailing) {
-						VStack(spacing: 4) {
-							ThumbnailView(
-								url: photo.url,
-								size: thumbnailSize,
-								refreshToken: refreshToken,
-								metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
-								forceLoad: forceThumbnailLoading
-							)
-							// Filename and keywords are rendered by ThumbnailView now.
-						}
-						.overlay {
-							RoundedRectangle(cornerRadius: 8)
-								.stroke(isSelected ? Color.accentColor : .clear, lineWidth: 3)
-						}
-						if selectionMode {
-							// Selection badge
-							Group {
-								if isSelected {
-									Image(systemName: "checkmark.circle.fill")
-										.foregroundStyle(.white, .blue)
-										.background(Circle().fill(Color.blue))
-								} else {
-									Image(systemName: "circle")
-										.foregroundStyle(.secondary)
-								}
+		ScrollViewReader { scrollProxy in
+			ScrollView {
+				LazyVGrid(
+					columns: [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.4), spacing: 10)],
+					spacing: 10
+				) {
+					ForEach(displayedPhotos) { photo in
+						let isSelected = isPhotoSelected(photo.url)
+						ZStack(alignment: .topTrailing) {
+							VStack(spacing: 4) {
+								ThumbnailView(
+									url: photo.url,
+									size: thumbnailSize,
+									refreshToken: refreshToken,
+									metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
+									forceLoad: forceThumbnailLoading
+								)
+								// Filename and keywords are rendered by ThumbnailView now.
 							}
-							.padding(6)
-						}
-					}
-					.background {
-						GeometryReader { proxy in
-							Color.clear
-								.preference(key: ThumbnailFramePreferenceKey.self, value: [photo.url: proxy.frame(in: .named("photoGridArea"))])
-						}
-					}
-					.contentShape(Rectangle())
-					.onTapGesture {
-						handleThumbnailSingleClick(photo.url)
-					}
-					.onTapGesture(count: 2) {
-						openPhotoViewer(photo.url)
-					}
-					.contextMenu {
-						let contextURLs = contextActionURLs(for: photo.url)
-						Button(contextURLs.count > 1 ? "Show Selected in Finder" : "Show in Finder") {
-							NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
-						}
-						Button(contextURLs.count > 1 ? "Open Selected with Default App" : "Open with Default App") {
-							for url in contextURLs { NSWorkspace.shared.open(url) }
-						}
-						Button(contextURLs.count > 1 ? "Copy Selected Files" : "Copy File") {
-							copyFilesToPasteboard(contextURLs)
-						}
-						Divider()
-						Button("Repair metadata") {
-							Task.detached(priority: .utility) {
-								let (ok, msg) = await Self.repairMetadata(for: photo.url)
-								await MainActor.run {
-									if ok {
-										// Force a thumbnail refresh and log
-										refreshToken = UUID()
-										repairResultMessage = "Repair succeeded for \(photo.url.lastPathComponent)"
+							.overlay {
+								RoundedRectangle(cornerRadius: 8)
+									.stroke(isSelected ? Color.accentColor : .clear, lineWidth: 3)
+							}
+							if selectionMode {
+								// Selection badge
+								Group {
+									if isSelected {
+										Image(systemName: "checkmark.circle.fill")
+											.foregroundStyle(.white, .blue)
+											.background(Circle().fill(Color.blue))
 									} else {
-										logger.error("Repair metadata failed: \(msg ?? "")")
-										repairResultMessage = "Repair failed for \(photo.url.lastPathComponent): \(msg ?? "Unknown error")"
+										Image(systemName: "circle")
+											.foregroundStyle(.secondary)
 									}
-									showRepairResult = true
+								}
+								.padding(6)
+							}
+						}
+						.id(photo.url)
+						.background {
+							GeometryReader { proxy in
+								Color.clear
+									.preference(key: ThumbnailFramePreferenceKey.self, value: [photo.url: proxy.frame(in: .named("photoGridArea"))])
+							}
+						}
+						.contentShape(Rectangle())
+						.onTapGesture {
+							handleThumbnailSingleClick(photo.url)
+						}
+						.onTapGesture(count: 2) {
+							openPhotoViewer(photo.url)
+						}
+						.contextMenu {
+							let contextURLs = contextActionURLs(for: photo.url)
+							Button(contextURLs.count > 1 ? "Show Selected in Finder" : "Show in Finder") {
+								NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
+							}
+							Button(contextURLs.count > 1 ? "Open Selected with Default App" : "Open with Default App") {
+								for url in contextURLs { NSWorkspace.shared.open(url) }
+							}
+							Button(contextURLs.count > 1 ? "Copy Selected Files" : "Copy File") {
+								copyFilesToPasteboard(contextURLs)
+							}
+							Divider()
+							Button("Repair metadata") {
+								Task.detached(priority: .utility) {
+									let (ok, msg) = await Self.repairMetadata(for: photo.url)
+									await MainActor.run {
+										if ok {
+											// Force a thumbnail refresh and log
+											refreshToken = UUID()
+											repairResultMessage = "Repair succeeded for \(photo.url.lastPathComponent)"
+										} else {
+											logger.error("Repair metadata failed: \(msg ?? "")")
+											repairResultMessage = "Repair failed for \(photo.url.lastPathComponent): \(msg ?? "Unknown error")"
+										}
+										showRepairResult = true
+									}
 								}
 							}
 						}
 					}
 				}
+				.padding(12)
 			}
-			.padding(12)
-		}
-		.coordinateSpace(name: "photoGridArea")
-		.onPreferenceChange(ThumbnailFramePreferenceKey.self) { frames in
-			queueThumbnailFrameUpdate(frames)
-		}
-		.simultaneousGesture(
-			DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
-				.onChanged { value in
-					if selectionDragStart == nil {
-						if let startURL = thumbnailURL(at: value.startLocation) {
-							let dragURLs = contextActionURLs(for: startURL)
-							if beginSystemFileDrag(urls: dragURLs) {
-								suppressMarqueeDuringItemDrag = true
-								stopSelectionAutoScroll()
-								return
+			.coordinateSpace(name: "photoGridArea")
+			.onChange(of: photoGridScrollRequest) { _, request in
+				guard let request else { return }
+				withAnimation(.easeInOut(duration: 0.2)) {
+					scrollProxy.scrollTo(request.url, anchor: .center)
+				}
+				DispatchQueue.main.async {
+					_ = scrollGridToPhoto(request.url)
+				}
+			}
+			.onPreferenceChange(ThumbnailFramePreferenceKey.self) { frames in
+				queueThumbnailFrameUpdate(frames)
+			}
+			.simultaneousGesture(
+				DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
+					.onChanged { value in
+						if selectionDragStart == nil {
+							if let startURL = thumbnailURL(at: value.startLocation) {
+								let dragURLs = contextActionURLs(for: startURL)
+								if beginSystemFileDrag(urls: dragURLs) {
+									suppressMarqueeDuringItemDrag = true
+									stopSelectionAutoScroll()
+									return
+								}
 							}
+							selectionDragStart = value.startLocation
+							selectionDragBase = selectedSetForMarqueeBase()
+							selectionDragMode = marqueeSelectionModeForCurrentModifiers()
 						}
-						selectionDragStart = value.startLocation
-						selectionDragBase = selectedSetForMarqueeBase()
-						selectionDragMode = marqueeSelectionModeForCurrentModifiers()
+						if suppressMarqueeDuringItemDrag { return }
+						selectionDragCurrent = value.location
+						updateDragSelection()
+						startSelectionAutoScrollIfNeeded()
 					}
-					if suppressMarqueeDuringItemDrag { return }
-					selectionDragCurrent = value.location
-					updateDragSelection()
-					startSelectionAutoScrollIfNeeded()
-				}
-				.onEnded { _ in
-					if suppressMarqueeDuringItemDrag {
-						suppressMarqueeDuringItemDrag = false
+					.onEnded { _ in
+						if suppressMarqueeDuringItemDrag {
+							suppressMarqueeDuringItemDrag = false
+							stopSelectionAutoScroll()
+							return
+						}
+						updateDragSelection()
+						selectionDragStart = nil
+						selectionDragCurrent = nil
+						selectionDragBase = []
+						selectionDragMode = .replace
 						stopSelectionAutoScroll()
-						return
 					}
-					updateDragSelection()
-					selectionDragStart = nil
-					selectionDragCurrent = nil
-					selectionDragBase = []
-					selectionDragMode = .replace
-					stopSelectionAutoScroll()
+			)
+			.overlay(alignment: .topLeading) {
+				if let rect = currentSelectionRect {
+					RoundedRectangle(cornerRadius: 6)
+						.fill(Color.accentColor.opacity(0.15))
+						.overlay {
+							RoundedRectangle(cornerRadius: 6)
+								.stroke(Color.accentColor.opacity(0.8), lineWidth: 1.5)
+						}
+						.frame(width: rect.width, height: rect.height)
+						.position(x: rect.midX, y: rect.midY)
 				}
-		)
-		.overlay(alignment: .topLeading) {
-			if let rect = currentSelectionRect {
-				RoundedRectangle(cornerRadius: 6)
-					.fill(Color.accentColor.opacity(0.15))
-					.overlay {
-						RoundedRectangle(cornerRadius: 6)
-							.stroke(Color.accentColor.opacity(0.8), lineWidth: 1.5)
+			}
+			.overlay(alignment: .bottom) {
+				if library.isScanning {
+					HStack(spacing: 8) {
+						ProgressView().controlSize(.small)
+						Text("Scanning… \(library.photos.count.formatted()) photo\(library.photos.count == 1 ? "" : "s") found")
+							.font(.callout)
 					}
-					.frame(width: rect.width, height: rect.height)
-					.position(x: rect.midX, y: rect.midY)
+					.padding(.horizontal, 14)
+					.padding(.vertical, 8)
+					.background(.thinMaterial, in: Capsule())
+					.padding(.bottom, 12)
+				}
 			}
+				.overlay(alignment: .top) {
+					FaceScanProgressOverlay()
+				}
+				.background {
+					SelectAllKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) {
+						selectAllDisplayedPhotos()
+					}
+				}
+				.background {
+					GridArrowKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) { direction in
+						moveGridSelection(in: direction)
+					}
+				}
+				.background {
+					ScrollViewAccessor { scrollView in
+						gridScrollView = scrollView
+					}
+				}
 		}
-		.overlay(alignment: .bottom) {
-			if library.isScanning {
-				HStack(spacing: 8) {
-					ProgressView().controlSize(.small)
-					Text("Scanning… \(library.photos.count.formatted()) photo\(library.photos.count == 1 ? "" : "s") found")
-						.font(.callout)
-				}
-				.padding(.horizontal, 14)
-				.padding(.vertical, 8)
-				.background(.thinMaterial, in: Capsule())
-				.padding(.bottom, 12)
-			}
-		}
-			.overlay(alignment: .top) {
-				FaceScanProgressOverlay()
-			}
-			.background {
-				SelectAllKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) {
-					selectAllDisplayedPhotos()
-				}
-			}
-			.background {
-				GridArrowKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) { direction in
-					moveGridSelection(in: direction)
-				}
-			}
-			.background {
-				ScrollViewAccessor { scrollView in
-					gridScrollView = scrollView
-				}
-			}
-		}
+	}
 
 	@ToolbarContentBuilder
 	private var toolbarItems: some ToolbarContent {
@@ -4964,10 +4982,8 @@ struct ContentView: View {
 		}
 
 		selectSinglePhoto(targetURL)
-		guard scrollGridToPhoto(targetURL) else {
-			queuePendingSQLiteFocusRetry()
-			return
-		}
+		photoGridScrollRequest = PhotoGridScrollRequest(url: targetURL)
+		_ = scrollGridToPhoto(targetURL)
 		pendingSQLiteFocusFilename = nil
 		pendingSQLiteFocusTask?.cancel()
 		pendingSQLiteFocusTask = nil
@@ -4984,7 +5000,7 @@ struct ContentView: View {
 		let visibleRect = scrollView.contentView.bounds
 		let documentBounds = documentView.bounds
 		let maxY = max(documentBounds.minY, documentBounds.maxY - visibleRect.height)
-		let centeredY = frame.midY - (visibleRect.height / 2)
+		let centeredY = visibleRect.origin.y + frame.midY - (visibleRect.height / 2)
 		let nextY = min(max(centeredY, documentBounds.minY), maxY)
 		let nextOrigin = NSPoint(x: visibleRect.origin.x, y: nextY)
 		scrollView.contentView.scroll(to: nextOrigin)
@@ -5190,6 +5206,9 @@ struct ContentView: View {
 			try fm.moveItem(at: tempURL, to: url)
 			try? fm.removeItem(at: backupURL)
 			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
+			if SQLiteObjectStore.isWorkingCopyURL(url) {
+				try await SQLiteObjectStore.shared.storeObjectFile(at: url)
+			}
 			return true
 		} catch {
 			logger.error("writeKeywords: failed to replace original file: \(error.localizedDescription, privacy: .public)")

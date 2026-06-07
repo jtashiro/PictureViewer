@@ -57,6 +57,7 @@ struct PictureViewerApp: App {
 			let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
 			WindowStateStore.shared.markAppTerminating()
 			PhotoVault.clearWorkingCopiesOnDisk()
+			SQLiteObjectStore.clearWorkingCopiesOnDisk()
 			// Log only restorable windows/tabs. NSApplication.shared.windows
 			// includes utility and system windows, so counting all windows
 			// overstates the user-visible gallery/photo session.

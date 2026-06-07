@@ -202,7 +202,7 @@ actor SQLiteObjectStore {
         let contentHash = Self.contentHash(of: data)
         let contentType = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
             ?? UTType(filenameExtension: url.pathExtension)?.identifier
-        await storeObjectData(
+        try storeObjectDataThrowing(
             data,
             originalURL: url,
             contentHash: contentHash,
@@ -592,6 +592,11 @@ actor SQLiteObjectStore {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("PictureViewer", isDirectory: true)
             .appendingPathComponent("SQLiteObjectStore", isDirectory: true)
+    }
+
+    nonisolated static func clearWorkingCopiesOnDisk() {
+        let directory = workingDirectoryURL()
+        try? FileManager.default.removeItem(at: directory)
     }
 
     nonisolated static func isWorkingCopyURL(_ url: URL) -> Bool {
