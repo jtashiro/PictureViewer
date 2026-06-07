@@ -112,7 +112,7 @@ actor PhotoVault {
     private var contentHashesNeedsSave = false
 
     private nonisolated static var importWorkerCount: Int {
-        max(2, min(PhotoLibrary.workerCount, 6))
+        max(2, PhotoLibrary.workerCount)
     }
 
     private struct Header: Codable {
@@ -321,6 +321,7 @@ actor PhotoVault {
     func importFiles(
         _ urls: [URL],
         ignoreDuplicates: Bool = true,
+        keywordsToAppend: [String] = [],
         progress: (@Sendable (Int, Int, String) async -> Void)? = nil
     ) async throws -> PhotoVaultImportResult {
         guard !urls.isEmpty else {
@@ -364,20 +365,21 @@ actor PhotoVault {
                         logger.error("vault import:read failed source=\(src.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
                         return (idx, .failed)
                     }
-                    let hash = Self.contentHash(of: data)
-                    let reserved = ignoreDuplicates ? await reservations.reserve(hash) : true
+                    let sourceHash = Self.contentHash(of: data)
+                    let reserved = ignoreDuplicates ? await reservations.reserve(sourceHash) : true
                     if !reserved {
-                        logger.log("vault import:duplicate source=\(src.lastPathComponent, privacy: .public) hash=\(hash, privacy: .public)")
+                        logger.log("vault import:duplicate source=\(src.lastPathComponent, privacy: .public) hash=\(sourceHash, privacy: .public)")
                         return (idx, .duplicate)
                     }
                     let contentType = (try? src.resourceValues(forKeys: [.contentTypeKey]))?.contentType
                     let encryptedURL = uniqueEncryptedURL(for: src.lastPathComponent, in: destination)
                     do {
+                        let importData = try dataByAppendingKeywords(keywordsToAppend, toImageData: data)
                         try encryptData(
-                            data,
+                            importData,
                             originalFilename: src.lastPathComponent,
                             contentTypeIdentifier: contentType?.identifier,
-                            contentHash: hash,
+                            contentHash: sourceHash,
                             to: encryptedURL,
                             key: activeKey
                         )
@@ -385,18 +387,18 @@ actor PhotoVault {
                         if Task.isCancelled {
                             try? FileManager.default.removeItem(at: encryptedURL)
                             if ignoreDuplicates {
-                                await reservations.release(hash)
+                                await reservations.release(sourceHash)
                             }
                             return (idx, .failed)
                         }
-                        let workingURL = try writeWorkingCopy(data, originalFilename: src.lastPathComponent)
+                        let workingURL = try writeWorkingCopy(importData, originalFilename: src.lastPathComponent)
                         await setEncryptedURL(encryptedURL, forWorkingURL: workingURL)
                         logger.log("vault import:file success source=\(src.lastPathComponent, privacy: .public) encrypted=\(encryptedURL.lastPathComponent, privacy: .public)")
                         return (idx, .stored(workingURL))
                     } catch {
                         try? FileManager.default.removeItem(at: encryptedURL)
                         if ignoreDuplicates {
-                            await reservations.release(hash)
+                            await reservations.release(sourceHash)
                         }
                         logger.error("vault import:file failed source=\(src.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
                         return (idx, .failed)
@@ -746,6 +748,65 @@ actor PhotoVault {
             contentHashesCache = current
             contentHashesNeedsSave = true
         }
+    }
+
+    private nonisolated func dataByAppendingKeywords(_ keywords: [String], toImageData data: Data) throws -> Data {
+        let normalizedKeywords = Self.normalizedKeywords(keywords)
+        guard !normalizedKeywords.isEmpty else { return data }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) else {
+            throw PhotoVaultError.unsupportedFile
+        }
+
+        var metadata = (CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]) ?? [:]
+        var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
+        let existingKeywords = Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords])
+        iptc[kCGImagePropertyIPTCKeywords] = Self.mergedKeywords(existingKeywords, normalizedKeywords) as CFArray
+        metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
+
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, type, 1, nil) else {
+            throw PhotoVaultError.unsupportedFile
+        }
+        CGImageDestinationAddImageFromSource(destination, source, 0, metadata as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else {
+            throw PhotoVaultError.unsupportedFile
+        }
+        return output as Data
+    }
+
+    private nonisolated static func keywordStrings(from value: Any?) -> [String] {
+        if let strings = value as? [String] {
+            return strings
+        }
+        if let array = value as? [Any] {
+            return array.compactMap { $0 as? String }
+        }
+        if let array = value as? NSArray {
+            return array.compactMap { $0 as? String }
+        }
+        if let string = value as? String {
+            return [string]
+        }
+        return []
+    }
+
+    private nonisolated static func normalizedKeywords(_ keywords: [String]) -> [String] {
+        mergedKeywords([], keywords)
+    }
+
+    private nonisolated static func mergedKeywords(_ existing: [String], _ appended: [String]) -> [String] {
+        var result: [String] = []
+        var seen: Set<String> = []
+        for keyword in existing + appended {
+            let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let key = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            if seen.insert(key).inserted {
+                result.append(trimmed)
+            }
+        }
+        return result
     }
 
     private nonisolated func encryptFile(at sourceURL: URL, to encryptedURL: URL, key: SymmetricKey) throws {

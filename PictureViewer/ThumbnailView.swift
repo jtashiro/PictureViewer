@@ -20,20 +20,23 @@ struct ThumbnailView: View {
 	/// bypassing both memory and disk caches. Used by the "Refresh
 	/// Thumbnails" button.
 	let refreshToken: UUID
+	let metadataRefreshToken: UUID
 	let forceLoad: Bool
 
 	@State private var image: NSImage?
 	@State private var loadFailed = false
 	@State private var metadataState: MetadataState = .none
 	@State private var embeddedKeywords: [String] = []
+	private static let defaultMetadataRefreshToken = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 	// Default to false so thumbnails load by default. Setting this to true
 	// defers thumbnail loading at app launch (can help avoid startup spikes).
 	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
 
-	init(url: URL, size: CGFloat, refreshToken: UUID, forceLoad: Bool = false) {
+	init(url: URL, size: CGFloat, refreshToken: UUID, metadataRefreshToken: UUID = Self.defaultMetadataRefreshToken, forceLoad: Bool = false) {
 		self.url = url
 		self.size = size
 		self.refreshToken = refreshToken
+		self.metadataRefreshToken = metadataRefreshToken
 		self.forceLoad = forceLoad
 		self._image = State(initialValue: ThumbnailCache.shared.memoryImage(for: url, namespace: nil))
 	}
@@ -96,7 +99,8 @@ struct ThumbnailView: View {
 		.help(url.lastPathComponent)
 		.task(id: ThumbnailTaskID(url: url, refreshToken: refreshToken, namespace: namespace, forceLoad: forceLoad)) {
 			await loadThumbnail()
-			// Also update metadata indicator asynchronously
+		}
+		.task(id: MetadataTaskID(url: url, metadataRefreshToken: metadataRefreshToken)) {
 			await updateMetadataState()
 		}
 	}
@@ -106,6 +110,11 @@ struct ThumbnailView: View {
 		let refreshToken: UUID
 		let namespace: String?
 		let forceLoad: Bool
+	}
+
+	private struct MetadataTaskID: Equatable, Hashable {
+		let url: URL
+		let metadataRefreshToken: UUID
 	}
 
 	private func loadThumbnail() async {

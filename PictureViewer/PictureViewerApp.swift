@@ -55,24 +55,28 @@ struct PictureViewerApp: App {
 		NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
 			let save = UserDefaults.standard.bool(forKey: "saveOpenWindows")
 			let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
+			WindowStateStore.shared.markAppTerminating()
 			PhotoVault.clearWorkingCopiesOnDisk()
-			// Log the titles and represented URLs of all windows for diagnostics
-			var windowEntries: [String] = []
+			// Log only restorable windows/tabs. NSApplication.shared.windows
+			// includes utility and system windows, so counting all windows
+			// overstates the user-visible gallery/photo session.
+			var photoWindowEntries: [String] = []
 			for w in NSApplication.shared.windows {
+				guard let representedURL = w.representedURL else { continue }
 				let title = w.title.isEmpty ? "<untitled>" : w.title
-				let path = w.representedURL?.path ?? "<noURL>"
-				windowEntries.append("\(title):\(path)")
+				photoWindowEntries.append("\(title):\(representedURL.path)")
 			}
+			let galleryTabCount = WindowStateStore.shared.openGalleryFolderURLs().count
 			if save {
-				logger.log("App will terminate; snapshotting open photo windows for restore; windowCount=\(windowEntries.count, privacy: .public)")
+				logger.log("App will terminate; snapshotting restorable session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
 				if AppLogLevel.current.allows(.debug) {
-					logger.debug("App will terminate; open photo window details=\(windowEntries.joined(separator: ","), privacy: .public)")
+					logger.debug("App will terminate; open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
 				}
 				WindowStateStore.shared.snapshotOpenPhotosFromSystem()
 			} else {
-				logger.log("App will terminate; saveOpenWindows disabled; clearing saved open photos; windowCount=\(windowEntries.count, privacy: .public)")
+				logger.log("App will terminate; saveOpenWindows disabled; clearing saved session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
 				if AppLogLevel.current.allows(.debug) {
-					logger.debug("App will terminate; skipped open photo window details=\(windowEntries.joined(separator: ","), privacy: .public)")
+					logger.debug("App will terminate; skipped open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
 				}
 				WindowStateStore.shared.clearOpenPhotos()
 			}
@@ -301,6 +305,12 @@ struct VaultFileCommands: Commands {
 			}
 			.keyboardShortcut("v", modifiers: .command)
 			.disabled(vaultActions?.canPaste != true)
+
+			Button("Select All") {
+				vaultActions?.selectAll()
+			}
+			.keyboardShortcut("a", modifiers: .command)
+			.disabled(vaultActions?.canSelectAll != true)
 		}
 	}
 }

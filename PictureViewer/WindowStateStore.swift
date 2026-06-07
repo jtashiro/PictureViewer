@@ -18,11 +18,13 @@ final class WindowStateStore: @unchecked Sendable {
 
 	private let bookmarkKey = "savedFolderBookmark"
 	private let openWindowsKey = "openPhotoPaths"
+	private let openGalleryBookmarksKey = "openGalleryFolderBookmarks"
 	private let tabNamePrefix = "tabName:" // prefix for per-folder tab name storage
 
 	private let queueLock = NSLock()
 	private var activeFolderURL: URL?
 	private var didRestoreThisLaunch = false
+	private var appIsTerminating = false
 
 	private init() {}
 
@@ -34,6 +36,16 @@ final class WindowStateStore: @unchecked Sendable {
 		if didRestoreThisLaunch { return false }
 		didRestoreThisLaunch = true
 		return true
+	}
+
+	func markAppTerminating() {
+		queueLock.lock(); defer { queueLock.unlock() }
+		appIsTerminating = true
+	}
+
+	func isAppTerminating() -> Bool {
+		queueLock.lock(); defer { queueLock.unlock() }
+		return appIsTerminating
 	}
 
 	// MARK: - Folder bookmark (sandbox-safe)
@@ -136,6 +148,52 @@ final class WindowStateStore: @unchecked Sendable {
 		return currentPaths().map { URL(fileURLWithPath: $0) }
 	}
 
+	func recordOpenGalleryFolder(_ url: URL) {
+		queueLock.lock(); defer { queueLock.unlock() }
+		let path = url.standardizedFileURL.path
+		var entries = openGalleryBookmarkEntries()
+		if entries.contains(where: { $0.path == path }) { return }
+		do {
+			let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+			entries.append(GalleryBookmarkEntry(path: path, bookmark: bookmark))
+			UserDefaults.standard.set(try JSONEncoder().encode(entries), forKey: openGalleryBookmarksKey)
+		} catch {
+			windowStateLogger.error("recordOpenGalleryFolder failed path=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+		}
+	}
+
+	func recordClosedGalleryFolder(_ url: URL) {
+		queueLock.lock(); defer { queueLock.unlock() }
+		let path = url.standardizedFileURL.path
+		var entries = openGalleryBookmarkEntries()
+		entries.removeAll { $0.path == path }
+		persistOpenGalleryBookmarkEntries(entries)
+	}
+
+	func openGalleryFolderURLs() -> [URL] {
+		queueLock.lock(); defer { queueLock.unlock() }
+		var resolved: [URL] = []
+		var refreshed: [GalleryBookmarkEntry] = []
+		for entry in openGalleryBookmarkEntries() {
+			var stale = false
+			do {
+				let url = try URL(resolvingBookmarkData: entry.bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
+				_ = url.startAccessingSecurityScopedResource()
+				let bookmark = stale
+					? (try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)) ?? entry.bookmark
+					: entry.bookmark
+				resolved.append(url)
+				refreshed.append(GalleryBookmarkEntry(path: url.standardizedFileURL.path, bookmark: bookmark))
+			} catch {
+				windowStateLogger.error("openGalleryFolderURLs failed path=\(entry.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
+		}
+		if refreshed.count != openGalleryBookmarkEntries().count {
+			persistOpenGalleryBookmarkEntries(refreshed)
+		}
+		return resolved
+	}
+
 	/// Scans the running app's windows and records any windows that have a
 	/// representedURL (set by photo windows). This is used at quit time to
 	/// capture the complete set of open photo windows (including those in
@@ -213,9 +271,32 @@ final class WindowStateStore: @unchecked Sendable {
 	func clearOpenPhotos() {
 		queueLock.lock(); defer { queueLock.unlock() }
 		UserDefaults.standard.removeObject(forKey: openWindowsKey)
+		UserDefaults.standard.removeObject(forKey: openGalleryBookmarksKey)
 	}
 
 	private func currentPaths() -> [String] {
 		UserDefaults.standard.stringArray(forKey: openWindowsKey) ?? []
+	}
+
+	private struct GalleryBookmarkEntry: Codable {
+		let path: String
+		let bookmark: Data
+	}
+
+	private func openGalleryBookmarkEntries() -> [GalleryBookmarkEntry] {
+		guard let data = UserDefaults.standard.data(forKey: openGalleryBookmarksKey),
+			  let entries = try? JSONDecoder().decode([GalleryBookmarkEntry].self, from: data)
+		else { return [] }
+		return entries
+	}
+
+	private func persistOpenGalleryBookmarkEntries(_ entries: [GalleryBookmarkEntry]) {
+		if entries.isEmpty {
+			UserDefaults.standard.removeObject(forKey: openGalleryBookmarksKey)
+			return
+		}
+		if let data = try? JSONEncoder().encode(entries) {
+			UserDefaults.standard.set(data, forKey: openGalleryBookmarksKey)
+		}
 	}
 }

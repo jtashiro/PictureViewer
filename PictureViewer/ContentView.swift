@@ -30,6 +30,7 @@ struct VaultCommandActions {
 	let syncToTab: () -> Void
 	let copy: () -> Void
 	let paste: () -> Void
+	let selectAll: () -> Void
 	let canCloseVault: Bool
 	let canRenameVault: Bool
 	let canImportSelected: Bool
@@ -37,6 +38,7 @@ struct VaultCommandActions {
 	let canSyncToTab: Bool
 	let canCopy: Bool
 	let canPaste: Bool
+	let canSelectAll: Bool
 }
 
 private struct GalleryTabSnapshot: Identifiable, Hashable {
@@ -45,6 +47,11 @@ private struct GalleryTabSnapshot: Identifiable, Hashable {
 	let folderURL: URL?
 	let isVault: Bool
 	let photoURLs: [URL]
+}
+
+private struct VaultImportOptions {
+	let ignoreDuplicates: Bool
+	let keywords: [String]
 }
 
 @MainActor
@@ -226,6 +233,7 @@ struct ContentView: View {
 
 	@State private var initialFolderURL: URL?
 	@State private var tabID = UUID()
+	@State private var registeredGalleryFolderURL: URL?
 
 	init(initialFolder: URL? = nil) {
 		_initialFolderURL = State(initialValue: initialFolder)
@@ -235,6 +243,27 @@ struct ContentView: View {
 	/// accessing the resource so the app can write into the folder while
 	/// sandboxed. This is safe to call at startup.
 	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async -> Bool {
+		if saveOpenWindows {
+			let galleryFolders = WindowStateStore.shared.openGalleryFolderURLs()
+			if !galleryFolders.isEmpty {
+				let first = galleryFolders[0]
+				let rest = Array(galleryFolders.dropFirst())
+				logger.log("launch folder restore: source=open-gallery-tabs uniqueFolders=\(galleryFolders.count, privacy: .public) primaryFolder=\(first.path, privacy: .public)")
+				await MainActor.run {
+					if !tryOpenFolderAsVault(first) {
+						library.folderURL = first
+						activeFolderNames = [first.lastPathComponent]
+						library.scan(folder: first)
+					}
+					for url in rest {
+						logger.log("launch folder restore: source=open-gallery-tabs action=open-tab folder=\(url.path, privacy: .public)")
+						openWindow(id: "folder", value: url)
+					}
+				}
+				return true
+			}
+		}
+
 		// Prefer multi-bookmark list if available.
 		if let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data], !arr.isEmpty {
 			var resolvedFolders: [URL] = []
@@ -641,6 +670,7 @@ struct ContentView: View {
 			try fm.moveItem(at: url, to: backupURL)
 			try fm.moveItem(at: tempURL, to: url)
 			try? fm.removeItem(at: backupURL)
+			MetadataCache.shared.invalidate(for: url)
 			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
 			return true
 		} catch {
@@ -724,9 +754,13 @@ struct ContentView: View {
 
 		// Displayed (sorted) snapshot of photos. Computed in background when
 		// the underlying library or the sort mode changes.
-		@State private var displayedPhotos: [PhotoItem] = []
+	@State private var displayedPhotos: [PhotoItem] = []
 	@State private var sortTask: Task<Void, Never>? = nil
+	@State private var photoChangeTask: Task<Void, Never>? = nil
 	@State private var refreshToken = UUID()
+	@State private var metadataRefreshTokens: [URL: UUID] = [:]
+	@State private var pendingMetadataRefreshURLs: Set<URL> = []
+	@State private var metadataRefreshTask: Task<Void, Never>? = nil
 	@State private var forceThumbnailLoading = false
 	@State private var searchText: String = ""
 	@State private var isRefreshing = false
@@ -735,6 +769,8 @@ struct ContentView: View {
 	@State private var isAllDisplayedSelectionActive: Bool = false
 	@State private var deselectedItemsFromAll: Set<URL> = []
 	@State private var thumbnailFrames: [URL: CGRect] = [:]
+	@State private var pendingThumbnailFrames: [URL: CGRect] = [:]
+	@State private var thumbnailFrameTask: Task<Void, Never>? = nil
 	@State private var selectionDragStart: CGPoint? = nil
 	@State private var selectionDragCurrent: CGPoint? = nil
 	@State private var selectionDragBase: Set<URL> = []
@@ -867,6 +903,11 @@ struct ContentView: View {
 		return baseName.hasSuffix("*") ? baseName : "\(baseName)*"
 	}
 
+	@MainActor
+	private static func windowsAreAlreadyTabbed(_ first: NSWindow, _ second: NSWindow) -> Bool {
+		first.tabbedWindows?.contains(second) == true || second.tabbedWindows?.contains(first) == true
+	}
+
 	var body: some View {
 		NavigationStack {
 			VStack(spacing: 0) {
@@ -893,13 +934,15 @@ struct ContentView: View {
 				syncToTab: { syncToAnotherTab() },
 				copy: { copySelectedFiles() },
 				paste: { pasteFilesToVault() },
+				selectAll: { selectAllDisplayedPhotos() },
 				canCloseVault: isActiveVaultView || vaultStatus.isUnlocked,
 				canRenameVault: isActiveVaultView && library.folderURL != nil,
 				canImportSelected: hasSelectedPhotos,
 				canExport: !library.photos.isEmpty,
 				canSyncToTab: !library.photos.isEmpty,
 				canCopy: hasSelectedPhotos,
-				canPaste: canPasteFilesToVault
+				canPaste: canPasteFilesToVault,
+				canSelectAll: !displayedPhotos.isEmpty
 			))
 		}
 		.frame(minWidth: 760, minHeight: 540)
@@ -914,7 +957,9 @@ struct ContentView: View {
 			window.tabbingMode = .preferred
 			window.tabbingIdentifier = "PictureViewerGallery"
 			if let main = ContentView.mainGalleryWindow, main !== window, main.isVisible {
-				main.addTabbedWindow(window, ordered: .above)
+				if !Self.windowsAreAlreadyTabbed(main, window) {
+					main.addTabbedWindow(window, ordered: .above)
+				}
 			} else {
 				ContentView.mainGalleryWindow = window
 			}
@@ -971,11 +1016,13 @@ struct ContentView: View {
 		.onDisappear {
 			Task { @MainActor in
 				GalleryTabRegistry.shared.remove(id: tabID)
+				if let folderURL = registeredGalleryFolderURL, !WindowStateStore.shared.isAppTerminating() {
+					WindowStateStore.shared.recordClosedGalleryFolder(folderURL)
+				}
 			}
 		}
 		.onChange(of: library.photos) { _ in
-			scheduleSort()
-			updateTabRegistry()
+			queuePhotoChangeRefresh()
 		}
 		.onChange(of: activeFolderNames) { _ in updateTabRegistry() }
 		.onChange(of: library.folderURL) { _ in updateTabRegistry() }
@@ -1158,7 +1205,10 @@ struct ContentView: View {
 									await MainActor.run {
 										editingResults[u] = ok
 										editProgressCount += 1
-													logger.log("writeKeywords: success=\(ok, privacy: .public)")
+										if ok {
+											queueMetadataRefresh(for: u)
+										}
+										logger.log("writeKeywords: success=\(ok, privacy: .public)")
 									}
 								}
 								await MainActor.run {
@@ -1167,6 +1217,7 @@ struct ContentView: View {
 										if res == true { removeFromSelection(u) }
 									}
 									isApplyingKeywords = false
+									scheduleSort()
 								}
 							}
 						}
@@ -1763,6 +1814,7 @@ struct ContentView: View {
 								url: photo.url,
 								size: thumbnailSize,
 								refreshToken: refreshToken,
+								metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
 								forceLoad: forceThumbnailLoading
 							)
 							// Filename and keywords are rendered by ThumbnailView now.
@@ -1834,7 +1886,7 @@ struct ContentView: View {
 		}
 		.coordinateSpace(name: "photoGridArea")
 		.onPreferenceChange(ThumbnailFramePreferenceKey.self) { frames in
-			thumbnailFrames = frames
+			queueThumbnailFrameUpdate(frames)
 		}
 		.simultaneousGesture(
 			DragGesture(minimumDistance: 4, coordinateSpace: .named("photoGridArea"))
@@ -2393,6 +2445,14 @@ struct ContentView: View {
 			isVault: isActiveVaultView,
 			photoURLs: library.photos.map(\.url)
 		)
+		if registeredGalleryFolderURL?.standardizedFileURL.path != library.folderURL?.standardizedFileURL.path,
+		   let previousURL = registeredGalleryFolderURL {
+			WindowStateStore.shared.recordClosedGalleryFolder(previousURL)
+		}
+		if let folderURL = library.folderURL {
+			WindowStateStore.shared.recordOpenGalleryFolder(folderURL)
+		}
+		registeredGalleryFolderURL = library.folderURL
 		Task { @MainActor in
 			GalleryTabRegistry.shared.update(snapshot)
 		}
@@ -2697,18 +2757,42 @@ struct ContentView: View {
 		bookmarkURLs = resolved
 	}
 
-	private func promptForVaultImportDuplicateOption(folderCount: Int) -> Bool? {
+	private func promptForVaultImportOptions(itemCount: Int, title: String, itemName: String = "photo") -> VaultImportOptions? {
 		let alert = NSAlert()
-		alert.messageText = "Import Folder to Vault"
-		alert.informativeText = "Import photos from \(folderCount) selected folder\(folderCount == 1 ? "" : "s") into the current vault."
+		alert.messageText = title
+		alert.informativeText = "Import \(itemCount) \(itemName)\(itemCount == 1 ? "" : "s") into the current vault."
 		alert.addButton(withTitle: "Import")
 		alert.addButton(withTitle: "Cancel")
 		let checkbox = NSButton(checkboxWithTitle: "Ignore duplicates", target: nil, action: nil)
 		checkbox.state = .on
-		checkbox.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
-		alert.accessoryView = checkbox
+		let label = NSTextField(labelWithString: "Keywords to append")
+		let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+		field.placeholderString = "Optional, comma-separated"
+		let stack = NSStackView(views: [checkbox, label, field])
+		stack.orientation = .vertical
+		stack.alignment = .leading
+		stack.spacing = 8
+		stack.frame = NSRect(x: 0, y: 0, width: 380, height: 78)
+		alert.accessoryView = stack
 		guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-		return checkbox.state == .on
+		return VaultImportOptions(
+			ignoreDuplicates: checkbox.state == .on,
+			keywords: Self.parseKeywordInput(field.stringValue)
+		)
+	}
+
+	private static func parseKeywordInput(_ input: String) -> [String] {
+		var keywords: [String] = []
+		var seen: Set<String> = []
+		for part in input.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+			let keyword = part.trimmingCharacters(in: .whitespacesAndNewlines)
+			guard !keyword.isEmpty else { continue }
+			let key = keyword.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+			if seen.insert(key).inserted {
+				keywords.append(keyword)
+			}
+		}
+		return keywords
 	}
 
 	private func importFolderToVault() {
@@ -2721,7 +2805,7 @@ struct ContentView: View {
 		guard panel.runModal() == .OK else { return }
 		let folders = panel.urls
 		guard !folders.isEmpty else { return }
-		guard let ignoreDuplicates = promptForVaultImportDuplicateOption(folderCount: folders.count) else { return }
+		guard let importOptions = promptForVaultImportOptions(itemCount: folders.count, title: "Import Folder to Vault", itemName: "selected folder") else { return }
 
 		vaultStoreTask?.cancel()
 		isVaultWorking = true
@@ -2729,7 +2813,7 @@ struct ContentView: View {
 		vaultProgressCompleted = 0
 		vaultProgressTotal = 0
 		vaultProgressCurrentFile = ""
-		logger.log("vault import: start scan folders=\(folders.count, privacy: .public) ignoreDuplicates=\(ignoreDuplicates, privacy: .public)")
+		logger.log("vault import: start scan folders=\(folders.count, privacy: .public) ignoreDuplicates=\(importOptions.ignoreDuplicates, privacy: .public) keywordCount=\(importOptions.keywords.count, privacy: .public)")
 
 		let task = Task.detached(priority: .userInitiated) {
 			do {
@@ -2782,7 +2866,7 @@ struct ContentView: View {
 					}
 
 				let requestedCount = importURLs.count
-				let result = try await PhotoVault.shared.importFiles(importURLs, ignoreDuplicates: ignoreDuplicates) { completed, total, _ in
+				let result = try await PhotoVault.shared.importFiles(importURLs, ignoreDuplicates: importOptions.ignoreDuplicates, keywordsToAppend: importOptions.keywords) { completed, total, _ in
 					if completed == total || completed % 128 == 0 {
 						await MainActor.run {
 							vaultProgressCompleted = completed
@@ -2877,16 +2961,17 @@ struct ContentView: View {
 
 	private func storeImagesInVault(_ urls: [URL], progressMessage: String) {
 		guard !urls.isEmpty else { return }
+		guard let importOptions = promptForVaultImportOptions(itemCount: urls.count, title: "Store Photos in Vault") else { return }
 		vaultStoreTask?.cancel()
 		isVaultWorking = true
 		vaultProgressMessage = progressMessage
 		vaultProgressCompleted = 0
 		vaultProgressTotal = urls.count
 		vaultProgressCurrentFile = ""
-		logger.log("vault store: start count=\(urls.count, privacy: .public)")
+		logger.log("vault store: start count=\(urls.count, privacy: .public) ignoreDuplicates=\(importOptions.ignoreDuplicates, privacy: .public) keywordCount=\(importOptions.keywords.count, privacy: .public)")
 		let task = Task.detached(priority: .userInitiated) {
 			do {
-				let result = try await PhotoVault.shared.importFiles(urls) { completed, total, _ in
+				let result = try await PhotoVault.shared.importFiles(urls, ignoreDuplicates: importOptions.ignoreDuplicates, keywordsToAppend: importOptions.keywords) { completed, total, _ in
 					if completed == total || completed % 128 == 0 {
 						await MainActor.run {
 							vaultProgressCompleted = completed
@@ -3380,7 +3465,6 @@ struct ContentView: View {
 						vaultProgressCurrentFile = currentFile
 						if !loadedURLs.isEmpty {
 							library.photos.append(contentsOf: loadedURLs.map { PhotoItem(url: $0) })
-							refreshToken = UUID()
 						}
 					}
 				}
@@ -3793,6 +3877,43 @@ struct ContentView: View {
 		}
 	}
 
+	private func queueMetadataRefresh(for url: URL) {
+		pendingMetadataRefreshURLs.insert(url)
+		metadataRefreshTask?.cancel()
+		metadataRefreshTask = Task { @MainActor in
+			try? await Task.sleep(nanoseconds: 16_000_000)
+			if Task.isCancelled { return }
+			let urls = pendingMetadataRefreshURLs
+			pendingMetadataRefreshURLs.removeAll(keepingCapacity: true)
+			for url in urls {
+				metadataRefreshTokens[url] = UUID()
+			}
+			metadataRefreshTask = nil
+		}
+	}
+
+	private func queuePhotoChangeRefresh() {
+		photoChangeTask?.cancel()
+		photoChangeTask = Task { @MainActor in
+			try? await Task.sleep(nanoseconds: 16_000_000)
+			if Task.isCancelled { return }
+			scheduleSort()
+			updateTabRegistry()
+			photoChangeTask = nil
+		}
+	}
+
+	private func queueThumbnailFrameUpdate(_ frames: [URL: CGRect]) {
+		pendingThumbnailFrames = frames
+		thumbnailFrameTask?.cancel()
+		thumbnailFrameTask = Task { @MainActor in
+			try? await Task.sleep(nanoseconds: 16_000_000)
+			if Task.isCancelled { return }
+			thumbnailFrames = pendingThumbnailFrames
+			thumbnailFrameTask = nil
+		}
+	}
+
 	private static func computeSorted(photos: [PhotoItem], mode: SortMode, filter: String) async -> [PhotoItem] {
 		// If no filter provided, just sort normally.
 		let filtered: [PhotoItem]
@@ -3943,7 +4064,8 @@ struct ContentView: View {
 
 		var metadata = props
 		var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
-		iptc[kCGImagePropertyIPTCKeywords] = keywords as CFArray
+		let existingKeywords = Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords])
+		iptc[kCGImagePropertyIPTCKeywords] = Self.mergedKeywords(existingKeywords, keywords) as CFArray
 		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
 
 		// Create a temporary file next to the original so moves are atomic
@@ -3988,6 +4110,36 @@ struct ContentView: View {
 			// Do not fall back to sidecar; surface failure to caller.
 			return false
 		}
+	}
+
+	private static func keywordStrings(from value: Any?) -> [String] {
+		if let strings = value as? [String] {
+			return strings
+		}
+		if let array = value as? [Any] {
+			return array.compactMap { $0 as? String }
+		}
+		if let array = value as? NSArray {
+			return array.compactMap { $0 as? String }
+		}
+		if let string = value as? String {
+			return [string]
+		}
+		return []
+	}
+
+	private static func mergedKeywords(_ existing: [String], _ appended: [String]) -> [String] {
+		var result: [String] = []
+		var seen: Set<String> = []
+		for keyword in existing + appended {
+			let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+			guard !trimmed.isEmpty else { continue }
+			let key = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+			if seen.insert(key).inserted {
+				result.append(trimmed)
+			}
+		}
+		return result
 	}
 
 	private func restoreSavedWindowsIfNeeded(skipSavedFolder: Bool) {

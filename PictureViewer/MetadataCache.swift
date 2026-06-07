@@ -26,6 +26,15 @@ final class MetadataCache {
 		self.limiter = AsyncLimiter(capacity: cap)
 	}
 
+	func invalidate(for url: URL) {
+		let key = url.path
+		cacheQueue.async(flags: .barrier) { [weak self] in
+			self?.imageDateCache.removeValue(forKey: key)
+			self?.fileDateCache.removeValue(forKey: key)
+			self?.candidateCache.removeValue(forKey: key)
+		}
+	}
+
 	/// Returns the cached image date if available, otherwise parses the
 	/// image metadata off the actor and caches the result. This function
 	/// performs expensive IO/decoding off the calling thread via
