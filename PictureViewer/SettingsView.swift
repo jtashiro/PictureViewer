@@ -39,6 +39,8 @@ struct SettingsView: View {
 	@AppStorage("requirePasswordAtLaunch") private var requirePasswordAtLaunch: Bool = true
 	@AppStorage("deferAtLaunchBackgroundWork") private var deferAtLaunchBackgroundWork: Bool = true
 	@AppStorage(AppLogLevel.userDefaultsKey) private var logLevelRaw: String = AppLogLevel.defaultLevel.rawValue
+	@AppStorage(SQLiteObjectStore.encryptBlobsKey) private var sqliteObjectStoreEncryptBlobs: Bool = false
+	@AppStorage(SQLiteObjectStore.storeNameKey) private var sqliteObjectStoreName: String = SQLiteObjectStore.defaultStoreName
 
 	var body: some View {
 		TabView {
@@ -46,8 +48,10 @@ struct SettingsView: View {
 				.tabItem { Label("General", systemImage: "gearshape") }
 			performanceTab
 				.tabItem { Label("Performance", systemImage: "cpu") }
+			storageTab
+				.tabItem { Label("Storage", systemImage: "externaldrive") }
 		}
-		.frame(width: 520, height: 400)
+		.frame(width: 560, height: 440)
 	}
 
 	private var generalTab: some View {
@@ -118,8 +122,26 @@ struct SettingsView: View {
 		.formStyle(.grouped)
 	}
 
-}
+	private var storageTab: some View {
+		Form {
+			Section {
+				TextField("Store name", text: $sqliteObjectStoreName)
+					.textFieldStyle(.roundedBorder)
+				Toggle("Encrypt BLOB content", isOn: $sqliteObjectStoreEncryptBlobs)
+				Text("When disabled, BLOB content is stored in SQLite as original file bytes. When enabled, BLOB content is AES-GCM encrypted before it is written.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
 
-#Preview {
-	SettingsView()
+				LabeledContent("Database file", value: SQLiteObjectStore.configuredDatabaseFilename)
+			} header: {
+				Text("SQLite Object Store")
+			} footer: {
+				Text("SQLite stores are always available. Use File > New or File > Open to create or choose a store.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+			}
+		}
+		.formStyle(.grouped)
+	}
+
 }

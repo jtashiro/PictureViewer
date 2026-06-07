@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import Combine
 import UniformTypeIdentifiers
 import os
 
@@ -14,15 +15,14 @@ struct PhotoItem: Identifiable, Hashable, Sendable {
 }
 
 @MainActor
-@Observable
-final class PhotoLibrary {
+final class PhotoLibrary: ObservableObject {
 	nonisolated private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "scan")
-	var photos: [PhotoItem] = []
-	var folderURL: URL?
-	var isScanning = false
-	var lastScanDate: Date?
-	var scanStartDate: Date?
-	var lastScanDuration: TimeInterval?
+	@Published var photos: [PhotoItem] = []
+	@Published var folderURL: URL?
+	@Published var isScanning = false
+	@Published var lastScanDate: Date?
+	@Published var scanStartDate: Date?
+	@Published var lastScanDuration: TimeInterval?
 
 	private var currentScan: Task<Void, Never>?
 

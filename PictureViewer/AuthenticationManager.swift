@@ -11,6 +11,7 @@ import SwiftUI
 import Combine
 import os
 
+@MainActor
 final class AuthenticationManager: ObservableObject {
     static let shared = AuthenticationManager()
     private let logger = Logger(subsystem: "com.example.PictureViewer", category: "auth")
@@ -34,22 +35,27 @@ final class AuthenticationManager: ObservableObject {
         let reason = "Unlock Picture Viewer"
 
         // deviceOwnerAuthentication allows biometrics and password fallback.
-        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, error in
-            DispatchQueue.main.async {
-                self?.isAuthenticating = false
-                if success {
-                    self?.isAuthenticated = true
-                    self?.logger.log("auth:success")
-                } else {
-                    self?.isAuthenticated = false
-                    if let error = error as NSError? {
-                        self?.lastError = error.localizedDescription
-                        self?.logger.log("auth:failed error=\(error.localizedDescription, privacy: .public)")
-                    } else {
-                        self?.lastError = "Authentication failed"
-                        self?.logger.log("auth:failed unknown")
-                    }
-                }
+        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in
+            let errorDescription = (error as NSError?)?.localizedDescription
+            Task { @MainActor in
+                AuthenticationManager.shared.finishAuthentication(success: success, errorDescription: errorDescription)
+            }
+        }
+    }
+
+    private func finishAuthentication(success: Bool, errorDescription: String?) {
+        isAuthenticating = false
+        if success {
+            isAuthenticated = true
+            logger.log("auth:success")
+        } else {
+            isAuthenticated = false
+            if let errorDescription {
+                lastError = errorDescription
+                logger.log("auth:failed error=\(errorDescription, privacy: .public)")
+            } else {
+                lastError = "Authentication failed"
+                logger.log("auth:failed unknown")
             }
         }
     }

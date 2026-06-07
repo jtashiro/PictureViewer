@@ -9,6 +9,31 @@ import CoreImage
 import ImageIO
 import os
 
+@MainActor
+final class PhotoNavigationContext {
+	static let shared = PhotoNavigationContext()
+
+	private var orderedURLs: [URL] = []
+
+	private init() {}
+
+	func update(urls: [URL]) {
+		var seen: Set<URL> = []
+		orderedURLs = urls.filter { seen.insert($0).inserted }
+	}
+
+	func adjacentURL(to url: URL, offset: Int) -> URL? {
+		guard !orderedURLs.isEmpty,
+			  let index = orderedURLs.firstIndex(of: url)
+		else {
+			return nil
+		}
+		let targetIndex = index + offset
+		guard orderedURLs.indices.contains(targetIndex) else { return nil }
+		return orderedURLs[targetIndex]
+	}
+}
+
 struct FullScreenPhotoView: View {
 	let url: URL
 	@State private var currentURL: URL
@@ -64,6 +89,14 @@ struct FullScreenPhotoView: View {
 		.focusEffectDisabled()
 		.onKeyPress(.escape) {
 			dismiss()
+			return .handled
+		}
+		.onKeyPress(.leftArrow) {
+			navigateToAdjacentPhoto(offset: -1)
+			return .handled
+		}
+		.onKeyPress(.rightArrow) {
+			navigateToAdjacentPhoto(offset: 1)
 			return .handled
 		}
 		.onTapGesture {
@@ -204,6 +237,32 @@ struct FullScreenPhotoView: View {
 		contrastAdjustment = 1
 	}
 
+	private func navigateToAdjacentPhoto(offset: Int) {
+		guard let targetURL = PhotoNavigationContext.shared.adjacentURL(to: currentURL, offset: offset),
+			  targetURL != currentURL
+		else {
+			return
+		}
+		if hasPendingEdits {
+			Task {
+				await saveEdits()
+				navigate(to: targetURL)
+			}
+		} else {
+			navigate(to: targetURL)
+		}
+	}
+
+	private func navigate(to targetURL: URL) {
+		let previousURL = currentURL
+		WindowStateStore.shared.recordClosedPhoto(previousURL)
+		currentURL = targetURL
+		resetAdjustments()
+		rotationDegrees = 0
+		WindowStateStore.shared.recordOpenPhoto(targetURL)
+		updateWindowMetadata(previousURL: previousURL, newURL: targetURL)
+	}
+
 	private func nextEditedURL(for sourceURL: URL) -> URL {
 		let directoryURL = sourceURL.deletingLastPathComponent()
 		let fileExt = sourceURL.pathExtension
@@ -245,6 +304,7 @@ struct FullScreenPhotoView: View {
 		guard hasPendingEdits else { return }
 		guard let nsImg = image else { return }
 		let sourceURL = currentURL
+		let shouldPersistToSQLite = SQLiteObjectStore.isWorkingCopyURL(sourceURL)
 		isSavingEdits = true
 		defer { isSavingEdits = false }
 
@@ -341,6 +401,22 @@ struct FullScreenPhotoView: View {
 				NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": sourceURL.path, "op": "photoDetailSave", "message": "CGImageDestinationFinalize failed when attempting to save edited image."])
 				// Do not write sidecar; surface failure.
 				return nil
+			}
+
+			if shouldPersistToSQLite {
+				do {
+					try await SQLiteObjectStore.shared.storeObjectFile(at: destinationURL)
+					await MainActor.run {
+						NotificationCenter.default.post(
+							name: .sqliteObjectStoreDidChange,
+							object: nil,
+							userInfo: ["filename": destinationURL.lastPathComponent]
+						)
+					}
+				} catch {
+					let logger = Logger(subsystem: "com.example.PictureViewer", category: "sqlite-object-store")
+					logger.error("photo-detail: failed to persist sqlite edit path=\(destinationURL.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				}
 			}
 
 			return destinationURL

@@ -4,22 +4,21 @@
 //
 
 import Foundation
-import Observation
+import Combine
 import SwiftUI
 
 @MainActor
-@Observable
-final class FaceScanProgress {
+final class FaceScanProgress: ObservableObject {
     static let shared = FaceScanProgress()
 
-    var isActive: Bool = false
-    var title: String = ""
-    var status: String = ""
-    var completed: Int = 0
-    var total: Int = 0
-    var isCancelling: Bool = false
+    @Published var isActive: Bool = false
+    @Published var title: String = ""
+    @Published var status: String = ""
+    @Published var completed: Int = 0
+    @Published var total: Int = 0
+    @Published var isCancelling: Bool = false
 
-    @ObservationIgnored private var cancelHook: (@Sendable () -> Void)?
+    private var cancelHook: (@Sendable () -> Void)?
 
     private init() {}
 
@@ -72,8 +71,7 @@ final class FaceScanProgress {
 /// person's photos. PeopleView writes; ContentView reads and re-filters its
 /// thumbnail grid in response.
 @MainActor
-@Observable
-final class PersonFilterState {
+final class PersonFilterState: ObservableObject {
     static let shared = PersonFilterState()
 
     struct Active: Equatable {
@@ -81,7 +79,7 @@ final class PersonFilterState {
         let personName: String
     }
 
-    var active: Active? = nil
+    @Published var active: Active? = nil
 
     private init() {}
 
@@ -128,7 +126,7 @@ actor FaceScanCoordinator {
 }
 
 struct FaceScanProgressOverlay: View {
-    private let progress = FaceScanProgress.shared
+    @ObservedObject private var progress = FaceScanProgress.shared
 
     var body: some View {
         if progress.isActive {

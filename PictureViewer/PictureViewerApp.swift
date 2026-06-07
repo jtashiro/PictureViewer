@@ -66,7 +66,7 @@ struct PictureViewerApp: App {
 				let title = w.title.isEmpty ? "<untitled>" : w.title
 				photoWindowEntries.append("\(title):\(representedURL.path)")
 			}
-			let galleryTabCount = WindowStateStore.shared.openGalleryFolderURLs().count
+			let galleryTabCount = WindowStateStore.shared.openGallerySessionItems().count
 			if save {
 				logger.log("App will terminate; snapshotting restorable session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
 				if AppLogLevel.current.allows(.debug) {
@@ -143,6 +143,26 @@ struct PictureViewerApp: App {
 			} else {
 				if let url {
 					ContentView(initialFolder: url)
+						.environmentObject(authManager)
+				}
+			}
+		}
+		.windowStyle(.automatic)
+		.windowResizability(.contentSize)
+
+		WindowGroup(id: "sqlite-store", for: String.self) { $storeName in
+			if requirePasswordAtLaunch {
+				if authManager.isAuthenticated {
+					if let storeName {
+						ContentView(initialSQLiteStoreName: storeName)
+							.environmentObject(authManager)
+					}
+				} else {
+					EmptyView()
+				}
+			} else {
+				if let storeName {
+					ContentView(initialSQLiteStoreName: storeName)
 						.environmentObject(authManager)
 				}
 			}
@@ -237,27 +257,27 @@ struct VaultFileCommands: Commands {
 
 	var body: some Commands {
 		CommandGroup(after: .newItem) {
-			Button("New Vault…") {
-				vaultActions?.newVault()
+			Button("New…") {
+				vaultActions?.newItem()
 			}
 			.disabled(vaultActions == nil)
 
-			Button("Open Vault…") {
-				vaultActions?.chooseAndOpenVault()
+			Button("Open…") {
+				vaultActions?.openItem()
 			}
 			.disabled(vaultActions == nil)
 
-			Button("Close Vault") {
+			Button("Close") {
 				vaultActions?.closeVault()
 			}
 			.disabled(vaultActions?.canCloseVault != true)
 
-			Button("Rename Vault…") {
+			Button("Rename…") {
 				vaultActions?.renameVault()
 			}
 			.disabled(vaultActions?.canRenameVault != true)
 
-			Button("Manage Vaults…") {
+			Button("Manage…") {
 				vaultActions?.manageVaults()
 			}
 			.disabled(vaultActions == nil)
@@ -275,11 +295,6 @@ struct VaultFileCommands: Commands {
 			}
 			.disabled(vaultActions?.canImportSelected != true)
 
-			Button("Open Vault") {
-				vaultActions?.chooseAndOpenVault()
-			}
-			.disabled(vaultActions == nil)
-
 			Button(vaultActions?.canImportSelected == true ? "Export Selected Photos…" : "Export Displayed Photos…") {
 				vaultActions?.exportPhotos()
 			}
@@ -291,6 +306,17 @@ struct VaultFileCommands: Commands {
 				vaultActions?.syncToTab()
 			}
 			.disabled(vaultActions?.canSyncToTab != true)
+
+			Button("Sync Tab to SQLite Store…") {
+				vaultActions?.syncToSQLiteStore()
+			}
+			.disabled(vaultActions?.canSyncToSQLiteStore != true)
+
+			Button("Store Selected in SQLite Store…") {
+				vaultActions?.syncSelectedToSQLiteStore()
+			}
+			.disabled(vaultActions?.canSyncSelectedToSQLiteStore != true)
+
 		}
 
 		CommandGroup(replacing: .pasteboard) {

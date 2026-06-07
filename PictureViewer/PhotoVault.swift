@@ -393,6 +393,12 @@ actor PhotoVault {
                         }
                         let workingURL = try writeWorkingCopy(importData, originalFilename: src.lastPathComponent)
                         await setEncryptedURL(encryptedURL, forWorkingURL: workingURL)
+                        await SQLiteObjectStore.shared.storeObjectData(
+                            importData,
+                            originalURL: src,
+                            contentHash: sourceHash,
+                            contentTypeIdentifier: contentType?.identifier
+                        )
                         logger.log("vault import:file success source=\(src.lastPathComponent, privacy: .public) encrypted=\(encryptedURL.lastPathComponent, privacy: .public)")
                         return (idx, .stored(workingURL))
                     } catch {

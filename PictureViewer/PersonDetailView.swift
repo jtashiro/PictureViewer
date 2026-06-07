@@ -131,7 +131,3 @@ private struct AsyncLoadedImage: View {
         }
     }
 }
-
-#Preview {
-    PersonDetailView(person: Person(id: UUID(), representative: URL(fileURLWithPath: "/"), count: 1, sampleSource: nil, name: "Person"))
-}

@@ -15,9 +15,12 @@ import UniformTypeIdentifiers
 extension Notification.Name {
 	static let embedWriteFailed = Notification.Name("com.example.PictureViewer.embedWriteFailed")
 	static let galleryTabSyncImported = Notification.Name("com.example.PictureViewer.galleryTabSyncImported")
+	static let sqliteObjectStoreDidChange = Notification.Name("com.example.PictureViewer.sqliteObjectStoreDidChange")
 }
 
 struct VaultCommandActions {
+	let newItem: () -> Void
+	let openItem: () -> Void
 	let newVault: () -> Void
 	let importFolders: () -> Void
 	let importSelected: () -> Void
@@ -28,6 +31,9 @@ struct VaultCommandActions {
 	let manageVaults: () -> Void
 	let exportPhotos: () -> Void
 	let syncToTab: () -> Void
+	let syncToSQLiteStore: () -> Void
+	let syncSelectedToSQLiteStore: () -> Void
+	let openSQLiteStore: () -> Void
 	let copy: () -> Void
 	let paste: () -> Void
 	let selectAll: () -> Void
@@ -36,6 +42,9 @@ struct VaultCommandActions {
 	let canImportSelected: Bool
 	let canExport: Bool
 	let canSyncToTab: Bool
+	let canSyncToSQLiteStore: Bool
+	let canSyncSelectedToSQLiteStore: Bool
+	let canOpenSQLiteStore: Bool
 	let canCopy: Bool
 	let canPaste: Bool
 	let canSelectAll: Bool
@@ -73,6 +82,23 @@ private final class GalleryTabRegistry {
 			.filter { $0.id != id && $0.folderURL != nil }
 			.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
 	}
+
+	func containsBookmarkName(_ name: String, excluding id: UUID? = nil) -> Bool {
+		let key = Self.normalizedBookmarkName(name)
+		guard !key.isEmpty else { return false }
+		return snapshots.values.contains { snapshot in
+			if let id, snapshot.id == id { return false }
+			let snapshotName = snapshot.folderURL?.lastPathComponent ?? snapshot.title
+			return Self.normalizedBookmarkName(snapshotName) == key
+		}
+	}
+
+	private static func normalizedBookmarkName(_ name: String) -> String {
+		name
+			.trimmingCharacters(in: .whitespacesAndNewlines)
+			.trimmingCharacters(in: CharacterSet(charactersIn: "*"))
+			.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+	}
 }
 
 private struct VaultCommandActionsKey: FocusedValueKey {
@@ -104,6 +130,35 @@ private enum MarqueeSelectionMode {
 private final class ThumbnailDraggingSource: NSObject, NSDraggingSource {
 	func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
 		.copy
+	}
+}
+
+private func isTextEditingFirstResponder(_ responder: NSResponder?) -> Bool {
+	var current = responder
+	while let candidate = current {
+		if candidate is NSTextView || candidate is NSTextField || candidate is NSSearchField {
+			return true
+		}
+		current = candidate.nextResponder
+	}
+	return false
+}
+
+private struct ScrollViewAccessor: NSViewRepresentable {
+	let callback: (NSScrollView?) -> Void
+
+	func makeNSView(context: Context) -> NSView {
+		let view = NSView(frame: .zero)
+		DispatchQueue.main.async { [weak view] in
+			callback(view?.enclosingScrollView)
+		}
+		return view
+	}
+
+	func updateNSView(_ nsView: NSView, context: Context) {
+		DispatchQueue.main.async {
+			callback(nsView.enclosingScrollView)
+		}
 	}
 }
 
@@ -149,7 +204,7 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 		func ensureMenuResponderIfAppropriate() {
 			guard isSelectAllEnabled,
 				  let window,
-				  window.firstResponder == nil || !Self.isTextEditingFirstResponder(window.firstResponder)
+				  window.firstResponder == nil || !isTextEditingFirstResponder(window.firstResponder)
 			else { return }
 			window.makeFirstResponder(self)
 		}
@@ -157,7 +212,7 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 		override func selectAll(_ sender: Any?) {
 			guard isSelectAllEnabled,
 				  let window,
-				  !Self.isTextEditingFirstResponder(window.firstResponder)
+				  !isTextEditingFirstResponder(window.firstResponder)
 			else { return }
 			selectAllAction?()
 		}
@@ -169,16 +224,6 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 			return false
 		}
 
-		static func isTextEditingFirstResponder(_ responder: NSResponder?) -> Bool {
-			var current = responder
-			while let candidate = current {
-				if candidate is NSTextView || candidate is NSTextField || candidate is NSSearchField {
-					return true
-				}
-				current = candidate.nextResponder
-			}
-			return false
-		}
 	}
 
 	final class Coordinator {
@@ -199,7 +244,7 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 				window.isKeyWindow,
 				event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
 				event.charactersIgnoringModifiers?.lowercased() == "a",
-				!SelectAllResponderView.isTextEditingFirstResponder(window.firstResponder)
+				!isTextEditingFirstResponder(window.firstResponder)
 			else {
 				return event
 			}
@@ -210,8 +255,117 @@ private struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 	}
 }
 
+private struct GridArrowKeyboardShortcutView: NSViewRepresentable {
+	let isEnabled: Bool
+	let action: (GridNavigationDirection) -> Void
+
+	func makeCoordinator() -> Coordinator {
+		Coordinator()
+	}
+
+	func makeNSView(context: Context) -> NSView {
+		let view = GridArrowResponderView(frame: .zero)
+		context.coordinator.view = view
+		context.coordinator.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak coordinator = context.coordinator] event in
+			coordinator?.handle(event) ?? event
+		}
+		return view
+	}
+
+	func updateNSView(_ nsView: NSView, context: Context) {
+		context.coordinator.view = nsView
+		context.coordinator.isEnabled = isEnabled
+		context.coordinator.action = action
+		if let responderView = nsView as? GridArrowResponderView {
+			responderView.isGridNavigationEnabled = isEnabled
+			responderView.navigationAction = action
+			responderView.ensureMenuResponderIfAppropriate()
+		}
+	}
+
+	final class GridArrowResponderView: NSView {
+		var isGridNavigationEnabled = false
+		var navigationAction: ((GridNavigationDirection) -> Void)?
+
+		override var acceptsFirstResponder: Bool { true }
+
+		override func viewDidMoveToWindow() {
+			super.viewDidMoveToWindow()
+			ensureMenuResponderIfAppropriate()
+		}
+
+		func ensureMenuResponderIfAppropriate() {
+			guard isGridNavigationEnabled, let window else { return }
+			if window.firstResponder == nil || isTextEditingFirstResponder(window.firstResponder) {
+				return
+			}
+			if window.firstResponder !== self {
+				window.makeFirstResponder(self)
+			}
+		}
+
+		override func keyDown(with event: NSEvent) {
+			guard isGridNavigationEnabled,
+				  event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
+				  let direction = GridNavigationDirection(event: event)
+			else {
+				super.keyDown(with: event)
+				return
+			}
+			navigationAction?(direction)
+		}
+	}
+
+	final class Coordinator {
+		weak var view: NSView?
+		var isEnabled = false
+		var action: ((GridNavigationDirection) -> Void)?
+		var monitor: Any?
+
+		deinit {
+			if let monitor {
+				NSEvent.removeMonitor(monitor)
+			}
+		}
+
+		func handle(_ event: NSEvent) -> NSEvent? {
+			guard isEnabled,
+				  let window = view?.window,
+				  window.isKeyWindow,
+				  event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty,
+				  let direction = GridNavigationDirection(event: event),
+				  !isTextEditingFirstResponder(window.firstResponder)
+			else {
+				return event
+			}
+
+			action?(direction)
+			return nil
+		}
+	}
+}
+
+private enum GridNavigationDirection {
+	case left
+	case right
+	case up
+	case down
+
+	init?(event: NSEvent) {
+		switch event.keyCode {
+		case 123: self = .left
+		case 124: self = .right
+		case 126: self = .up
+		case 125: self = .down
+		default: return nil
+		}
+	}
+}
+
 struct ContentView: View {
-	@State private var library = PhotoLibrary()
+	@StateObject private var library = PhotoLibrary()
+	@StateObject private var faceScanProgress = FaceScanProgress.shared
+	@StateObject private var personFilterState = PersonFilterState.shared
 	@State private var thumbnailSize: CGFloat = 160
 	@AppStorage("sortMode") private var sortModeRaw: Int = 0
 	private enum SortMode: Int, CaseIterable, Identifiable {
@@ -232,11 +386,14 @@ struct ContentView: View {
 	}
 
 	@State private var initialFolderURL: URL?
+	@State private var initialSQLiteStoreName: String?
 	@State private var tabID = UUID()
 	@State private var registeredGalleryFolderURL: URL?
+	@State private var registeredSQLiteStoreName: String?
 
-	init(initialFolder: URL? = nil) {
+	init(initialFolder: URL? = nil, initialSQLiteStoreName: String? = nil) {
 		_initialFolderURL = State(initialValue: initialFolder)
+		_initialSQLiteStoreName = State(initialValue: initialSQLiteStoreName)
 	}
 
 	/// Restore a persisted security-scoped bookmark (if present) and start
@@ -244,20 +401,31 @@ struct ContentView: View {
 	/// sandboxed. This is safe to call at startup.
 	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async -> Bool {
 		if saveOpenWindows {
-			let galleryFolders = WindowStateStore.shared.openGalleryFolderURLs()
-			if !galleryFolders.isEmpty {
-				let first = galleryFolders[0]
-				let rest = Array(galleryFolders.dropFirst())
-				logger.log("launch folder restore: source=open-gallery-tabs uniqueFolders=\(galleryFolders.count, privacy: .public) primaryFolder=\(first.path, privacy: .public)")
+			let sessionItems = Self.uniqueGallerySessionItems(WindowStateStore.shared.openGallerySessionItems())
+			if !sessionItems.isEmpty {
+				logger.log("launch gallery restore: source=open-gallery-tabs itemCount=\(sessionItems.count, privacy: .public)")
 				await MainActor.run {
-					if !tryOpenFolderAsVault(first) {
-						library.folderURL = first
-						activeFolderNames = [first.lastPathComponent]
-						library.scan(folder: first)
-					}
-					for url in rest {
-						logger.log("launch folder restore: source=open-gallery-tabs action=open-tab folder=\(url.path, privacy: .public)")
-						openWindow(id: "folder", value: url)
+					for (index, item) in sessionItems.enumerated() {
+						switch item {
+						case .folder(let url):
+							if index == 0 {
+								if !tryOpenFolderAsVault(url) {
+									library.folderURL = url
+									activeFolderNames = [url.lastPathComponent]
+									library.scan(folder: url)
+								}
+							} else {
+								logger.log("launch gallery restore: source=open-gallery-tabs action=open-folder-tab folder=\(url.path, privacy: .public)")
+								openWindow(id: "folder", value: url)
+							}
+						case .sqliteStore(let storeName):
+							if index == 0 {
+								openSQLiteObjectStore(named: storeName)
+							} else {
+								logger.log("launch gallery restore: source=open-gallery-tabs action=open-sqlite-tab store=\(storeName, privacy: .public)")
+								openWindow(id: "sqlite-store", value: storeName)
+							}
+						}
 					}
 				}
 				return true
@@ -268,13 +436,16 @@ struct ContentView: View {
 		if let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data], !arr.isEmpty {
 			var resolvedFolders: [URL] = []
 			var seenPaths: Set<String> = []
+			var seenNames: Set<String> = []
 			var duplicateCount = 0
 			for bm in arr {
 				var stale = false
 				do {
 					let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
 					if url.startAccessingSecurityScopedResource() {
-						if seenPaths.insert(url.path).inserted {
+						let pathInserted = seenPaths.insert(url.path).inserted
+						let nameInserted = seenNames.insert(Self.normalizedBookmarkOpenName(url.lastPathComponent)).inserted
+						if pathInserted && nameInserted {
 							resolvedFolders.append(url)
 							if AppLogLevel.current.allows(.debug) {
 								logger.debug("launch folder restore: resolved bookmark path=\(url.path, privacy: .public) stale=\(stale, privacy: .public)")
@@ -762,6 +933,7 @@ struct ContentView: View {
 	@State private var pendingMetadataRefreshURLs: Set<URL> = []
 	@State private var metadataRefreshTask: Task<Void, Never>? = nil
 	@State private var forceThumbnailLoading = false
+	@State private var isSQLiteObjectStoreView = false
 	@State private var searchText: String = ""
 	@State private var isRefreshing = false
 	@State private var selectionMode: Bool = false
@@ -776,6 +948,10 @@ struct ContentView: View {
 	@State private var selectionDragBase: Set<URL> = []
 	@State private var selectionDragMode: MarqueeSelectionMode = .replace
 	@State private var suppressMarqueeDuringItemDrag: Bool = false
+	@State private var gridScrollView: NSScrollView? = nil
+	@State private var selectionAutoScrollTask: Task<Void, Never>? = nil
+	@State private var pendingSQLiteFocusFilename: String? = nil
+	@State private var pendingSQLiteFocusTask: Task<Void, Never>? = nil
 	private let thumbnailDraggingSource = ThumbnailDraggingSource()
 	@State private var isEditingKeywords: Bool = false
 	@State private var editKeywordsText: String = ""
@@ -828,6 +1004,12 @@ struct ContentView: View {
 	// multiple folders. Kept for backward compatibility with the single
 	// bookmark key above.
 	static let kLastFolderBookmarks = "lastFolderBookmarks"
+	static let kKnownFolderBookmarks = "knownFolderBookmarks"
+	private static let sqliteStoreContentTypes: [UTType] = [
+		UTType(filenameExtension: "sqlite") ?? .data,
+		UTType(filenameExtension: "sqlite3") ?? .data,
+		UTType(filenameExtension: "db") ?? .data
+	]
 	// Active resolved security-scoped URLs (kept open for the app lifetime)
 	private static var activeSecurityScopedURLs: [URL] = []
 	// First mounted gallery window. Subsequent windows are force-tabbed onto
@@ -903,6 +1085,42 @@ struct ContentView: View {
 		return baseName.hasSuffix("*") ? baseName : "\(baseName)*"
 	}
 
+	private nonisolated static func normalizedBookmarkOpenName(_ name: String) -> String {
+		name
+			.trimmingCharacters(in: .whitespacesAndNewlines)
+			.trimmingCharacters(in: CharacterSet(charactersIn: "*"))
+			.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+	}
+
+	private nonisolated static func uniqueFoldersByBookmarkName(_ urls: [URL]) -> [URL] {
+		var seenNames: Set<String> = []
+		return urls.filter { url in
+			let key = normalizedBookmarkOpenName(url.lastPathComponent)
+			guard !key.isEmpty else { return true }
+			return seenNames.insert(key).inserted
+		}
+	}
+
+	private nonisolated static func uniqueGallerySessionItems(_ items: [WindowStateStore.GallerySessionItem]) -> [WindowStateStore.GallerySessionItem] {
+		var seenNames: Set<String> = []
+		return items.filter { item in
+			let name: String
+			switch item {
+			case .folder(let url):
+				name = url.lastPathComponent
+			case .sqliteStore(let storeName):
+				name = storeName
+			}
+			let key = normalizedBookmarkOpenName(name)
+			guard !key.isEmpty else { return true }
+			return seenNames.insert(key).inserted
+		}
+	}
+
+	private nonisolated static func isSQLiteStoreFile(_ url: URL) -> Bool {
+		["sqlite", "sqlite3", "db"].contains(url.pathExtension.lowercased())
+	}
+
 	@MainActor
 	private static func windowsAreAlreadyTabbed(_ first: NSWindow, _ second: NSWindow) -> Bool {
 		first.tabbedWindows?.contains(second) == true || second.tabbedWindows?.contains(first) == true
@@ -922,6 +1140,8 @@ struct ContentView: View {
 						)
 			.toolbar { toolbarItems }
 			.focusedSceneValue(\.vaultCommandActions, VaultCommandActions(
+				newItem: { newItem() },
+				openItem: { chooseFolder() },
 				newVault: { newVault() },
 				importFolders: { importFolderToVault() },
 				importSelected: { importSelectedImagesToVault() },
@@ -932,14 +1152,20 @@ struct ContentView: View {
 				manageVaults: { showVaultManager() },
 				exportPhotos: { exportVaultSelection() },
 				syncToTab: { syncToAnotherTab() },
+				syncToSQLiteStore: { syncCurrentTabToSQLiteStore() },
+				syncSelectedToSQLiteStore: { syncSelectedMediaToSQLiteStore() },
+				openSQLiteStore: { chooseAndOpenSQLiteObjectStore() },
 				copy: { copySelectedFiles() },
 				paste: { pasteFilesToVault() },
 				selectAll: { selectAllDisplayedPhotos() },
-				canCloseVault: isActiveVaultView || vaultStatus.isUnlocked,
+				canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
 				canRenameVault: isActiveVaultView && library.folderURL != nil,
 				canImportSelected: hasSelectedPhotos,
 				canExport: !library.photos.isEmpty,
 				canSyncToTab: !library.photos.isEmpty,
+				canSyncToSQLiteStore: !library.photos.isEmpty,
+				canSyncSelectedToSQLiteStore: hasSelectedPhotos,
+				canOpenSQLiteStore: true,
 				canCopy: hasSelectedPhotos,
 				canPaste: canPasteFilesToVault,
 				canSelectAll: !displayedPhotos.isEmpty
@@ -957,6 +1183,10 @@ struct ContentView: View {
 			window.tabbingMode = .preferred
 			window.tabbingIdentifier = "PictureViewerGallery"
 			if let main = ContentView.mainGalleryWindow, main !== window, main.isVisible {
+				// If AppKit already tabbed the new window (e.g. user pressed
+				// "+" on the tab bar), leave it alone. Otherwise attach the
+				// new window to the main window's tab group so programmatic
+				// openWindow(id:value:) opens land as tabs too.
 				if !Self.windowsAreAlreadyTabbed(main, window) {
 					main.addTabbedWindow(window, ordered: .above)
 				}
@@ -984,6 +1214,11 @@ struct ContentView: View {
 				if tryOpenFolderAsVault(seed) { return }
 				forceThumbnailLoading = false
 				library.scan(folder: seed)
+				return
+			}
+			if let storeName = initialSQLiteStoreName {
+				logger.log("launch sqlite restore: source=initial-sqlite-window store=\(storeName, privacy: .public)")
+				openSQLiteObjectStore(named: storeName)
 				return
 			}
 			// Defer work by a short amount; if responsiveness is still an
@@ -1019,6 +1254,9 @@ struct ContentView: View {
 				if let folderURL = registeredGalleryFolderURL, !WindowStateStore.shared.isAppTerminating() {
 					WindowStateStore.shared.recordClosedGalleryFolder(folderURL)
 				}
+				if let sqliteStoreName = registeredSQLiteStoreName, !WindowStateStore.shared.isAppTerminating() {
+					WindowStateStore.shared.recordClosedSQLiteStore(named: sqliteStoreName)
+				}
 			}
 		}
 		.onChange(of: library.photos) { _ in
@@ -1028,11 +1266,11 @@ struct ContentView: View {
 		.onChange(of: library.folderURL) { _ in updateTabRegistry() }
 		.onChange(of: sortModeRaw) { _ in scheduleSort() }
 		.onChange(of: searchText) { _ in scheduleSort() }
-		.onChange(of: PersonFilterState.shared.active) { active in
+		.onChange(of: personFilterState.active) { active in
 			applyPersonFilter(active)
 		}
 		.task {
-			applyPersonFilter(PersonFilterState.shared.active)
+			applyPersonFilter(personFilterState.active)
 		}
 		.sheet(isPresented: $showBookmarkManager) {
 			VStack(spacing: 12) {
@@ -1197,18 +1435,36 @@ struct ContentView: View {
 							editingResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
 							editProgressCount = 0
 							isApplyingKeywords = true
-							// Run writes sequentially in background so disk I/O is moderated.
 							Task.detached(priority: .utility) {
-								for u in urls {
-									if Task.isCancelled { break }
-									let ok = await Self.writeKeywords(to: u, keywords: parts)
-									await MainActor.run {
-										editingResults[u] = ok
-										editProgressCount += 1
-										if ok {
-											queueMetadataRefresh(for: u)
+								let workerCount = max(1, min(urls.count, PhotoLibrary.workerCount))
+								await withTaskGroup(of: (URL, Bool).self) { group in
+									var nextIndex = 0
+
+									func enqueueNext() {
+										guard nextIndex < urls.count else { return }
+										let url = urls[nextIndex]
+										nextIndex += 1
+										group.addTask {
+											if Task.isCancelled { return (url, false) }
+											let ok = await Self.writeKeywords(to: url, keywords: parts)
+											return (url, ok)
 										}
-										logger.log("writeKeywords: success=\(ok, privacy: .public)")
+									}
+
+									for _ in 0..<workerCount {
+										enqueueNext()
+									}
+
+									while let (url, ok) = await group.next() {
+										await MainActor.run {
+											editingResults[url] = ok
+											editProgressCount += 1
+											if ok {
+												queueMetadataRefresh(for: url)
+											}
+											logger.log("writeKeywords: success=\(ok, privacy: .public)")
+										}
+										enqueueNext()
 									}
 								}
 								await MainActor.run {
@@ -1383,6 +1639,17 @@ struct ContentView: View {
 		}
 		.onReceive(NotificationCenter.default.publisher(for: .galleryTabSyncImported)) { notification in
 			receiveSyncedFiles(notification)
+		}
+		.onReceive(NotificationCenter.default.publisher(for: .sqliteObjectStoreDidChange)) { notification in
+			guard isSQLiteObjectStoreView, !isVaultWorking else { return }
+			// Skip the reload on the tab that originated the change — its
+			// library.photos was already mutated in place by performSQLiteDelete
+			// / performSQLiteSync so a close-and-reopen would just churn the UI.
+			if let originator = notification.object as? UUID, originator == tabID {
+				return
+			}
+			let focusFilename = notification.userInfo?["filename"] as? String
+			refreshThumbnails(focusFilename: focusFilename)
 		}
 		.sheet(isPresented: $isVaultWorking) {
 			VStack(spacing: 12) {
@@ -1695,6 +1962,9 @@ struct ContentView: View {
 			}
 		} else if isRefreshing {
 			Text("Refreshing thumbnails…").foregroundStyle(.secondary)
+		} else if isSQLiteObjectStoreView {
+			Text("\(library.photos.count.formatted()) object\(library.photos.count == 1 ? "" : "s") in SQLite store")
+				.foregroundStyle(.secondary)
 		} else if let date = library.lastScanDate {
 			HStack(spacing: 6) {
 				Text("\(library.photos.count.formatted()) photo\(library.photos.count == 1 ? "" : "s")")
@@ -1740,8 +2010,15 @@ struct ContentView: View {
 		VStack(spacing: 0) {
 			personFilterBanner
 			Group {
-				if library.folderURL == nil {
+				if library.folderURL == nil && !isSQLiteObjectStoreView {
 					emptyState
+				} else if isSQLiteObjectStoreView && isVaultWorking && library.photos.isEmpty {
+					VStack(spacing: 12) {
+						ProgressView()
+						Text("Opening SQLite store...")
+							.foregroundStyle(.secondary)
+					}
+					.frame(maxWidth: .infinity, maxHeight: .infinity)
 				} else if library.isScanning && library.photos.isEmpty {
 					VStack(spacing: 12) {
 						ProgressView()
@@ -1751,20 +2028,57 @@ struct ContentView: View {
 					.frame(maxWidth: .infinity, maxHeight: .infinity)
 				} else if library.photos.isEmpty {
 					ContentUnavailableView(
-						"No Photos Found",
+						isSQLiteObjectStoreView ? "No Objects Found" : "No Photos Found",
 						systemImage: "photo.on.rectangle.angled",
-						description: Text("This folder doesn't contain any supported image files.")
+						description: Text(isSQLiteObjectStoreView ? "The SQLite object store does not contain any displayable objects." : "This folder doesn't contain any supported image files.")
 					)
 				} else {
 					photoGrid
 				}
 			}
 		}
+		.onDrop(of: [UTType.fileURL], isTargeted: nil) { providers in
+			guard isSQLiteObjectStoreView else { return false }
+			Task {
+				let urls = await Self.collectFileURLs(from: providers)
+				await MainActor.run {
+					guard !urls.isEmpty else { return }
+					performSQLiteSync(sourceURLs: urls, title: "Store Dropped Items in SQLite Store")
+				}
+			}
+			return true
+		}
+	}
+
+	private nonisolated static func collectFileURLs(from providers: [NSItemProvider]) async -> [URL] {
+		await withTaskGroup(of: URL?.self, returning: [URL].self) { group in
+			for provider in providers {
+				group.addTask {
+					await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+						_ = provider.loadObject(ofClass: URL.self) { url, _ in
+							if let url, url.isFileURL {
+								cont.resume(returning: url)
+							} else {
+								cont.resume(returning: nil)
+							}
+						}
+					}
+				}
+			}
+			var result: [URL] = []
+			var seen: Set<String> = []
+			for await url in group {
+				if let url, seen.insert(url.standardizedFileURL.path).inserted {
+					result.append(url)
+				}
+			}
+			return result
+		}
 	}
 
 	@ViewBuilder
 	private var personFilterBanner: some View {
-		if let active = PersonFilterState.shared.active {
+		if let active = personFilterState.active {
 			HStack(spacing: 8) {
 				Image(systemName: "person.crop.circle.fill")
 					.foregroundStyle(.tint)
@@ -1774,7 +2088,7 @@ struct ContentView: View {
 					.fontWeight(.semibold)
 				Spacer()
 				Button("Clear Filter") {
-					PersonFilterState.shared.clear()
+					personFilterState.clear()
 				}
 				.buttonStyle(.borderless)
 				.controlSize(.small)
@@ -1849,7 +2163,7 @@ struct ContentView: View {
 						handleThumbnailSingleClick(photo.url)
 					}
 					.onTapGesture(count: 2) {
-						openWindow(id: "photo-viewer", value: photo.url)
+						openPhotoViewer(photo.url)
 					}
 					.contextMenu {
 						let contextURLs = contextActionURLs(for: photo.url)
@@ -1896,6 +2210,7 @@ struct ContentView: View {
 							let dragURLs = contextActionURLs(for: startURL)
 							if beginSystemFileDrag(urls: dragURLs) {
 								suppressMarqueeDuringItemDrag = true
+								stopSelectionAutoScroll()
 								return
 							}
 						}
@@ -1906,10 +2221,12 @@ struct ContentView: View {
 					if suppressMarqueeDuringItemDrag { return }
 					selectionDragCurrent = value.location
 					updateDragSelection()
+					startSelectionAutoScrollIfNeeded()
 				}
 				.onEnded { _ in
 					if suppressMarqueeDuringItemDrag {
 						suppressMarqueeDuringItemDrag = false
+						stopSelectionAutoScroll()
 						return
 					}
 					updateDragSelection()
@@ -1917,6 +2234,7 @@ struct ContentView: View {
 					selectionDragCurrent = nil
 					selectionDragBase = []
 					selectionDragMode = .replace
+					stopSelectionAutoScroll()
 				}
 		)
 		.overlay(alignment: .topLeading) {
@@ -1950,6 +2268,16 @@ struct ContentView: View {
 			.background {
 				SelectAllKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) {
 					selectAllDisplayedPhotos()
+				}
+			}
+			.background {
+				GridArrowKeyboardShortcutView(isEnabled: !displayedPhotos.isEmpty) { direction in
+					moveGridSelection(in: direction)
+				}
+			}
+			.background {
+				ScrollViewAccessor { scrollView in
+					gridScrollView = scrollView
 				}
 			}
 		}
@@ -2028,7 +2356,7 @@ struct ContentView: View {
 					} else {
 						ForEach(bookmarkURLs, id: \.self) { url in
 							Button(url.lastPathComponent) {
-								openWindow(id: "folder", value: url)
+								openBookmarkedFolder(url)
 							}
 						}
 						Divider()
@@ -2061,7 +2389,7 @@ struct ContentView: View {
 				}) {
 					Text("Rescan Faces")
 				}
-				.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || FaceScanProgress.shared.isActive)
+				.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
 				.help("Rescan selected photos, or all loaded photos when none are selected")
 				if selectionMode {
 					Button(action: {
@@ -2182,6 +2510,14 @@ struct ContentView: View {
 		return Array(selectedItems)
 	}
 
+	private func selectedPhotoURLsInDisplayOrder() -> [URL] {
+		let orderedURLs = displayedPhotos.map(\.url)
+		let orderIndex = Dictionary(uniqueKeysWithValues: orderedURLs.enumerated().map { ($1, $0) })
+		return selectedPhotoURLs.sorted {
+			(orderIndex[$0] ?? Int.max) < (orderIndex[$1] ?? Int.max)
+		}
+	}
+
 	private func isPhotoSelected(_ url: URL) -> Bool {
 		if isAllDisplayedSelectionActive {
 			return !deselectedItemsFromAll.contains(url)
@@ -2191,6 +2527,12 @@ struct ContentView: View {
 
 	private func clearSelection() {
 		selectedItems.removeAll()
+		deselectedItemsFromAll.removeAll()
+		isAllDisplayedSelectionActive = false
+	}
+
+	private func selectSinglePhoto(_ url: URL) {
+		selectedItems = [url]
 		deselectedItemsFromAll.removeAll()
 		isAllDisplayedSelectionActive = false
 	}
@@ -2220,6 +2562,119 @@ struct ContentView: View {
 	private var faceActionTargetURLs: [URL] {
 		if hasSelectedPhotos { return selectedPhotoURLs }
 		return library.photos.map { $0.url }
+	}
+
+	private func openPhotoViewer(_ url: URL) {
+		PhotoNavigationContext.shared.update(urls: displayedPhotos.map(\.url))
+		openWindow(id: "photo-viewer", value: url)
+	}
+
+	private func thumbnailColumnCount() -> Int {
+		let sortedFrames = displayedPhotos.compactMap { photo -> (url: URL, frame: CGRect)? in
+			guard let frame = thumbnailFrames[photo.url] else { return nil }
+			return (photo.url, frame)
+		}
+		guard let first = sortedFrames.min(by: {
+			if abs($0.frame.minY - $1.frame.minY) > 0.5 {
+				return $0.frame.minY < $1.frame.minY
+			}
+			return $0.frame.minX < $1.frame.minX
+		}) else {
+			return 1
+		}
+		let rowY = first.frame.minY
+		let threshold: CGFloat = 1
+		let count = sortedFrames.filter { abs($0.frame.minY - rowY) < threshold }.count
+		return max(1, count)
+	}
+
+	private func moveGridSelection(in direction: GridNavigationDirection) {
+		guard !displayedPhotos.isEmpty else { return }
+		guard !isAllDisplayedSelectionActive else { return }
+
+		let orderedPhotos = displayedPhotos.map(\.url)
+		let orderedSelection = selectedPhotoURLsInDisplayOrder()
+		guard orderedSelection.count <= 1 else { return }
+
+		guard let currentURL = orderedSelection.first else {
+			guard let firstURL = orderedPhotos.first else { return }
+			selectSinglePhoto(firstURL)
+			return
+		}
+
+		guard let currentIndex = orderedPhotos.firstIndex(of: currentURL) else { return }
+
+		let nextIndex: Int?
+		switch direction {
+		case .left:
+			nextIndex = currentIndex > 0 ? currentIndex - 1 : nil
+		case .right:
+			nextIndex = currentIndex + 1 < orderedPhotos.count ? currentIndex + 1 : nil
+		case .up:
+			let step = thumbnailColumnCount()
+			nextIndex = currentIndex >= step ? currentIndex - step : nil
+		case .down:
+			let step = thumbnailColumnCount()
+			nextIndex = currentIndex + step < orderedPhotos.count ? currentIndex + step : nil
+		}
+
+		guard let nextIndex, orderedPhotos.indices.contains(nextIndex) else { return }
+		let targetURL = orderedPhotos[nextIndex]
+
+		selectSinglePhoto(targetURL)
+	}
+
+	private func startSelectionAutoScrollIfNeeded() {
+		guard selectionAutoScrollTask == nil else { return }
+		selectionAutoScrollTask = Task { @MainActor in
+			defer { selectionAutoScrollTask = nil }
+			while !Task.isCancelled {
+				guard selectionDragStart != nil,
+					  selectionDragCurrent != nil,
+					  !suppressMarqueeDuringItemDrag
+				else {
+					break
+				}
+
+				guard let scrollView = gridScrollView,
+					  let documentView = scrollView.documentView,
+					  let dragPoint = selectionDragCurrent
+				else {
+					try? await Task.sleep(nanoseconds: 30_000_000)
+					continue
+				}
+
+				let visibleRect = scrollView.contentView.bounds
+				let edgeThreshold: CGFloat = 80
+				let maxStep: CGFloat = 36
+				var deltaY: CGFloat = 0
+
+				if dragPoint.y > visibleRect.maxY - edgeThreshold {
+					let distance = min(edgeThreshold, dragPoint.y - (visibleRect.maxY - edgeThreshold))
+					deltaY = maxStep * (distance / edgeThreshold)
+				} else if dragPoint.y < visibleRect.minY + edgeThreshold {
+					let distance = min(edgeThreshold, (visibleRect.minY + edgeThreshold) - dragPoint.y)
+					deltaY = -maxStep * (distance / edgeThreshold)
+				}
+
+				if deltaY != 0 {
+					let maxOriginY = max(0, documentView.bounds.height - visibleRect.height)
+					let nextOriginY = min(max(0, visibleRect.origin.y + deltaY), maxOriginY)
+					if nextOriginY != visibleRect.origin.y {
+						scrollView.contentView.bounds.origin.y = nextOriginY
+						scrollView.reflectScrolledClipView(scrollView.contentView)
+						updateDragSelection()
+					}
+				}
+
+				try? await Task.sleep(nanoseconds: 30_000_000)
+			}
+		}
+	}
+
+	private func stopSelectionAutoScroll() {
+		selectionAutoScrollTask?.cancel()
+		selectionAutoScrollTask = nil
 	}
 
 	private func selectAllDisplayedPhotos() {
@@ -2287,12 +2742,39 @@ struct ContentView: View {
 		selectionDragBase = []
 		selectionDragMode = .replace
 		suppressMarqueeDuringItemDrag = false
-		guard selectionMode else {
+		let modifierMode = marqueeSelectionModeForCurrentModifiers()
+		if !selectionMode && modifierMode == .replace {
 			selectedItems = [url]
 			deselectedItemsFromAll.removeAll()
 			isAllDisplayedSelectionActive = false
 			return
 		}
+
+		switch modifierMode {
+		case .replace where selectionMode:
+			toggleSinglePhotoSelection(url)
+		case .replace:
+			selectedItems = [url]
+			deselectedItemsFromAll.removeAll()
+			isAllDisplayedSelectionActive = false
+		case .add:
+			addSinglePhotoSelection(url)
+		case .subtract:
+			removeFromSelection(url)
+		case .toggle:
+			toggleSinglePhotoSelection(url)
+		}
+	}
+
+	private func addSinglePhotoSelection(_ url: URL) {
+		if isAllDisplayedSelectionActive {
+			deselectedItemsFromAll.remove(url)
+		} else {
+			selectedItems.insert(url)
+		}
+	}
+
+	private func toggleSinglePhotoSelection(_ url: URL) {
 		if isAllDisplayedSelectionActive {
 			if deselectedItemsFromAll.contains(url) {
 				deselectedItemsFromAll.remove(url)
@@ -2449,10 +2931,18 @@ struct ContentView: View {
 		   let previousURL = registeredGalleryFolderURL {
 			WindowStateStore.shared.recordClosedGalleryFolder(previousURL)
 		}
+		let currentSQLiteStoreName = isSQLiteObjectStoreView ? SQLiteObjectStore.configuredStoreName : nil
+		if registeredSQLiteStoreName != currentSQLiteStoreName,
+		   let previousSQLiteStoreName = registeredSQLiteStoreName {
+			WindowStateStore.shared.recordClosedSQLiteStore(named: previousSQLiteStoreName)
+		}
 		if let folderURL = library.folderURL {
 			WindowStateStore.shared.recordOpenGalleryFolder(folderURL)
+		} else if let currentSQLiteStoreName {
+			WindowStateStore.shared.recordOpenSQLiteStore(named: currentSQLiteStoreName)
 		}
 		registeredGalleryFolderURL = library.folderURL
+		registeredSQLiteStoreName = currentSQLiteStoreName
 		Task { @MainActor in
 			GalleryTabRegistry.shared.update(snapshot)
 		}
@@ -2508,6 +2998,261 @@ struct ContentView: View {
 		} else {
 			syncFilesToFolder(syncURLs, target: target)
 		}
+	}
+
+	private func syncCurrentTabToSQLiteStore() {
+		performSQLiteSync(sourceURLs: library.photos.map(\.url), title: "Sync Tab to SQLite Store")
+	}
+
+	private func syncSelectedMediaToSQLiteStore() {
+		performSQLiteSync(sourceURLs: selectedPhotoURLs, title: "Store Selected in SQLite Store")
+	}
+
+	private func performSQLiteSync(sourceURLs: [URL], title: String) {
+		guard SQLiteObjectStore.configuredDirectoryPath != nil else {
+			vaultAlertMessage = "Create or open a SQLite store before syncing."
+			showVaultAlert = true
+			return
+		}
+		guard !sourceURLs.isEmpty else { return }
+		let databaseFilename = SQLiteObjectStore.configuredDatabaseFilename
+		let workers = max(1, min(sourceURLs.count, PhotoLibrary.workerCount))
+
+		let alert = NSAlert()
+		alert.messageText = title
+		alert.informativeText = "Sync \(sourceURLs.count) object\(sourceURLs.count == 1 ? "" : "s") to \(databaseFilename) using up to \(workers) worker\(workers == 1 ? "" : "s")."
+		alert.addButton(withTitle: "Sync")
+		alert.addButton(withTitle: "Cancel")
+		guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+		isVaultWorking = true
+		vaultProgressMessage = "Syncing to \(databaseFilename)..."
+		vaultProgressCompleted = 0
+		vaultProgressTotal = sourceURLs.count
+		vaultStoreTask?.cancel()
+		let task = Task.detached(priority: .userInitiated) {
+			enum SQLiteSyncResult {
+				case stored
+				case skippedCancelled
+				case failed
+			}
+
+			var failedCount = 0
+			var completedCount = 0
+			var storedCount = 0
+			var cancelledBeforeStartCount = 0
+
+			await withTaskGroup(of: SQLiteSyncResult.self) { group in
+				var nextIndex = 0
+
+				func startTask(at index: Int) {
+					let url = sourceURLs[index]
+					group.addTask {
+						if Task.isCancelled { return .skippedCancelled }
+						do {
+							let started = url.startAccessingSecurityScopedResource()
+							defer { if started { url.stopAccessingSecurityScopedResource() } }
+							let data = try Data(contentsOf: url)
+							try Task.checkCancellation()
+							let contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+							let contentType = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
+								?? UTType(filenameExtension: url.pathExtension)?.identifier
+							try await SQLiteObjectStore.shared.storeObjectDataThrowing(
+								data,
+								originalURL: url,
+								contentHash: contentHash,
+								contentTypeIdentifier: contentType
+							)
+							return .stored
+						} catch is CancellationError {
+							return .skippedCancelled
+						} catch {
+							logger.error("sqlite sync: failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+							return .failed
+						}
+					}
+				}
+
+				for _ in 0..<workers {
+					startTask(at: nextIndex)
+					nextIndex += 1
+				}
+
+				while let result = await group.next() {
+					switch result {
+					case .stored:
+						storedCount += 1
+						completedCount += 1
+					case .failed:
+						failedCount += 1
+						completedCount += 1
+					case .skippedCancelled:
+						cancelledBeforeStartCount += 1
+					}
+					let processedCount = completedCount + cancelledBeforeStartCount
+					if processedCount == sourceURLs.count || processedCount % 128 == 0 {
+						let completed = processedCount
+						await MainActor.run {
+							vaultProgressCompleted = completed
+							vaultProgressTotal = sourceURLs.count
+						}
+					}
+					if Task.isCancelled {
+						group.cancelAll()
+						continue
+					}
+					if nextIndex < sourceURLs.count {
+						startTask(at: nextIndex)
+						nextIndex += 1
+					}
+				}
+			}
+			let wasCancelled = Task.isCancelled
+			let finalFailedCount = failedCount
+			let finalStoredCount = storedCount
+			let finalProcessedCount = completedCount
+			let finalSkippedCount = cancelledBeforeStartCount
+			await MainActor.run {
+				isVaultWorking = false
+				vaultStoreTask = nil
+				vaultAlertMessage = sqliteSyncSummary(
+					stored: finalStoredCount,
+					processed: finalProcessedCount,
+					requested: sourceURLs.count,
+					failed: finalFailedCount,
+					skipped: finalSkippedCount,
+					cancelled: wasCancelled,
+					databaseFilename: databaseFilename
+				)
+				showVaultAlert = true
+				if finalStoredCount > 0 {
+					NotificationCenter.default.post(name: .sqliteObjectStoreDidChange, object: tabID)
+				}
+			}
+		}
+		vaultStoreTask = task
+	}
+
+	private func sqliteSyncSummary(
+		stored: Int,
+		processed: Int,
+		requested: Int,
+		failed: Int,
+		skipped: Int,
+		cancelled: Bool,
+		databaseFilename: String
+	) -> String {
+		var pieces: [String] = []
+		let objectSuffix = requested == 1 ? "" : "s"
+		if cancelled {
+			pieces.append("Cancelled.")
+		}
+		pieces.append("Synced \(stored) of \(requested) object\(objectSuffix) to \(databaseFilename).")
+		if processed != requested {
+			pieces.append("Processed \(processed) before cancellation.")
+		}
+		if skipped > 0 {
+			pieces.append("\(skipped) object\(skipped == 1 ? " was" : "s were") not started.")
+		}
+		if failed > 0 {
+			pieces.append("\(failed) object\(failed == 1 ? " failed" : "s failed").")
+		}
+		return pieces.joined(separator: " ")
+	}
+
+	private func chooseAndOpenSQLiteObjectStore() {
+		let panel = NSOpenPanel()
+		panel.canChooseFiles = true
+		panel.canChooseDirectories = false
+		panel.allowsMultipleSelection = false
+		panel.allowedContentTypes = Self.sqliteStoreContentTypes
+		panel.message = "Choose a SQLite object-store database"
+		panel.prompt = "Open"
+		guard panel.runModal() == .OK, let url = panel.url else { return }
+		openSQLiteObjectStore(fileURL: url)
+	}
+
+	private func openSQLiteObjectStore(fileURL: URL) {
+		Task {
+			do {
+				try await SQLiteObjectStore.shared.setDatabaseFile(fileURL)
+				await MainActor.run {
+					openWindow(id: "sqlite-store", value: fileURL.lastPathComponent)
+				}
+			} catch {
+				await MainActor.run {
+					vaultAlertMessage = "Could not open SQLite store: \(error.localizedDescription)"
+					showVaultAlert = true
+				}
+			}
+		}
+	}
+
+	private func openSQLiteObjectStore(named storeName: String? = nil) {
+		if let storeName {
+			let trimmed = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+			if !trimmed.isEmpty {
+				UserDefaults.standard.set(trimmed, forKey: SQLiteObjectStore.storeNameKey)
+			}
+		}
+		guard SQLiteObjectStore.configuredDirectoryPath != nil else {
+			vaultAlertMessage = "Choose a SQLite store file before opening it."
+			showVaultAlert = true
+			return
+		}
+
+		isVaultWorking = true
+		vaultProgressMessage = "Opening SQLite store..."
+		vaultProgressCompleted = 0
+		vaultProgressTotal = 0
+		library.photos = []
+		displayedPhotos = []
+		library.folderURL = nil
+		isSQLiteObjectStoreView = true
+		activeFolderNames = [SQLiteObjectStore.configuredStoreName]
+		WindowStateStore.shared.recordOpenSQLiteStore(named: SQLiteObjectStore.configuredStoreName)
+		selectedItems.removeAll()
+		deselectedItemsFromAll.removeAll()
+		vaultStoreTask?.cancel()
+
+		let task = Task.detached(priority: .userInitiated) {
+			do {
+				let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles { completed, total, batch in
+					await MainActor.run {
+						let batchPhotos = batch.map { PhotoItem(url: $0) }
+						library.photos.append(contentsOf: batchPhotos)
+						displayedPhotos.append(contentsOf: batchPhotos)
+						vaultProgressCompleted = completed
+						vaultProgressTotal = total
+						lastRefreshDate = Date()
+						forceThumbnailLoading = true
+					}
+				}
+				await MainActor.run {
+					library.photos = urls.map { PhotoItem(url: $0) }
+					library.folderURL = nil
+					activeFolderNames = ["\(SQLiteObjectStore.configuredStoreName) (SQLite)"]
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultProgressCompleted = urls.count
+					vaultProgressTotal = urls.count
+					lastRefreshDate = Date()
+					forceThumbnailLoading = true
+					refreshToken = UUID()
+					scheduleSort()
+					logger.log("sqlite object store: opened filename=\(SQLiteObjectStore.configuredDatabaseFilename, privacy: .public) objects=\(urls.count, privacy: .public)")
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = "Could not open SQLite object store: \(error.localizedDescription)"
+					showVaultAlert = true
+					logger.error("sqlite object store: open failed error=\(error.localizedDescription, privacy: .public)")
+				}
+			}
+		}
+		vaultStoreTask = task
 	}
 
 	private func syncFilesToFolder(_ sourceURLs: [URL], target: GalleryTabSnapshot) {
@@ -2698,21 +3443,36 @@ struct ContentView: View {
 	/// stop security-scoped access for it. The legacy single-bookmark key is
 	/// kept in sync with the first remaining entry.
 	private func deleteBookmark(_ url: URL) {
-		guard let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data] else { return }
-		let remaining: [Data] = arr.compactMap { data in
-			var stale = false
-			if let resolved = try? URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale) {
-				return resolved == url ? nil : data
+		let urlPath = url.standardizedFileURL.path
+		let filterBookmarks: ([Data]) -> [Data] = { bookmarks in
+			bookmarks.compactMap { data in
+				var stale = false
+				if let resolved = try? URL(resolvingBookmarkData: data, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale) {
+					return resolved.standardizedFileURL.path == urlPath ? nil : data
+				}
+				return data
 			}
-			// Keep entries we can't resolve so we don't silently drop user data.
-			return data
 		}
+
+		let known = UserDefaults.standard.array(forKey: Self.kKnownFolderBookmarks) as? [Data] ?? []
+		UserDefaults.standard.set(filterBookmarks(known), forKey: Self.kKnownFolderBookmarks)
+
+		let last = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data] ?? []
+		let remaining = filterBookmarks(last)
 		UserDefaults.standard.set(remaining, forKey: Self.kLastFolderBookmarks)
-		if let first = remaining.first {
-			UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
-		} else {
-			UserDefaults.standard.removeObject(forKey: Self.kLastFolderBookmark)
+
+		if let legacy = UserDefaults.standard.data(forKey: Self.kLastFolderBookmark) {
+			var stale = false
+			if let resolved = try? URL(resolvingBookmarkData: legacy, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale),
+			   resolved.standardizedFileURL.path == urlPath {
+				if let first = remaining.first {
+					UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
+				} else {
+					UserDefaults.standard.removeObject(forKey: Self.kLastFolderBookmark)
+				}
+			}
 		}
+
 		url.stopAccessingSecurityScopedResource()
 		Self.activeSecurityScopedURLs.removeAll { $0 == url }
 		reloadBookmarks()
@@ -2721,40 +3481,110 @@ struct ContentView: View {
 	/// Resolve persisted folder bookmarks and start security-scoped access
 	/// for each. Populates `bookmarkURLs` for the toolbar dropdown.
 	private func reloadBookmarks() {
-		guard let arr = UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data], !arr.isEmpty else {
-			bookmarkURLs = []
-			return
-		}
 		var resolved: [URL] = []
 		var seenPaths: Set<String> = []
 		var resolvedData: [Data] = []
-		for bm in arr {
+
+		func addBookmarkData(_ bookmarkData: Data) {
 			var stale = false
 			do {
-				let url = try URL(resolvingBookmarkData: bm, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
-				if url.startAccessingSecurityScopedResource() {
-					if !Self.activeSecurityScopedURLs.contains(url) {
-						Self.activeSecurityScopedURLs.append(url)
-					}
+				let url = try URL(resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &stale)
+				if url.startAccessingSecurityScopedResource(), !Self.activeSecurityScopedURLs.contains(url) {
+					Self.activeSecurityScopedURLs.append(url)
 				}
-				if seenPaths.insert(url.path).inserted {
-					resolved.append(url)
-					resolvedData.append(bm)
+				let path = url.standardizedFileURL.path
+				guard seenPaths.insert(path).inserted else { return }
+				resolved.append(url)
+				if stale,
+				   let refreshed = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+					resolvedData.append(refreshed)
+				} else {
+					resolvedData.append(bookmarkData)
 				}
 			} catch {
 				logger.error("reloadBookmarks: failed to resolve bookmark: \(error.localizedDescription, privacy: .public)")
 			}
 		}
-		if resolvedData.count != arr.count {
-			logger.log("bookmark reload: removed duplicate bookmark entries originalCount=\(arr.count, privacy: .public) uniqueCount=\(resolvedData.count, privacy: .public)")
-			UserDefaults.standard.set(resolvedData, forKey: Self.kLastFolderBookmarks)
-			if let first = resolvedData.first {
-				UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
-			} else {
-				UserDefaults.standard.removeObject(forKey: Self.kLastFolderBookmark)
+
+		func addURL(_ url: URL) {
+			let path = url.standardizedFileURL.path
+			guard seenPaths.insert(path).inserted else { return }
+			if url.startAccessingSecurityScopedResource(), !Self.activeSecurityScopedURLs.contains(url) {
+				Self.activeSecurityScopedURLs.append(url)
+			}
+			do {
+				let bookmarkData = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+				resolved.append(url)
+				resolvedData.append(bookmarkData)
+			} catch {
+				logger.error("reloadBookmarks: failed to refresh known bookmark: \(error.localizedDescription, privacy: .public)")
 			}
 		}
+
+		for bookmarkData in UserDefaults.standard.array(forKey: Self.kKnownFolderBookmarks) as? [Data] ?? [] {
+			addBookmarkData(bookmarkData)
+		}
+		for bookmarkData in UserDefaults.standard.array(forKey: Self.kLastFolderBookmarks) as? [Data] ?? [] {
+			addBookmarkData(bookmarkData)
+		}
+		if let legacy = UserDefaults.standard.data(forKey: Self.kLastFolderBookmark) {
+			addBookmarkData(legacy)
+		}
+		for url in WindowStateStore.shared.openGalleryFolderURLs() {
+			addURL(url)
+		}
+
+		UserDefaults.standard.set(resolvedData, forKey: Self.kKnownFolderBookmarks)
 		bookmarkURLs = resolved
+	}
+
+	private func rememberKnownBookmarks(_ urls: [URL]) {
+		var bookmarks = UserDefaults.standard.array(forKey: Self.kKnownFolderBookmarks) as? [Data] ?? []
+		var knownPaths = Set(bookmarkURLs.map { $0.standardizedFileURL.path })
+		for url in urls {
+			let path = url.standardizedFileURL.path
+			guard knownPaths.insert(path).inserted else { continue }
+			do {
+				let bookmark = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+				bookmarks.append(bookmark)
+			} catch {
+				logger.error("rememberKnownBookmarks: failed to create bookmark: \(error.localizedDescription, privacy: .public)")
+			}
+		}
+		UserDefaults.standard.set(bookmarks, forKey: Self.kKnownFolderBookmarks)
+	}
+
+	private func openBookmarkedFolder(_ url: URL) {
+		guard !GalleryTabRegistry.shared.containsBookmarkName(url.lastPathComponent) else {
+			vaultAlertMessage = "\(url.lastPathComponent) is already open in this window."
+			showVaultAlert = true
+			return
+		}
+		openWindow(id: "folder", value: url)
+	}
+
+	private func filterAlreadyOpenBookmarkNames(_ urls: [URL]) -> [URL] {
+		var namesInSelection: Set<String> = []
+		var skippedNames: [String] = []
+		let filtered = urls.filter { url in
+			let name = url.lastPathComponent
+			let key = Self.normalizedBookmarkOpenName(name)
+			guard namesInSelection.insert(key).inserted else {
+				skippedNames.append(name)
+				return false
+			}
+			if GalleryTabRegistry.shared.containsBookmarkName(name) {
+				skippedNames.append(name)
+				return false
+			}
+			return true
+		}
+		if !skippedNames.isEmpty {
+			let uniqueNames = Array(Set(skippedNames)).sorted()
+			vaultAlertMessage = "Already open: \(uniqueNames.joined(separator: ", "))"
+			showVaultAlert = true
+		}
+		return filtered
 	}
 
 	private func promptForVaultImportOptions(itemCount: Int, title: String, itemName: String = "photo") -> VaultImportOptions? {
@@ -3040,6 +3870,25 @@ struct ContentView: View {
 		return pieces.joined(separator: " ")
 	}
 
+	private func newItem() {
+		let alert = NSAlert()
+		alert.messageText = "New"
+		alert.informativeText = "Choose the type to create."
+		alert.addButton(withTitle: "Continue")
+		alert.addButton(withTitle: "Cancel")
+
+		let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26), pullsDown: false)
+		popup.addItems(withTitles: ["Vault", "SQLite Store"])
+		alert.accessoryView = popup
+
+		guard alert.runModal() == .alertFirstButtonReturn else { return }
+		if popup.indexOfSelectedItem == 1 {
+			newSQLiteStore()
+		} else {
+			newVault()
+		}
+	}
+
 	private func newVault() {
 		let panel = NSOpenPanel()
 		panel.canChooseFiles = false
@@ -3064,6 +3913,30 @@ struct ContentView: View {
 		}
 	}
 
+	private func newSQLiteStore() {
+		let panel = NSSavePanel()
+		panel.allowedContentTypes = Self.sqliteStoreContentTypes
+		panel.canCreateDirectories = true
+		panel.nameFieldStringValue = SQLiteObjectStore.configuredDatabaseFilename
+		panel.message = "Choose where to create the SQLite object store"
+		panel.prompt = "Create"
+		guard panel.runModal() == .OK, let url = panel.url else { return }
+
+		Task {
+			do {
+				try await SQLiteObjectStore.shared.createDatabaseFile(url)
+				await MainActor.run {
+					openWindow(id: "sqlite-store", value: url.lastPathComponent)
+				}
+			} catch {
+				await MainActor.run {
+					vaultAlertMessage = "Could not create SQLite store: \(error.localizedDescription)"
+					showVaultAlert = true
+				}
+			}
+		}
+	}
+
 	private func chooseAndOpenVault() {
 		let panel = NSOpenPanel()
 		panel.canChooseFiles = false
@@ -3080,6 +3953,19 @@ struct ContentView: View {
 	}
 
 	private func closeVault() {
+		if isSQLiteObjectStoreView {
+			let storeName = SQLiteObjectStore.configuredStoreName
+			WindowStateStore.shared.recordClosedSQLiteStore(named: storeName)
+			isSQLiteObjectStoreView = false
+			library.photos = []
+			displayedPhotos = []
+			library.folderURL = nil
+			activeFolderNames = []
+			registeredSQLiteStoreName = nil
+			clearSelection()
+			refreshToken = UUID()
+			return
+		}
 		Task {
 			await PhotoVault.shared.lock()
 			await refreshVaultStatus()
@@ -3312,6 +4198,7 @@ struct ContentView: View {
 	private func tryOpenFolderAsVault(_ folder: URL) -> Bool {
 		guard Self.folderContainsEncryptedFiles(folder) else { return false }
 		logger.log("vault auto-open: folder=\(folder.path, privacy: .public) contains encrypted files; switching to vault flow")
+		isSQLiteObjectStoreView = false
 		library.photos = []
 		displayedPhotos = []
 		library.folderURL = folder
@@ -3439,6 +4326,7 @@ struct ContentView: View {
 	}
 
 	private func openVault() {
+		isSQLiteObjectStoreView = false
 		isVaultWorking = true
 		vaultProgressMessage = "Opening vault..."
 		vaultProgressCompleted = 0
@@ -3527,10 +4415,11 @@ struct ContentView: View {
 
 	private func chooseFolder() {
 		let panel = NSOpenPanel()
-		panel.canChooseFiles = false
+		panel.canChooseFiles = true
 		panel.canChooseDirectories = true
 		panel.allowsMultipleSelection = true
-		panel.message = "Choose one or more folders containing photos"
+		panel.allowedContentTypes = Self.sqliteStoreContentTypes
+		panel.message = "Choose one or more folders containing photos, or a SQLite object-store database"
 		panel.prompt = "Choose"
 		if panel.runModal() == .OK {
 			var urls: [URL] = []
@@ -3539,6 +4428,19 @@ struct ContentView: View {
 				urls.append(url)
 			}
 			guard !urls.isEmpty else { return }
+			let sqliteURLs = urls.filter { Self.isSQLiteStoreFile($0) }
+			if let sqliteURL = sqliteURLs.first {
+				if urls.count > 1 {
+					vaultAlertMessage = "Open one SQLite store at a time."
+					showVaultAlert = true
+					return
+				}
+				openSQLiteObjectStore(fileURL: sqliteURL)
+				return
+			}
+			urls = filterAlreadyOpenBookmarkNames(urls)
+			guard !urls.isEmpty else { return }
+			isSQLiteObjectStoreView = false
 
 			// Create bookmarks for each selected folder and persist them as
 			// an array so we can restore multiple folders at next launch.
@@ -3557,6 +4459,7 @@ struct ContentView: View {
 				if let first = bookmarkDatas.first {
 					UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
 				}
+				rememberKnownBookmarks(urls)
 				reloadBookmarks()
 			}
 
@@ -3658,8 +4561,9 @@ struct ContentView: View {
 		}
 	}
 
-	private func refreshThumbnails() {
-		guard let folder = library.folderURL else { return }
+	private func refreshThumbnails(focusFilename: String? = nil) {
+		let refreshFolderURL = library.folderURL
+		guard refreshFolderURL != nil || isSQLiteObjectStoreView || isActiveVaultView else { return }
 		isRefreshing = true
 		let start = Date()
 		Task {
@@ -3667,6 +4571,11 @@ struct ContentView: View {
 				await ThumbnailCache.shared.clear()
 			}
 			_ = await clear.value
+
+			if isSQLiteObjectStoreView {
+				await reloadSQLiteObjectStoreContents(start: start, focusFilename: focusFilename)
+				return
+			}
 
 			if isActiveVaultView {
 				do {
@@ -3703,12 +4612,75 @@ struct ContentView: View {
 			}
 
 			// Trigger a fresh filesystem scan so newly added files appear in the grid.
+			guard let refreshFolderURL else {
+				isRefreshing = false
+				return
+			}
 			forceThumbnailLoading = false
-			library.scan(folder: folder)
+			library.scan(folder: refreshFolderURL)
 			lastRefreshDuration = Date().timeIntervalSince(start)
 			lastRefreshDate = Date()
 			isRefreshing = false
 			refreshToken = UUID()
+		}
+	}
+
+	private func reloadSQLiteObjectStoreContents(start: Date, focusFilename: String? = nil) async {
+		await MainActor.run {
+			isVaultWorking = true
+			vaultProgressMessage = "Refreshing SQLite store..."
+			vaultProgressCompleted = 0
+			vaultProgressTotal = 0
+			vaultStoreTask?.cancel()
+		}
+		do {
+			let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles { completed, total, batch in
+				await MainActor.run {
+					let batchPhotos = batch.map { PhotoItem(url: $0) }
+					library.photos.append(contentsOf: batchPhotos)
+					displayedPhotos.append(contentsOf: batchPhotos)
+					vaultProgressCompleted = completed
+					vaultProgressTotal = total
+					lastRefreshDate = Date()
+					forceThumbnailLoading = true
+				}
+			}
+			await MainActor.run {
+				library.photos = urls.map { PhotoItem(url: $0) }
+				library.folderURL = nil
+				activeFolderNames = ["\(SQLiteObjectStore.configuredStoreName) (SQLite)"]
+				isVaultWorking = false
+				vaultStoreTask = nil
+				vaultProgressCompleted = urls.count
+				vaultProgressTotal = urls.count
+				lastRefreshDate = Date()
+				lastRefreshDuration = Date().timeIntervalSince(start)
+				forceThumbnailLoading = true
+				refreshToken = UUID()
+				if let focusFilename {
+					pendingSQLiteFocusFilename = focusFilename
+				} else {
+					clearSelection()
+				}
+				scheduleSort()
+				focusPendingSQLiteObjectIfPossible()
+				logger.log("sqlite object store: refreshed filename=\(SQLiteObjectStore.configuredDatabaseFilename, privacy: .public) objects=\(urls.count, privacy: .public)")
+			}
+		} catch {
+			await MainActor.run {
+				isVaultWorking = false
+				vaultStoreTask = nil
+				vaultAlertMessage = "Could not refresh SQLite object store: \(error.localizedDescription)"
+				showVaultAlert = true
+				logger.error("sqlite object store: refresh failed error=\(error.localizedDescription, privacy: .public)")
+			}
+		}
+		await MainActor.run {
+			lastRefreshDuration = Date().timeIntervalSince(start)
+			lastRefreshDate = Date()
+			isRefreshing = false
+			refreshToken = UUID()
+			focusPendingSQLiteObjectIfPossible()
 		}
 	}
 
@@ -3721,6 +4693,10 @@ struct ContentView: View {
 	}
 
 	private func performDelete(urls: [URL]) {
+		if isSQLiteObjectStoreView {
+			performSQLiteDelete(urls: urls)
+			return
+		}
 		deleteResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
 		deleteErrorMessages = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as String?) })
 		deleteProgressCount = 0
@@ -3793,6 +4769,70 @@ struct ContentView: View {
 				// clear deletingURLs when done
 				deletingURLs = []
 				isDeleting = false
+			}
+		}
+	}
+
+	/// Deletes the supplied items from the SQLite object-store database only.
+	/// The matching working file in the temporary directory is removed (it's
+	/// a transient cache) but the *original* imported source on disk — the
+	/// file the user picked when they synced into the store — is never
+	/// touched. We just drop the row from the `objects` table.
+	private func performSQLiteDelete(urls: [URL]) {
+		guard !urls.isEmpty else { return }
+		deleteResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
+		deleteErrorMessages = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as String?) })
+		deleteProgressCount = 0
+		isDeleting = true
+		deletingURLs = urls
+		logger.log("performSQLiteDelete: removing \(urls.count) records from SQLite store")
+		Task.detached(priority: .utility) {
+			var deletedCount = 0
+			var failureMessage: String? = nil
+			do {
+				deletedCount = try await SQLiteObjectStore.shared.deleteObjects(at: urls)
+			} catch {
+				failureMessage = error.localizedDescription
+				await MainActor.run {
+					self.logger.error("performSQLiteDelete: delete failed: \(error.localizedDescription, privacy: .public)")
+				}
+			}
+			let fm = FileManager.default
+			for u in urls {
+				try? fm.removeItem(at: u)
+			}
+			await MainActor.run {
+				let succeeded = failureMessage == nil
+				for u in urls {
+					deleteResults[u] = succeeded
+					deleteErrorMessages[u] = failureMessage
+					deleteProgressCount += 1
+					if succeeded {
+						selectedItems.remove(u)
+						library.photos.removeAll { $0.url == u }
+						displayedPhotos.removeAll { $0.url == u }
+					}
+				}
+				var detailLines: [String] = []
+				let sorted = urls.sorted { $0.lastPathComponent < $1.lastPathComponent }
+				let successCount = succeeded ? urls.count : 0
+				let failureCount = succeeded ? 0 : urls.count
+				for u in sorted {
+					if succeeded {
+						detailLines.append("[OK] \(u.lastPathComponent)")
+					} else {
+						detailLines.append("[FAIL] \(u.lastPathComponent): \(failureMessage ?? "Unknown delete error.")")
+					}
+				}
+				deleteHadFailures = !succeeded
+				deleteErrorSummary = (["Requested: \(urls.count), Removed from SQLite: \(deletedCount), Failed: \(failureCount)"] + detailLines).joined(separator: "\n")
+				_ = successCount
+				showDeleteErrorSummary = true
+				deletingURLs = []
+				isDeleting = false
+				if deletedCount > 0 {
+					NotificationCenter.default.post(name: .sqliteObjectStoreDidChange, object: tabID)
+				}
 			}
 		}
 	}
@@ -3911,6 +4951,55 @@ struct ContentView: View {
 			if Task.isCancelled { return }
 			thumbnailFrames = pendingThumbnailFrames
 			thumbnailFrameTask = nil
+			focusPendingSQLiteObjectIfPossible()
+		}
+	}
+
+	private func focusPendingSQLiteObjectIfPossible() {
+		guard let filename = pendingSQLiteFocusFilename else { return }
+		guard let targetURL = displayedPhotos.first(where: { $0.url.lastPathComponent == filename })?.url
+				?? library.photos.first(where: { $0.url.lastPathComponent == filename })?.url else {
+			queuePendingSQLiteFocusRetry()
+			return
+		}
+
+		selectSinglePhoto(targetURL)
+		guard scrollGridToPhoto(targetURL) else {
+			queuePendingSQLiteFocusRetry()
+			return
+		}
+		pendingSQLiteFocusFilename = nil
+		pendingSQLiteFocusTask?.cancel()
+		pendingSQLiteFocusTask = nil
+	}
+
+	@discardableResult
+	private func scrollGridToPhoto(_ url: URL) -> Bool {
+		guard let scrollView = gridScrollView,
+			  let documentView = scrollView.documentView,
+			  let frame = thumbnailFrames[url] else {
+			return false
+		}
+
+		let visibleRect = scrollView.contentView.bounds
+		let documentBounds = documentView.bounds
+		let maxY = max(documentBounds.minY, documentBounds.maxY - visibleRect.height)
+		let centeredY = frame.midY - (visibleRect.height / 2)
+		let nextY = min(max(centeredY, documentBounds.minY), maxY)
+		let nextOrigin = NSPoint(x: visibleRect.origin.x, y: nextY)
+		scrollView.contentView.scroll(to: nextOrigin)
+		scrollView.reflectScrolledClipView(scrollView.contentView)
+		return true
+	}
+
+	private func queuePendingSQLiteFocusRetry() {
+		guard pendingSQLiteFocusTask == nil else { return }
+		pendingSQLiteFocusTask = Task { @MainActor in
+			try? await Task.sleep(nanoseconds: 50_000_000)
+			pendingSQLiteFocusTask = nil
+			if !Task.isCancelled {
+				focusPendingSQLiteObjectIfPossible()
+			}
 		}
 	}
 
@@ -4291,8 +5380,4 @@ struct ContentView: View {
 			logger.log("launch photo-window restore: result=skipped reason=disabled savedCount=\(saved.count, privacy: .public)")
 		}
 	}
-}
-
-#Preview {
-	ContentView()
 }

@@ -3,6 +3,8 @@ import AppKit
 
 struct PeopleView: View {
     @Environment(\.openWindow) private var openWindow
+    @StateObject private var faceScanProgress = FaceScanProgress.shared
+    @StateObject private var personFilterState = PersonFilterState.shared
     @State private var faces: [PublicFace] = []
     @State private var people: [Person] = []
     @State private var searchText: String = ""
@@ -39,7 +41,7 @@ struct PeopleView: View {
                     } label: {
                         Label("Rescan", systemImage: "arrow.clockwise")
                     }
-                    .disabled(FaceScanProgress.shared.isActive)
+                    .disabled(faceScanProgress.isActive)
                     .help("Re-group all detected faces into people")
                 }
             }
@@ -57,9 +59,7 @@ struct PeopleView: View {
                 await MainActor.run { people = list }
             }
         }
-        .overlay(alignment: .top) {
-            FaceScanProgressOverlay()
-        }
+        .overlay(alignment: .top) { FaceScanProgressOverlay() }
         .sheet(item: $selectedPerson) { person in
             PersonDetailView(person: person) {
                 Task.detached {
@@ -121,12 +121,12 @@ struct PeopleView: View {
 
     @ViewBuilder
     private func personButton(for person: Person) -> some View {
-        let isFiltered = PersonFilterState.shared.active?.personID == person.id
+        let isFiltered = personFilterState.active?.personID == person.id
         Button {
             if isFiltered {
-                PersonFilterState.shared.clear()
+                personFilterState.clear()
             } else {
-                PersonFilterState.shared.set(personID: person.id, name: person.name)
+                personFilterState.set(personID: person.id, name: person.name)
             }
         } label: {
             VStack(spacing: 8) {
@@ -149,11 +149,11 @@ struct PeopleView: View {
             }
             if isFiltered {
                 Button("Clear Filter") {
-                    PersonFilterState.shared.clear()
+                    personFilterState.clear()
                 }
             } else {
                 Button("Filter Gallery") {
-                    PersonFilterState.shared.set(personID: person.id, name: person.name)
+                    personFilterState.set(personID: person.id, name: person.name)
                 }
             }
         }
@@ -168,20 +168,20 @@ struct PeopleView: View {
     }
 
     private func rescanFaces() {
-        guard !FaceScanProgress.shared.isActive else { return }
+        guard !faceScanProgress.isActive else { return }
         let clusterTask = Task.detached {
             _ = await FaceProcessor.shared.clusterFaces { completed, total, status in
                 Task { @MainActor in
-                    FaceScanProgress.shared.update(completed: completed, total: total, status: status)
+                    faceScanProgress.update(completed: completed, total: total, status: status)
                 }
             }
             let list = await FaceProcessor.shared.allPeople()
             await MainActor.run {
                 people = list
-                FaceScanProgress.shared.end()
+                faceScanProgress.end()
             }
         }
-        FaceScanProgress.shared.begin(title: "Grouping faces", total: 1) {
+        faceScanProgress.begin(title: "Grouping faces", total: 1) {
             clusterTask.cancel()
         }
     }
@@ -212,8 +212,4 @@ struct PeopleView: View {
             }
         }
     }
-}
-
-#Preview {
-    PeopleView()
 }

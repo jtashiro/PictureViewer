@@ -16,6 +16,11 @@ private let windowStateLogger = Logger(subsystem: "com.example.PictureViewer", c
 final class WindowStateStore: @unchecked Sendable {
 	static let shared = WindowStateStore()
 
+	enum GallerySessionItem {
+		case folder(URL)
+		case sqliteStore(String)
+	}
+
 	private let bookmarkKey = "savedFolderBookmark"
 	private let openWindowsKey = "openPhotoPaths"
 	private let openGalleryBookmarksKey = "openGalleryFolderBookmarks"
@@ -152,7 +157,7 @@ final class WindowStateStore: @unchecked Sendable {
 		queueLock.lock(); defer { queueLock.unlock() }
 		let path = url.standardizedFileURL.path
 		var entries = openGalleryBookmarkEntries()
-		if entries.contains(where: { $0.path == path }) { return }
+		if entries.contains(where: { $0.kindValue == GalleryBookmarkEntry.folderKind && $0.path == path }) { return }
 		do {
 			let bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
 			entries.append(GalleryBookmarkEntry(path: path, bookmark: bookmark))
@@ -162,11 +167,29 @@ final class WindowStateStore: @unchecked Sendable {
 		}
 	}
 
+	func recordOpenSQLiteStore(named storeName: String) {
+		queueLock.lock(); defer { queueLock.unlock() }
+		let trimmed = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !trimmed.isEmpty else { return }
+		var entries = openGalleryBookmarkEntries()
+		if entries.contains(where: { $0.kindValue == GalleryBookmarkEntry.sqliteKind && $0.storeName == trimmed }) { return }
+		entries.append(GalleryBookmarkEntry(sqliteStoreName: trimmed))
+		persistOpenGalleryBookmarkEntries(entries)
+	}
+
 	func recordClosedGalleryFolder(_ url: URL) {
 		queueLock.lock(); defer { queueLock.unlock() }
 		let path = url.standardizedFileURL.path
 		var entries = openGalleryBookmarkEntries()
-		entries.removeAll { $0.path == path }
+		entries.removeAll { $0.kindValue == GalleryBookmarkEntry.folderKind && $0.path == path }
+		persistOpenGalleryBookmarkEntries(entries)
+	}
+
+	func recordClosedSQLiteStore(named storeName: String) {
+		queueLock.lock(); defer { queueLock.unlock() }
+		let trimmed = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+		var entries = openGalleryBookmarkEntries()
+		entries.removeAll { $0.kindValue == GalleryBookmarkEntry.sqliteKind && $0.storeName == trimmed }
 		persistOpenGalleryBookmarkEntries(entries)
 	}
 
@@ -175,15 +198,21 @@ final class WindowStateStore: @unchecked Sendable {
 		var resolved: [URL] = []
 		var refreshed: [GalleryBookmarkEntry] = []
 		for entry in openGalleryBookmarkEntries() {
+			guard entry.kindValue == GalleryBookmarkEntry.folderKind,
+				  let bookmark = entry.bookmark
+			else {
+				refreshed.append(entry)
+				continue
+			}
 			var stale = false
 			do {
-				let url = try URL(resolvingBookmarkData: entry.bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
+				let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
 				_ = url.startAccessingSecurityScopedResource()
-				let bookmark = stale
-					? (try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)) ?? entry.bookmark
-					: entry.bookmark
+				let refreshedBookmark = stale
+					? (try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)) ?? bookmark
+					: bookmark
 				resolved.append(url)
-				refreshed.append(GalleryBookmarkEntry(path: url.standardizedFileURL.path, bookmark: bookmark))
+				refreshed.append(GalleryBookmarkEntry(path: url.standardizedFileURL.path, bookmark: refreshedBookmark))
 			} catch {
 				windowStateLogger.error("openGalleryFolderURLs failed path=\(entry.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 			}
@@ -192,6 +221,39 @@ final class WindowStateStore: @unchecked Sendable {
 			persistOpenGalleryBookmarkEntries(refreshed)
 		}
 		return resolved
+	}
+
+	func openGallerySessionItems() -> [GallerySessionItem] {
+		queueLock.lock(); defer { queueLock.unlock() }
+		var restored: [GallerySessionItem] = []
+		var refreshed: [GalleryBookmarkEntry] = []
+		for entry in openGalleryBookmarkEntries() {
+			if entry.kindValue == GalleryBookmarkEntry.sqliteKind {
+				if let storeName = entry.storeName, !storeName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+					restored.append(.sqliteStore(storeName))
+					refreshed.append(entry)
+				}
+				continue
+			}
+
+			guard let bookmark = entry.bookmark else { continue }
+			var stale = false
+			do {
+				let url = try URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale)
+				_ = url.startAccessingSecurityScopedResource()
+				let refreshedBookmark = stale
+					? (try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)) ?? bookmark
+					: bookmark
+				restored.append(.folder(url))
+				refreshed.append(GalleryBookmarkEntry(path: url.standardizedFileURL.path, bookmark: refreshedBookmark))
+			} catch {
+				windowStateLogger.error("openGallerySessionItems failed path=\(entry.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
+		}
+		if refreshed.count != openGalleryBookmarkEntries().count {
+			persistOpenGalleryBookmarkEntries(refreshed)
+		}
+		return restored
 	}
 
 	/// Scans the running app's windows and records any windows that have a
@@ -279,8 +341,31 @@ final class WindowStateStore: @unchecked Sendable {
 	}
 
 	private struct GalleryBookmarkEntry: Codable {
+		static let folderKind = "folder"
+		static let sqliteKind = "sqlite"
+
 		let path: String
-		let bookmark: Data
+		let bookmark: Data?
+		let kind: String?
+		let storeName: String?
+
+		var kindValue: String {
+			kind ?? Self.folderKind
+		}
+
+		init(path: String, bookmark: Data) {
+			self.path = path
+			self.bookmark = bookmark
+			self.kind = Self.folderKind
+			self.storeName = nil
+		}
+
+		init(sqliteStoreName: String) {
+			self.path = "sqlite:\(sqliteStoreName)"
+			self.bookmark = nil
+			self.kind = Self.sqliteKind
+			self.storeName = sqliteStoreName
+		}
 	}
 
 	private func openGalleryBookmarkEntries() -> [GalleryBookmarkEntry] {

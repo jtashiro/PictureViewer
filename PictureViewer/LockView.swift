@@ -58,7 +58,3 @@ struct LockView: View {
         }
     }
 }
-
-#Preview {
-    LockView()
-}
