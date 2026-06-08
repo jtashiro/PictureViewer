@@ -35,13 +35,6 @@ struct PictureViewerApp: App {
 			}
 		}
 
-		// Trigger authentication as early as possible so the system prompt
-		// appears at app launch, but only if the user enabled the option in
-		// Settings. The UI will remain gated behind the `authManager.isAuthenticated` flag.
-		if requirePasswordAtLaunch {
-			AuthenticationManager.shared.authenticate()
-		}
-
 		// Ensure automatic window tabbing is enabled so windows can be grouped
 		// into tabs by default. This is a global AppKit setting and should be
 		// set early in the app lifecycle.
