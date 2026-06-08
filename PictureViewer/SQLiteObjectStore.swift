@@ -312,9 +312,7 @@ actor SQLiteObjectStore {
         let contentHash = Self.contentHash(of: data)
         let contentType = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
             ?? UTType(filenameExtension: url.pathExtension)?.identifier
-        let thumbnailData = await MainActor.run {
-            ThumbnailCache.shared.jpegData(for: url)
-        }
+        let thumbnailData = await resolvedThumbnailData(for: url)
         try storeObjectDataThrowing(
             data,
             originalURL: url,
@@ -322,6 +320,25 @@ actor SQLiteObjectStore {
             contentTypeIdentifier: contentType,
             thumbnailData: thumbnailData
         )
+    }
+
+    /// Returns a JPEG thumbnail for `url`, generating one on demand if the
+    /// ThumbnailCache is cold. This matters for video formats whose thumbnail
+    /// cascade takes time (e.g. .flv/.wmv must fall through QuickLook and
+    /// AVFoundation before VLC can produce a frame), since sync may run
+    /// before the grid view has populated the cache.
+    nonisolated func resolvedThumbnailData(for url: URL) async -> Data? {
+        if let cached = await MainActor.run(body: { ThumbnailCache.shared.jpegData(for: url) }) {
+            return cached
+        }
+        do {
+            let image = try await ThumbnailGenerator.shared.generateThumbnail(for: url)
+            await MainActor.run { ThumbnailCache.shared.store(image, for: url) }
+            return ThumbnailCache.jpegData(from: image)
+        } catch {
+            logger.error("sqlite object store: on-demand thumbnail failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return nil
+        }
     }
 
     func loadObjectWorkingFiles(

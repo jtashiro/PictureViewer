@@ -1300,7 +1300,20 @@ struct ContentView: View {
 			Text(vaultAlertMessage)
 		}
 		.sheet(isPresented: $isShowingVaultUnlockPrompt, onDismiss: clearVaultUnlockPrompt) {
-			vaultUnlockPromptView
+			VaultUnlockPromptView(
+				vaultHasPassword: vaultStatus.hasPassword,
+				displayName: currentVaultDisplayName,
+				pendingAutoOpen: pendingVaultAutoOpen,
+				unlockMessage: vaultUnlockMessage,
+				password: $vaultUnlockPassword,
+				confirmation: $vaultUnlockConfirmation,
+				onCancel: {
+					pendingVaultAutoOpen = false
+					clearVaultUnlockPrompt()
+					isShowingVaultUnlockPrompt = false
+				},
+				onSubmit: submitVaultUnlockPrompt
+			)
 		}
 		.task {
 			await refreshVaultStatus()
@@ -1741,10 +1754,10 @@ struct ContentView: View {
 	@ViewBuilder
 	private var contentBody: some View {
 		VStack(spacing: 0) {
-			personFilterBanner
+			PersonFilterBanner(personFilterState: personFilterState)
 			Group {
 				if library.folderURL == nil && !isSQLiteObjectStoreView {
-					emptyState
+					EmptyFolderView(chooseFolder: chooseFolder)
 				} else if library.isScanning && library.photos.isEmpty {
 					VStack(spacing: 12) {
 						ProgressView()
@@ -1834,43 +1847,6 @@ struct ContentView: View {
 	}
 
 	@ViewBuilder
-	private var personFilterBanner: some View {
-		if let active = personFilterState.active {
-			HStack(spacing: 8) {
-				Image(systemName: "person.crop.circle.fill")
-					.foregroundStyle(.tint)
-				Text("Showing photos of ")
-					.foregroundStyle(.secondary)
-				+ Text(active.personName)
-					.fontWeight(.semibold)
-				Spacer()
-				Button("Clear Filter") {
-					personFilterState.clear()
-				}
-				.buttonStyle(.borderless)
-				.controlSize(.small)
-			}
-			.font(.callout)
-			.padding(.horizontal, 12)
-			.padding(.vertical, 6)
-			.background(.thinMaterial)
-			.overlay(alignment: .bottom) {
-				Divider()
-			}
-		}
-	}
-
-	private var emptyState: some View {
-		ContentUnavailableView {
-			Label("No Folder Selected", systemImage: "folder.badge.questionmark")
-		} description: {
-			Text("Pick a folder to recursively browse photos.")
-		} actions: {
-			Button("Choose Folder…") { chooseFolder() }
-				.buttonStyle(.borderedProminent)
-		}
-	}
-
 	private var photoGrid: some View {
 		ScrollViewReader { scrollProxy in
 			ScrollView {
@@ -2980,10 +2956,7 @@ struct ContentView: View {
 	}
 
 	private nonisolated static func sqliteThumbnailDataForSyncSource(_ url: URL) async -> Data? {
-		if let cached = await MainActor.run(body: { ThumbnailCache.shared.jpegData(for: url) }) {
-			return cached
-		}
-		return nil
+		await SQLiteObjectStore.shared.resolvedThumbnailData(for: url)
 	}
 
 	private func visibleSQLiteSyncTargets() -> [SQLiteSyncTarget] {
@@ -4232,49 +4205,6 @@ struct ContentView: View {
 				openVault()
 			}
 		}
-	}
-
-	private var vaultUnlockPromptView: some View {
-		VStack(alignment: .leading, spacing: 14) {
-			Text(vaultStatus.hasPassword ? "Unlock \(currentVaultDisplayName)" : "Set Password for \(currentVaultDisplayName)")
-				.font(.headline)
-
-			SecureField("Password", text: $vaultUnlockPassword)
-				.textFieldStyle(.roundedBorder)
-
-			if !vaultStatus.hasPassword {
-				SecureField("Re-enter password", text: $vaultUnlockConfirmation)
-					.textFieldStyle(.roundedBorder)
-			}
-
-			Text(pendingVaultAutoOpen
-				 ? "This folder contains encrypted photos. Enter the password to open \(currentVaultDisplayName)."
-				 : "After unlocking, choose Vault → Open Vault to view your photos.")
-				.font(.caption)
-				.foregroundStyle(.secondary)
-				.fixedSize(horizontal: false, vertical: true)
-
-			if let vaultUnlockMessage {
-				Text(vaultUnlockMessage)
-					.font(.caption)
-					.foregroundStyle(.red)
-			}
-
-			HStack {
-				Button("Cancel") {
-					pendingVaultAutoOpen = false
-					clearVaultUnlockPrompt()
-					isShowingVaultUnlockPrompt = false
-				}
-				Spacer()
-				Button(vaultStatus.hasPassword ? "Unlock" : "Set Password") {
-					submitVaultUnlockPrompt()
-				}
-				.keyboardShortcut(.defaultAction)
-			}
-		}
-		.padding()
-		.frame(width: 360)
 	}
 
 	private func openVault() {
