@@ -108,6 +108,7 @@ struct PictureViewerApp: App {
 		}
 		.commands {
 			VaultFileCommands()
+			WindowMergeCommands()
 			AboutCommands(isShowingAboutSheet: $isShowingAboutSheet)
 		}
 
@@ -199,6 +200,50 @@ struct PictureViewerApp: App {
 	}
 }
 
+@MainActor
+enum PictureViewerWindowTabber {
+	static func mergeAllWindows() {
+		let windows = NSApp.windows.filter(isMergeEligible)
+		guard let target = NSApp.keyWindow.flatMap({ isMergeEligible($0) ? $0 : nil })
+			?? NSApp.mainWindow.flatMap({ isMergeEligible($0) ? $0 : nil })
+			?? windows.first
+		else {
+			return
+		}
+
+		target.tabbingMode = .preferred
+		target.tabbingIdentifier = "PictureViewerMergedWindows"
+		for window in windows where window !== target {
+			window.tabbingMode = .preferred
+			window.tabbingIdentifier = target.tabbingIdentifier
+			if !windowsAreAlreadyTabbed(target, window) {
+				target.addTabbedWindow(window, ordered: .above)
+			}
+		}
+		target.makeKeyAndOrderFront(nil)
+	}
+
+	private static func isMergeEligible(_ window: NSWindow) -> Bool {
+		guard window.isVisible,
+			  !window.isMiniaturized,
+			  window.canBecomeMain,
+			  !(window is NSPanel),
+			  !window.styleMask.contains(.fullScreen),
+			  window.sheetParent == nil
+		else {
+			return false
+		}
+		return true
+	}
+
+	private static func windowsAreAlreadyTabbed(_ a: NSWindow, _ b: NSWindow) -> Bool {
+		if let group = a.tabGroup {
+			return group.windows.contains { $0 === b }
+		}
+		return false
+	}
+}
+
 struct AboutBuildView: View {
 	@Binding var isShowingAboutSheet: Bool
 
@@ -250,6 +295,16 @@ struct AboutCommands: Commands {
 		CommandGroup(after: .help) {
 			Button("About Picture Viewer…") {
 				isShowingAboutSheet = true
+			}
+		}
+	}
+}
+
+struct WindowMergeCommands: Commands {
+	var body: some Commands {
+		CommandGroup(after: .windowArrangement) {
+			Button("Merge All Windows") {
+				PictureViewerWindowTabber.mergeAllWindows()
 			}
 		}
 	}

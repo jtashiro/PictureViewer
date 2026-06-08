@@ -1997,7 +1997,7 @@ struct ContentView: View {
 			HStack(spacing: 6) {
 				Text("Scanning \(library.folderURL?.lastPathComponent ?? "")…")
 				bullet
-				Text("\(library.photos.count.formatted()) found")
+				Text("\(mediaStatusSummary(for: library.photos)) found")
 					.foregroundStyle(.secondary)
 				if let start = library.scanStartDate {
 					bullet
@@ -2012,7 +2012,7 @@ struct ContentView: View {
 			Text("Refreshing thumbnails…").foregroundStyle(.secondary)
 		} else if isSQLiteObjectStoreView {
 			HStack(spacing: 6) {
-				Text("\(library.photos.count.formatted()) object\(library.photos.count == 1 ? "" : "s") in SQLite store")
+				Text("\(mediaStatusSummary(for: library.photos)) in SQLite store")
 					.foregroundStyle(.secondary)
 				if isVaultWorking {
 					bullet
@@ -2047,7 +2047,7 @@ struct ContentView: View {
 			}
 		} else if let date = library.lastScanDate {
 			HStack(spacing: 6) {
-				Text("\(library.photos.count.formatted()) photo\(library.photos.count == 1 ? "" : "s")")
+				Text(mediaStatusSummary(for: library.photos))
 				bullet
 				Text("scanned \(date.formatted(date: .abbreviated, time: .shortened))")
 					.foregroundStyle(.secondary)
@@ -2070,6 +2070,21 @@ struct ContentView: View {
 
 	private var bullet: some View {
 		Text("·").foregroundStyle(.tertiary)
+	}
+
+	private func mediaStatusSummary(for items: [PhotoItem]) -> String {
+		let videoCount = items.reduce(into: 0) { count, item in
+			let contentType = try? item.url.resourceValues(forKeys: [.contentTypeKey]).contentType
+			if PhotoLibrary.isVideoMediaFile(item.url, contentType: contentType) {
+				count += 1
+			}
+		}
+		let totalCount = items.count
+		let photoCount = max(0, totalCount - videoCount)
+		let totalLabel = totalCount.formatted()
+		let photoLabel = "\(photoCount.formatted()) photo\(photoCount == 1 ? "" : "s")"
+		let videoLabel = "\(videoCount.formatted()) video\(videoCount == 1 ? "" : "s")"
+		return "\(totalLabel) (\(photoLabel), \(videoLabel))"
 	}
 
 	private static func format(duration: TimeInterval) -> String {
@@ -3178,10 +3193,10 @@ struct ContentView: View {
 		vaultProgressTotal = sourceURLs.count
 		vaultStoreTask?.cancel()
 		let task = Task.detached(priority: .userInitiated) {
-			enum SQLiteSyncResult {
-				case stored(String)
-				case skippedCancelled
-				case failed
+			struct PreparedSQLiteObject: Sendable {
+				let index: Int
+				let filename: String
+				let pendingObject: SQLiteObjectStore.PendingObject
 			}
 
 			var failedCount = 0
@@ -3189,81 +3204,101 @@ struct ContentView: View {
 			var storedCount = 0
 			var firstStoredFilename: String?
 			var cancelledBeforeStartCount = 0
+			let syncStart = Date()
+			let chunkSize = max(1, min(workers, 8))
+			logger.log("sqlite sync: begin database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) workers=\(workers, privacy: .public) chunkSize=\(chunkSize, privacy: .public)")
 
-			await withTaskGroup(of: SQLiteSyncResult.self) { group in
-				var nextIndex = 0
+			for chunkStart in stride(from: 0, to: sourceURLs.count, by: chunkSize) {
+				if Task.isCancelled {
+					cancelledBeforeStartCount += sourceURLs.count - chunkStart
+					break
+				}
+				let chunkEnd = min(chunkStart + chunkSize, sourceURLs.count)
+				let chunk = Array(sourceURLs[chunkStart..<chunkEnd])
+				let chunkStartDate = Date()
+				logger.log("sqlite sync: chunk begin range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) of=\(sourceURLs.count, privacy: .public)")
 
-				func startTask(at index: Int) {
-					let url = sourceURLs[index]
-					group.addTask {
-						if Task.isCancelled { return .skippedCancelled }
-						do {
-							let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey])
-							guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
-								logger.error("sqlite sync: unsupported media url=\(url.path, privacy: .public)")
-								return .failed
+				let preparedObjects: [PreparedSQLiteObject] = await withTaskGroup(of: PreparedSQLiteObject?.self) { group in
+					for (offset, url) in chunk.enumerated() {
+						let index = chunkStart + offset
+						group.addTask {
+							if Task.isCancelled { return nil }
+							let itemStart = Date()
+							logger.log("sqlite sync: item read begin index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public)")
+							do {
+								let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey])
+								guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
+									logger.error("sqlite sync: unsupported media index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) url=\(url.path, privacy: .public)")
+									return nil
+								}
+								let started = url.startAccessingSecurityScopedResource()
+								defer { if started { url.stopAccessingSecurityScopedResource() } }
+								let data = try Data(contentsOf: url)
+								try Task.checkCancellation()
+								let contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+								let contentType = resourceValues?.contentType?.identifier
+									?? UTType(filenameExtension: url.pathExtension)?.identifier
+								let thumbnailData = await Self.sqliteThumbnailDataForSyncSource(url)
+								logger.log("sqlite sync: item read complete index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public) bytes=\(data.count, privacy: .public) duration=\(Date().timeIntervalSince(itemStart), privacy: .public)")
+								return PreparedSQLiteObject(
+									index: index,
+									filename: url.lastPathComponent,
+									pendingObject: SQLiteObjectStore.PendingObject(
+										objectData: data,
+										originalURL: url,
+										contentHash: contentHash,
+										contentTypeIdentifier: contentType,
+										thumbnailData: thumbnailData
+									)
+								)
+							} catch is CancellationError {
+								logger.log("sqlite sync: item cancelled index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public)")
+								return nil
+							} catch {
+								logger.error("sqlite sync: item read failed index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) url=\(url.path, privacy: .public) duration=\(Date().timeIntervalSince(itemStart), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+								return nil
 							}
-							let started = url.startAccessingSecurityScopedResource()
-							defer { if started { url.stopAccessingSecurityScopedResource() } }
-							let data = try Data(contentsOf: url)
-							try Task.checkCancellation()
-							let contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-							let contentType = resourceValues?.contentType?.identifier
-								?? UTType(filenameExtension: url.pathExtension)?.identifier
-							let thumbnailData = await Self.sqliteThumbnailDataForSyncSource(url)
-							try await SQLiteObjectStore.shared.storeObjectDataThrowing(
-								data,
-								originalURL: url,
-								contentHash: contentHash,
-								contentTypeIdentifier: contentType,
-								thumbnailData: thumbnailData,
-								storeName: targetStoreName
-							)
-							return .stored(url.lastPathComponent)
-						} catch is CancellationError {
-							return .skippedCancelled
-						} catch {
-							logger.error("sqlite sync: failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-							return .failed
 						}
 					}
+
+					var prepared: [PreparedSQLiteObject] = []
+					for await object in group {
+						if let object {
+							prepared.append(object)
+						}
+					}
+					return prepared.sorted { $0.index < $1.index }
 				}
 
-				for _ in 0..<workers {
-					startTask(at: nextIndex)
-					nextIndex += 1
-				}
-
-				while let result = await group.next() {
-					switch result {
-					case .stored(let filename):
-						storedCount += 1
-						completedCount += 1
+				let chunkFailedCount = chunk.count - preparedObjects.count
+				failedCount += chunkFailedCount
+				if !preparedObjects.isEmpty {
+					do {
+						let writeStart = Date()
+						let pendingObjects = preparedObjects.map(\.pendingObject)
+						logger.log("sqlite sync: chunk write begin range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) prepared=\(pendingObjects.count, privacy: .public)")
+						let writtenCount = try await SQLiteObjectStore.shared.storeObjectBatchThrowing(pendingObjects, storeName: targetStoreName)
+						storedCount += writtenCount
+						completedCount += writtenCount
 						if firstStoredFilename == nil {
-							firstStoredFilename = filename
+							firstStoredFilename = preparedObjects.first?.filename
 						}
-					case .failed:
-						failedCount += 1
-						completedCount += 1
-					case .skippedCancelled:
-						cancelledBeforeStartCount += 1
+						let writeFailedCount = max(0, preparedObjects.count - writtenCount)
+						failedCount += writeFailedCount
+						completedCount += writeFailedCount
+						logger.log("sqlite sync: chunk write complete range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) written=\(writtenCount, privacy: .public) writeFailed=\(writeFailedCount, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
+					} catch {
+						failedCount += preparedObjects.count
+						completedCount += preparedObjects.count
+						logger.error("sqlite sync: chunk write failed range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) prepared=\(preparedObjects.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 					}
-					let processedCount = completedCount + cancelledBeforeStartCount
-					if processedCount == sourceURLs.count || processedCount % 128 == 0 {
-						let completed = processedCount
-						await MainActor.run {
-							vaultProgressCompleted = completed
-							vaultProgressTotal = sourceURLs.count
-						}
-					}
-					if Task.isCancelled {
-						group.cancelAll()
-						continue
-					}
-					if nextIndex < sourceURLs.count {
-						startTask(at: nextIndex)
-						nextIndex += 1
-					}
+				}
+				completedCount += chunkFailedCount
+				let processedCount = completedCount + cancelledBeforeStartCount
+				logger.log("sqlite sync: progress processed=\(processedCount, privacy: .public) of=\(sourceURLs.count, privacy: .public) stored=\(storedCount, privacy: .public) failed=\(failedCount, privacy: .public) skipped=\(cancelledBeforeStartCount, privacy: .public) chunkDuration=\(Date().timeIntervalSince(chunkStartDate), privacy: .public) elapsed=\(Date().timeIntervalSince(syncStart), privacy: .public)")
+				await MainActor.run {
+					vaultProgressCompleted = processedCount
+					vaultProgressTotal = sourceURLs.count
 				}
 			}
 			let wasCancelled = Task.isCancelled
@@ -3272,6 +3307,7 @@ struct ContentView: View {
 			let finalProcessedCount = completedCount
 			let finalSkippedCount = cancelledBeforeStartCount
 			let finalFocusFilename = finalStoredCount == 1 ? firstStoredFilename : nil
+			logger.log("sqlite sync: complete database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) processed=\(finalProcessedCount, privacy: .public) stored=\(finalStoredCount, privacy: .public) failed=\(finalFailedCount, privacy: .public) skipped=\(finalSkippedCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public) duration=\(Date().timeIntervalSince(syncStart), privacy: .public)")
 			await MainActor.run {
 				isVaultWorking = false
 				vaultStoreTask = nil
@@ -3308,11 +3344,6 @@ struct ContentView: View {
 	private nonisolated static func sqliteThumbnailDataForSyncSource(_ url: URL) async -> Data? {
 		if let cached = await MainActor.run(body: { ThumbnailCache.shared.jpegData(for: url) }) {
 			return cached
-		}
-		if let generated = try? await ThumbnailGenerator.shared.generateThumbnail(for: url) {
-			return await MainActor.run {
-				ThumbnailCache.jpegData(from: generated)
-			}
 		}
 		return nil
 	}

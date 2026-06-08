@@ -62,6 +62,28 @@ actor SQLiteObjectStore {
         let dbURL: URL
     }
 
+    struct PendingObject: Sendable {
+        let objectData: Data
+        let originalURL: URL
+        let contentHash: String
+        let contentTypeIdentifier: String?
+        let thumbnailData: Data?
+
+        init(
+            objectData: Data,
+            originalURL: URL,
+            contentHash: String,
+            contentTypeIdentifier: String?,
+            thumbnailData: Data?
+        ) {
+            self.objectData = objectData
+            self.originalURL = originalURL
+            self.contentHash = contentHash
+            self.contentTypeIdentifier = contentTypeIdentifier
+            self.thumbnailData = thumbnailData
+        }
+    }
+
     private var lazyWorkingFiles: [String: LazyWorkingFile] = [:]
     private var lazyWorkingURLsByID: [Int64: URL] = [:]
     private var lazyWorkingThumbnailOrder: [Int64] = []
@@ -218,6 +240,68 @@ actor SQLiteObjectStore {
             try Self.replaceKeywords(objectMetadata.keywords, forObjectID: objectID, in: db)
         }
         logger.log("sqlite object store: stored filename=\(originalURL.lastPathComponent, privacy: .public) encrypted=\(shouldEncrypt, privacy: .public)")
+    }
+
+    func storeObjectBatchThrowing(_ objects: [PendingObject], storeName: String? = nil) throws -> Int {
+        guard Self.isEnabled, !objects.isEmpty else { return 0 }
+        let batchStart = Date()
+        let shouldEncrypt = Self.encryptsBlobs
+        let keyData = shouldEncrypt ? try accessKeyData() : nil
+        let dbURL = try resolvedDatabaseURL(storeName: storeName)
+        var storedCount = 0
+
+        try withDatabase(at: dbURL) { db in
+            try Self.createSchema(in: db)
+            try Self.exec("BEGIN IMMEDIATE TRANSACTION;", in: db)
+            do {
+                for object in objects {
+                    let storedData: Data
+                    if shouldEncrypt {
+                        guard let keyData,
+                              let combined = try AES.GCM.seal(object.objectData, using: SymmetricKey(data: keyData)).combined
+                        else {
+                            throw SQLiteObjectStoreError.databaseWriteFailed
+                        }
+                        storedData = combined
+                    } else {
+                        storedData = object.objectData
+                    }
+
+                    let objectMetadata = Self.objectMetadata(
+                        from: object.objectData,
+                        originalURL: object.originalURL,
+                        contentTypeIdentifier: object.contentTypeIdentifier
+                    )
+                    let fileValues = try? object.originalURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey, .fileSizeKey])
+                    let objectID = try Self.upsertObject(
+                        in: db,
+                        filename: object.originalURL.lastPathComponent,
+                        originalPath: object.originalURL.path,
+                        contentHash: object.contentHash,
+                        contentTypeIdentifier: objectMetadata.contentType,
+                        fileExtension: object.originalURL.pathExtension,
+                        fileSize: fileValues?.fileSize ?? object.objectData.count,
+                        pixelWidth: objectMetadata.pixelWidth,
+                        pixelHeight: objectMetadata.pixelHeight,
+                        createdAt: fileValues?.creationDate,
+                        modifiedAt: fileValues?.contentModificationDate,
+                        importedAt: Date(),
+                        isEncrypted: shouldEncrypt,
+                        blobData: storedData,
+                        thumbnailData: object.thumbnailData
+                    )
+                    try Self.replaceKeywords(objectMetadata.keywords, forObjectID: objectID, in: db)
+                    storedCount += 1
+                }
+                try Self.exec("COMMIT;", in: db)
+            } catch {
+                try? Self.exec("ROLLBACK;", in: db)
+                throw error
+            }
+        }
+
+        logger.log("sqlite object store: stored batch count=\(storedCount, privacy: .public) requested=\(objects.count, privacy: .public) encrypted=\(shouldEncrypt, privacy: .public) duration=\(Date().timeIntervalSince(batchStart), privacy: .public)")
+        return storedCount
     }
 
     func storeObjectFile(at url: URL) async throws {
