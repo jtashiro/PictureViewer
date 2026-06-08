@@ -35,6 +35,26 @@ final class PhotoLibrary: ObservableObject {
 		return max(2, min(cores, 32))
 	}()
 
+	nonisolated static var supportedMediaContentTypes: [UTType] {
+		[.image, .movie, .video, .audiovisualContent]
+	}
+
+	nonisolated static func isSupportedMediaType(_ type: UTType) -> Bool {
+		supportedMediaContentTypes.contains { supportedType in
+			type.conforms(to: supportedType)
+		}
+	}
+
+	nonisolated static func isSupportedMediaFile(_ url: URL, contentType: UTType? = nil) -> Bool {
+		if let contentType, isSupportedMediaType(contentType) {
+			return true
+		}
+		guard let extensionType = UTType(filenameExtension: url.pathExtension) else {
+			return false
+		}
+		return isSupportedMediaType(extensionType)
+	}
+
 	nonisolated static var cpuSummary: String {
 		let info = ProcessInfo.processInfo
 		return "\(info.activeProcessorCount) of \(info.processorCount) cores active · \(workerCount) scanner threads"
@@ -335,8 +355,7 @@ final class PhotoLibrary: ObservableObject {
 						subdirs.append(url)
 					}
 				} else if values.isRegularFile == true,
-						  let type = values.contentType,
-						  type.conforms(to: .image) {
+						  Self.isSupportedMediaFile(url, contentType: values.contentType) {
 					// Dedupe by filename (basename) so we don't show multiple
 					// files with the same name in the UI. Keep the first
 					// occurrence encountered by the scanner.

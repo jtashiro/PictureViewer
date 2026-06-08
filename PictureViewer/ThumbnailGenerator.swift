@@ -1,7 +1,9 @@
 import Foundation
 import AppKit
+import AVFoundation
 import QuickLookThumbnailing
 import os
+import UniformTypeIdentifiers
 
 private let qlLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-generator")
 
@@ -78,12 +80,42 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		let pixelSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
 		let request = QLThumbnailGenerator.Request(fileAt: url, size: pixelSize, scale: actualScale, representationTypes: .thumbnail)
 
-		let rep = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
-		if AppLogLevel.current.allows(.debug) {
-			qlLogger.debug("generateThumbnail:finished url=\(url.path, privacy: .public)")
+		do {
+			let rep = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+			if AppLogLevel.current.allows(.debug) {
+				qlLogger.debug("generateThumbnail:finished url=\(url.path, privacy: .public)")
+			}
+			// Telemetry: count generated thumbnails
+			Task { await Telemetry.shared.recordThumbnail() }
+			return rep.nsImage
+		} catch {
+			guard Self.isVideo(url) else { throw error }
+			let fallback = try Self.generateVideoFrameThumbnail(for: url)
+			Task { await Telemetry.shared.recordThumbnail() }
+			return fallback
 		}
-		// Telemetry: count generated thumbnails
-		Task { await Telemetry.shared.recordThumbnail() }
-		return rep.nsImage
+	}
+
+	private static func isVideo(_ url: URL) -> Bool {
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if let contentType {
+			return contentType.conforms(to: .movie)
+				|| contentType.conforms(to: .video)
+				|| contentType.conforms(to: .audiovisualContent)
+		}
+		guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+		return type.conforms(to: .movie)
+			|| type.conforms(to: .video)
+			|| type.conforms(to: .audiovisualContent)
+	}
+
+	private static func generateVideoFrameThumbnail(for url: URL) throws -> NSImage {
+		let asset = AVURLAsset(url: url)
+		let generator = AVAssetImageGenerator(asset: asset)
+		generator.appliesPreferredTrackTransform = true
+		generator.maximumSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
+		let time = CMTime(seconds: 0.1, preferredTimescale: 600)
+		let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+		return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
 	}
 }

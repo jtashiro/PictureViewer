@@ -1016,6 +1016,9 @@ struct ContentView: View {
 		UTType(filenameExtension: "sqlite3") ?? .data,
 		UTType(filenameExtension: "db") ?? .data
 	]
+	private static var openableContentTypes: [UTType] {
+		sqliteStoreContentTypes + PhotoLibrary.supportedMediaContentTypes
+	}
 	// Active resolved security-scoped URLs (kept open for the app lifetime)
 	private static var activeSecurityScopedURLs: [URL] = []
 	// First mounted gallery window. Subsequent windows are force-tabbed onto
@@ -3050,7 +3053,7 @@ struct ContentView: View {
 		vaultStoreTask?.cancel()
 		let task = Task.detached(priority: .userInitiated) {
 			enum SQLiteSyncResult {
-				case stored
+				case stored(String)
 				case skippedCancelled
 				case failed
 			}
@@ -3058,6 +3061,7 @@ struct ContentView: View {
 			var failedCount = 0
 			var completedCount = 0
 			var storedCount = 0
+			var firstStoredFilename: String?
 			var cancelledBeforeStartCount = 0
 
 			await withTaskGroup(of: SQLiteSyncResult.self) { group in
@@ -3068,12 +3072,17 @@ struct ContentView: View {
 					group.addTask {
 						if Task.isCancelled { return .skippedCancelled }
 						do {
+							let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey])
+							guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
+								logger.error("sqlite sync: unsupported media url=\(url.path, privacy: .public)")
+								return .failed
+							}
 							let started = url.startAccessingSecurityScopedResource()
 							defer { if started { url.stopAccessingSecurityScopedResource() } }
 							let data = try Data(contentsOf: url)
 							try Task.checkCancellation()
 							let contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-							let contentType = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
+							let contentType = resourceValues?.contentType?.identifier
 								?? UTType(filenameExtension: url.pathExtension)?.identifier
 							try await SQLiteObjectStore.shared.storeObjectDataThrowing(
 								data,
@@ -3081,7 +3090,7 @@ struct ContentView: View {
 								contentHash: contentHash,
 								contentTypeIdentifier: contentType
 							)
-							return .stored
+							return .stored(url.lastPathComponent)
 						} catch is CancellationError {
 							return .skippedCancelled
 						} catch {
@@ -3098,9 +3107,12 @@ struct ContentView: View {
 
 				while let result = await group.next() {
 					switch result {
-					case .stored:
+					case .stored(let filename):
 						storedCount += 1
 						completedCount += 1
+						if firstStoredFilename == nil {
+							firstStoredFilename = filename
+						}
 					case .failed:
 						failedCount += 1
 						completedCount += 1
@@ -3130,6 +3142,7 @@ struct ContentView: View {
 			let finalStoredCount = storedCount
 			let finalProcessedCount = completedCount
 			let finalSkippedCount = cancelledBeforeStartCount
+			let finalFocusFilename = finalStoredCount == 1 ? firstStoredFilename : nil
 			await MainActor.run {
 				isVaultWorking = false
 				vaultStoreTask = nil
@@ -3144,6 +3157,9 @@ struct ContentView: View {
 				)
 				showVaultAlert = true
 				if finalStoredCount > 0 {
+					if isSQLiteObjectStoreView {
+						refreshThumbnails(focusFilename: finalFocusFilename)
+					}
 					NotificationCenter.default.post(name: .sqliteObjectStoreDidChange, object: tabID)
 				}
 			}
@@ -4436,8 +4452,8 @@ struct ContentView: View {
 		panel.canChooseFiles = true
 		panel.canChooseDirectories = true
 		panel.allowsMultipleSelection = true
-		panel.allowedContentTypes = Self.sqliteStoreContentTypes
-		panel.message = "Choose one or more folders containing photos, or a SQLite object-store database"
+		panel.allowedContentTypes = Self.openableContentTypes
+		panel.message = "Choose one or more folders containing media, media files, or a SQLite object-store database"
 		panel.prompt = "Choose"
 		if panel.runModal() == .OK {
 			var urls: [URL] = []
@@ -4458,12 +4474,21 @@ struct ContentView: View {
 			}
 			urls = filterAlreadyOpenBookmarkNames(urls)
 			guard !urls.isEmpty else { return }
+			let mediaFiles = urls.filter { url in
+				(try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+					&& PhotoLibrary.isSupportedMediaFile(url)
+			}
+			let scanFolders = urls.filter { url in
+				(try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+			}
+			let scanTargets = scanFolders + mediaFiles
+			guard !scanTargets.isEmpty else { return }
 			isSQLiteObjectStoreView = false
 
 			// Create bookmarks for each selected folder and persist them as
 			// an array so we can restore multiple folders at next launch.
 			var bookmarkDatas: [Data] = []
-			for url in urls {
+			for url in scanFolders {
 				do {
 					let bm = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
 					bookmarkDatas.append(bm)
@@ -4477,14 +4502,14 @@ struct ContentView: View {
 				if let first = bookmarkDatas.first {
 					UserDefaults.standard.set(first, forKey: Self.kLastFolderBookmark)
 				}
-				rememberKnownBookmarks(urls)
+				rememberKnownBookmarks(scanFolders)
 				reloadBookmarks()
 			}
 
 			// Try to start security access for each folder. Keep the first as
 			// the displayed folder (used for UI title) and as the primary
 			// security-scoped URL.
-			for (i, url) in urls.enumerated() {
+			for (i, url) in scanTargets.enumerated() {
 					if url.startAccessingSecurityScopedResource() {
 						if i == 0 { folderSecurityURL = url }
 						if !Self.activeSecurityScopedURLs.contains(url) { Self.activeSecurityScopedURLs.append(url) }
@@ -4492,13 +4517,24 @@ struct ContentView: View {
 			}
 
 			// Update UI title to reflect selected folders
-			activeFolderNames = urls.map { $0.lastPathComponent }
+			activeFolderNames = scanTargets.map { $0.lastPathComponent }
+
+			if scanFolders.isEmpty {
+				library.photos = mediaFiles.map { PhotoItem(url: $0) }
+				library.folderURL = mediaFiles.first?.deletingLastPathComponent()
+				library.lastScanDate = Date()
+				library.lastScanDuration = nil
+				forceThumbnailLoading = false
+				clearSelection()
+				scheduleSort()
+				return
+			}
 
 			// If only one folder selected, reuse the existing scan API which
 			// handles state, telemetry and persistence. For multiple folders
 			// we perform per-folder scans in the background and append the
 			// results into the library so the UI shows a combined view.
-			if urls.count == 1, let url = urls.first {
+			if scanTargets.count == 1, let url = scanFolders.first {
 				// Single-folder flow: set the active folder name and start
 				// the normal PhotoLibrary scan which handles persistence.
 				activeFolderNames = [url.lastPathComponent]
@@ -4515,8 +4551,8 @@ struct ContentView: View {
 			// and publish small batches to keep the UI responsive.
 			Task.detached(priority: .userInitiated) {
 				await MainActor.run {
-					library.photos = []
-					library.folderURL = urls.first
+					library.photos = mediaFiles.map { PhotoItem(url: $0) }
+					library.folderURL = scanTargets.first
 					library.isScanning = true
 					library.scanStartDate = Date()
 				}
@@ -4524,7 +4560,7 @@ struct ContentView: View {
 
 				let crossDeduper = MultiFolderDeduper()
 				await withTaskGroup(of: Void.self) { group in
-								for folder in urls {
+								for folder in scanFolders {
 										group.addTask {
 											let startedAccess = folder.startAccessingSecurityScopedResource()
 											defer { if startedAccess { folder.stopAccessingSecurityScopedResource() } }
@@ -4574,7 +4610,7 @@ struct ContentView: View {
 
 				// Persist a combined snapshot for faster restore next launch.
 				let finalPhotos = await MainActor.run { library.photos }
-				PhotoLibrary.persistCombinedSnapshot(finalPhotos, for: urls)
+				PhotoLibrary.persistCombinedSnapshot(finalPhotos, for: scanFolders)
 			}
 		}
 	}

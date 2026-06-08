@@ -8,6 +8,7 @@ import AppKit
 import QuickLookThumbnailing
 import ImageIO
 import os
+import UniformTypeIdentifiers
 
 private let thumbViewLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-view")
 
@@ -53,7 +54,7 @@ struct ThumbnailView: View {
 						.scaledToFit()
 						.padding(2)
 				} else if loadFailed {
-					Image(systemName: "photo.badge.exclamationmark")
+					Image(systemName: isVideo ? "video.badge.exclamationmark" : "photo.badge.exclamationmark")
 						.imageScale(.large)
 						.foregroundStyle(.secondary)
 				} else {
@@ -117,6 +118,19 @@ struct ThumbnailView: View {
 		let metadataRefreshToken: UUID
 	}
 
+	private var isVideo: Bool {
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if let contentType {
+			return contentType.conforms(to: .movie)
+				|| contentType.conforms(to: .video)
+				|| contentType.conforms(to: .audiovisualContent)
+		}
+		guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+		return type.conforms(to: .movie)
+			|| type.conforms(to: .video)
+			|| type.conforms(to: .audiovisualContent)
+	}
+
 	private func loadThumbnail() async {
 		loadFailed = false
 
@@ -149,20 +163,23 @@ struct ThumbnailView: View {
 		// user sees something immediately while the high-quality QuickLook
 		// thumbnail is generated. Both tasks are child tasks of the view's
 		// `.task` so they are cancelled when the view is recycled.
-		Task.detached(priority: .utility) {
-			// Fast low-res thumbnail via ImageIO
-			if !Task.isCancelled {
-				if let src = CGImageSourceCreateWithURL(target as CFURL, nil) {
-					let opts: [CFString: Any] = [
-						kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-						kCGImageSourceCreateThumbnailWithTransform: true,
-						kCGImageSourceThumbnailMaxPixelSize: 128
-					]
-					if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
-						let low = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-						await MainActor.run {
-							if !Task.isCancelled && image == nil {
-								image = low
+		if !isVideo {
+			Task.detached(priority: .utility) {
+				// Fast low-res thumbnail via ImageIO. This path is image-only;
+				// videos use QuickLook/AVFoundation because ImageIO logs errors.
+				if !Task.isCancelled {
+					if let src = CGImageSourceCreateWithURL(target as CFURL, nil) {
+						let opts: [CFString: Any] = [
+							kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+							kCGImageSourceCreateThumbnailWithTransform: true,
+							kCGImageSourceThumbnailMaxPixelSize: 128
+						]
+						if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+							let low = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+							await MainActor.run {
+								if !Task.isCancelled && image == nil {
+									image = low
+								}
 							}
 						}
 					}

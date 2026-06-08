@@ -5,9 +5,11 @@
 
 import SwiftUI
 import AppKit
+import AVKit
 import CoreImage
 import ImageIO
 import os
+import UniformTypeIdentifiers
 
 @MainActor
 final class PhotoNavigationContext {
@@ -34,6 +36,54 @@ final class PhotoNavigationContext {
 	}
 }
 
+fileprivate final class DeferredPlayerView: AVPlayerView {
+	var pendingPlayer: AVPlayer? {
+		didSet {
+			attachPlayerIfReady()
+		}
+	}
+
+	override func layout() {
+		super.layout()
+		attachPlayerIfReady()
+	}
+
+	override func viewDidMoveToWindow() {
+		super.viewDidMoveToWindow()
+		attachPlayerIfReady()
+	}
+
+	private func attachPlayerIfReady() {
+		guard bounds.width > 0, bounds.height > 0 else { return }
+		if player !== pendingPlayer {
+			player = pendingPlayer
+		}
+	}
+}
+
+private struct NativeVideoPlayerView: NSViewRepresentable {
+	let player: AVPlayer
+
+	func makeNSView(context: Context) -> DeferredPlayerView {
+		let view = DeferredPlayerView()
+		view.controlsStyle = .floating
+		view.videoGravity = .resizeAspect
+		view.updatesNowPlayingInfoCenter = false
+		view.pendingPlayer = player
+		return view
+	}
+
+	func updateNSView(_ nsView: DeferredPlayerView, context: Context) {
+		nsView.pendingPlayer = player
+	}
+
+	static func dismantleNSView(_ nsView: DeferredPlayerView, coordinator: ()) {
+		nsView.player?.pause()
+		nsView.player = nil
+		nsView.pendingPlayer = nil
+	}
+}
+
 struct FullScreenPhotoView: View {
 	let url: URL
 	@State private var currentURL: URL
@@ -46,6 +96,7 @@ struct FullScreenPhotoView: View {
 	@AppStorage("photoDisplayMode") private var displayMode: PhotoDisplayMode = .fullScreen
 
 	@State private var image: NSImage?
+	@State private var player: AVPlayer?
 	@State private var loadFailed = false
 	@State private var rotationDegrees: Int = 0
 	@State private var brightnessAdjustment: Double = 0
@@ -59,7 +110,26 @@ struct FullScreenPhotoView: View {
 			Color.black
 				.ignoresSafeArea()
 
-			if let image {
+			if isCurrentVideo {
+				if let player {
+					NativeVideoPlayerView(player: player)
+						.frame(minWidth: 1, minHeight: 1)
+						.ignoresSafeArea()
+				} else if loadFailed {
+					VStack(spacing: 12) {
+						Image(systemName: "video.badge.exclamationmark")
+							.font(.system(size: 56))
+							.foregroundStyle(.secondary)
+						Text("Cannot Display Video")
+							.font(.title3)
+							.foregroundStyle(.secondary)
+					}
+				} else {
+					ProgressView()
+						.controlSize(.large)
+						.tint(.white)
+				}
+			} else if let image {
 				Image(nsImage: image)
 					.resizable()
 					.scaledToFit()
@@ -100,48 +170,50 @@ struct FullScreenPhotoView: View {
 			return .handled
 		}
 		.onTapGesture {
-			if displayMode == .fullScreen {
+			if !isCurrentVideo && displayMode == .fullScreen {
 				dismiss()
 			}
 		}
 		.task(id: currentURL) {
-			await loadImage()
+			await loadMedia()
 		}
 		.toolbar {
 			ToolbarItem(placement: .automatic) {
-				HStack(spacing: 8) {
-					Button(action: { rotateLeft() }) {
-						Image(systemName: "rotate.left")
-					}
-					.help("Rotate left 90°")
-					Button(action: { rotateRight() }) {
-						Image(systemName: "rotate.right")
-					}
-					.help("Rotate right 90°")
-					Image(systemName: "sun.max")
-						.foregroundStyle(.secondary)
-					Slider(value: $brightnessAdjustment, in: -1...1, step: 0.05)
-						.frame(width: 120)
-						.help("Brightness")
-					Image(systemName: "circle.lefthalf.filled")
-						.foregroundStyle(.secondary)
-					Slider(value: $contrastAdjustment, in: 0.2...2.0, step: 0.05)
-						.frame(width: 120)
-						.help("Contrast")
-					Button(action: { resetAdjustments() }) {
-						Image(systemName: "arrow.uturn.backward")
-					}
-					.help("Reset brightness/contrast")
-					.disabled(abs(brightnessAdjustment) < 0.001 && abs(contrastAdjustment - 1) < 0.001)
-					Button(action: { Task { await saveEdits() } }) {
-						if isSavingEdits {
-							ProgressView().controlSize(.small)
-						} else {
-							Image(systemName: "square.and.arrow.down")
+				if !isCurrentVideo {
+					HStack(spacing: 8) {
+						Button(action: { rotateLeft() }) {
+							Image(systemName: "rotate.left")
 						}
+						.help("Rotate left 90°")
+						Button(action: { rotateRight() }) {
+							Image(systemName: "rotate.right")
+						}
+						.help("Rotate right 90°")
+						Image(systemName: "sun.max")
+							.foregroundStyle(.secondary)
+						Slider(value: $brightnessAdjustment, in: -1...1, step: 0.05)
+							.frame(width: 120)
+							.help("Brightness")
+						Image(systemName: "circle.lefthalf.filled")
+							.foregroundStyle(.secondary)
+						Slider(value: $contrastAdjustment, in: 0.2...2.0, step: 0.05)
+							.frame(width: 120)
+							.help("Contrast")
+						Button(action: { resetAdjustments() }) {
+							Image(systemName: "arrow.uturn.backward")
+						}
+						.help("Reset brightness/contrast")
+						.disabled(abs(brightnessAdjustment) < 0.001 && abs(contrastAdjustment - 1) < 0.001)
+						Button(action: { Task { await saveEdits() } }) {
+							if isSavingEdits {
+								ProgressView().controlSize(.small)
+							} else {
+								Image(systemName: "square.and.arrow.down")
+							}
+						}
+						.help("Save edits to file")
+						.disabled(isSavingEdits || !hasPendingEdits || image == nil)
 					}
-					.help("Save edits to file")
-					.disabled(isSavingEdits || !hasPendingEdits || image == nil)
 				}
 			}
 		}
@@ -151,7 +223,8 @@ struct FullScreenPhotoView: View {
 		.onDisappear {
 			// If the user rotated but didn't explicitly save, persist the
 			// rotation automatically when the window closes.
-			if hasPendingEdits {
+			player?.pause()
+			if !isCurrentVideo && hasPendingEdits {
 				Task.detached(priority: .utility) {
 					await saveEdits()
 				}
@@ -162,6 +235,19 @@ struct FullScreenPhotoView: View {
 
 	private var hasPendingEdits: Bool {
 		rotationDegrees % 360 != 0 || abs(brightnessAdjustment) >= 0.001 || abs(contrastAdjustment - 1) >= 0.001
+	}
+
+	private var isCurrentVideo: Bool {
+		let contentType = try? currentURL.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if let contentType {
+			return contentType.conforms(to: .movie)
+				|| contentType.conforms(to: .video)
+				|| contentType.conforms(to: .audiovisualContent)
+		}
+		guard let type = UTType(filenameExtension: currentURL.pathExtension) else { return false }
+		return type.conforms(to: .movie)
+			|| type.conforms(to: .video)
+			|| type.conforms(to: .audiovisualContent)
 	}
 
 	private func configure(window: NSWindow?) {
@@ -208,10 +294,18 @@ struct FullScreenPhotoView: View {
 		}
 	}
 
-	private func loadImage() async {
+	private func loadMedia() async {
 		image = nil
+		player?.pause()
+		player = nil
 		loadFailed = false
 		let target = currentURL
+		if isCurrentVideo {
+			let nextPlayer = AVPlayer(url: target)
+			player = nextPlayer
+			nextPlayer.play()
+			return
+		}
 		let loaded = await Task.detached(priority: .userInitiated) {
 			NSImage(contentsOf: target)
 		}.value
@@ -255,6 +349,7 @@ struct FullScreenPhotoView: View {
 
 	private func navigate(to targetURL: URL) {
 		let previousURL = currentURL
+		player?.pause()
 		WindowStateStore.shared.recordClosedPhoto(previousURL)
 		currentURL = targetURL
 		resetAdjustments()

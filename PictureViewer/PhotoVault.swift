@@ -26,7 +26,7 @@ enum PhotoVaultError: LocalizedError {
         case .passwordMissing: "Enter the vault password in Settings first."
         case .passwordIncorrect: "The vault password is incorrect."
         case .invalidEncryptedFile: "The encrypted file is not a Picture Viewer vault file."
-        case .unsupportedFile: "The file is not a supported image."
+        case .unsupportedFile: "The file is not a supported media file."
         }
     }
 }
@@ -353,7 +353,7 @@ actor PhotoVault {
                 let src = urls[idx]
                 group.addTask { [self] in
                     if Task.isCancelled { return (idx, .failed) }
-                    guard isImageFile(src) else {
+                    guard isSupportedMediaFile(src) else {
                         logger.error("vault import:unsupported file=\(src.path, privacy: .public)")
                         return (idx, .failed)
                     }
@@ -374,7 +374,7 @@ actor PhotoVault {
                     let contentType = (try? src.resourceValues(forKeys: [.contentTypeKey]))?.contentType
                     let encryptedURL = uniqueEncryptedURL(for: src.lastPathComponent, in: destination)
                     do {
-                        let importData = try dataByAppendingKeywords(keywordsToAppend, toImageData: data)
+                        let importData = try dataByAppendingKeywordsIfPossible(keywordsToAppend, to: data, contentType: contentType)
                         try encryptData(
                             importData,
                             originalFilename: src.lastPathComponent,
@@ -756,9 +756,10 @@ actor PhotoVault {
         }
     }
 
-    private nonisolated func dataByAppendingKeywords(_ keywords: [String], toImageData data: Data) throws -> Data {
+    private nonisolated func dataByAppendingKeywordsIfPossible(_ keywords: [String], to data: Data, contentType: UTType?) throws -> Data {
         let normalizedKeywords = Self.normalizedKeywords(keywords)
         guard !normalizedKeywords.isEmpty else { return data }
+        guard contentType?.conforms(to: .image) == true else { return data }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let type = CGImageSourceGetType(source) else {
             throw PhotoVaultError.unsupportedFile
@@ -817,7 +818,7 @@ actor PhotoVault {
 
     private nonisolated func encryptFile(at sourceURL: URL, to encryptedURL: URL, key: SymmetricKey) throws {
         let values = try sourceURL.resourceValues(forKeys: [.contentTypeKey])
-        guard values.contentType?.conforms(to: .image) == true || isImageFile(sourceURL) else {
+        guard PhotoLibrary.isSupportedMediaFile(sourceURL, contentType: values.contentType) else {
             throw PhotoVaultError.unsupportedFile
         }
         let data = try Data(contentsOf: sourceURL)
@@ -1034,13 +1035,9 @@ actor PhotoVault {
         }
     }
 
-    private nonisolated func isImageFile(_ url: URL) -> Bool {
-        if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
-           values.contentType?.conforms(to: .image) == true {
-            return true
-        }
-        guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-        return type.conforms(to: .image)
+    private nonisolated func isSupportedMediaFile(_ url: URL) -> Bool {
+        let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        return PhotoLibrary.isSupportedMediaFile(url, contentType: contentType)
     }
 
     private func encryptedURL(forWorkingURL workingURL: URL) -> URL? {
