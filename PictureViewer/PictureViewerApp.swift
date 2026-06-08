@@ -19,12 +19,21 @@ struct PictureViewerApp: App {
 	init() {
 		// Touch the lazy CPU detection so the worker count is computed at launch.
 		_ = PhotoLibrary.workerCount
+		let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
+		let embeddedVLCIsAvailable = EmbeddedVLCPlayerView.isAvailable
+		EmbeddedVLCPlayerView.logAvailabilityResult(context: "app launch")
+		if embeddedVLCIsAvailable {
+			UserDefaults.standard.set(true, forKey: "useVLCForVideoPlayback")
+			logger.log("vlc embedded: auto-enabled setting useVLCForVideoPlayback=true at launch")
+		} else {
+			let currentSetting = UserDefaults.standard.bool(forKey: "useVLCForVideoPlayback")
+			logger.log("vlc embedded: not auto-enabling setting at launch; embedded runtime unavailable currentSetting=\(currentSetting, privacy: .public)")
+		}
 		// Respect a runtime toggle to defer potentially expensive background
 		// work at launch while debugging responsiveness. Set the UserDefault
 		// key "deferAtLaunchBackgroundWork" to false to re-enable the
 		// default background work (thumbnail cache sweep).
 		let deferAtLaunch = UserDefaults.standard.object(forKey: "deferAtLaunchBackgroundWork") as? Bool ?? true
-		let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
 		if deferAtLaunch {
 			logger.log("Deferring at-launch background work: thumbnail sweep disabled")
 		} else {

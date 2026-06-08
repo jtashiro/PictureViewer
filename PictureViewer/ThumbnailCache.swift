@@ -118,6 +118,25 @@ final class ThumbnailCache: @unchecked Sendable {
 		}
 	}
 
+	func jpegData(for url: URL, namespace: String? = nil) -> Data? {
+		guard let image = image(for: url, namespace: namespace) ?? memoryImage(for: url, namespace: namespace) else {
+			return nil
+		}
+		return Self.jpegData(from: image)
+	}
+
+	static func jpegData(from image: NSImage, compressionFactor: CGFloat = 0.85) -> Data? {
+		guard
+			let tiff = image.tiffRepresentation,
+			let rep = NSBitmapImageRep(data: tiff)
+		else { return nil }
+		return rep.representation(using: .jpeg, properties: [.compressionFactor: compressionFactor])
+	}
+
+	static func image(fromJPEGData data: Data) -> NSImage? {
+		NSImage(data: data)
+	}
+
 	/// Clears both memory and disk caches.
 	func clear() {
 		memCache.removeAllObjects()
@@ -125,7 +144,7 @@ final class ThumbnailCache: @unchecked Sendable {
 		pinnedImages.removeAll()
 		pinnedImagesLock.unlock()
 		let dir = cacheDirectory
-		writeQueue.async(flags: .barrier) {
+		writeQueue.sync(flags: .barrier) {
 			try? FileManager.default.removeItem(at: dir)
 			try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 		}

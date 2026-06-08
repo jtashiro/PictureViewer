@@ -94,15 +94,20 @@ struct FullScreenPhotoView: View {
 	}
 
 	@AppStorage("photoDisplayMode") private var displayMode: PhotoDisplayMode = .fullScreen
+	@AppStorage("useVLCForVideoPlayback") private var useVLCForVideoPlayback: Bool = false
 
 	@State private var image: NSImage?
 	@State private var player: AVPlayer?
 	@State private var loadFailed = false
+	@State private var materializedURL: URL?
 	@State private var rotationDegrees: Int = 0
 	@State private var brightnessAdjustment: Double = 0
 	@State private var contrastAdjustment: Double = 1
 	@State private var isSavingEdits: Bool = false
 	@State private var didConfigureWindow = false
+	@State private var embeddedVLCControlBarOffset: CGSize = .zero
+	@State private var embeddedVLCControlBarDragStart: CGSize = .zero
+	@StateObject private var embeddedVLCController = EmbeddedVLCPlaybackController()
 	@Environment(\.dismiss) private var dismiss
 
 	var body: some View {
@@ -111,13 +116,39 @@ struct FullScreenPhotoView: View {
 				.ignoresSafeArea()
 
 			if isCurrentVideo {
-				if let player {
+				if usesEmbeddedVLC {
+					if let materializedURL {
+						ZStack(alignment: .bottom) {
+							EmbeddedVLCPlayerView(url: materializedURL, controller: embeddedVLCController)
+								.frame(minWidth: 1, minHeight: 1)
+								.ignoresSafeArea()
+							embeddedVLCControlBar
+								.padding(.horizontal, 24)
+								.padding(.bottom, 20)
+								.offset(embeddedVLCControlBarOffset)
+								.gesture(embeddedVLCControlBarDragGesture)
+						}
+					} else if loadFailed {
+						VStack(spacing: 12) {
+							Image(systemName: "video")
+								.font(.system(size: 56))
+								.foregroundStyle(.secondary)
+							Text("Cannot Display Video")
+								.font(.title3)
+								.foregroundStyle(.secondary)
+						}
+					} else {
+						ProgressView()
+							.controlSize(.large)
+							.tint(.white)
+					}
+				} else if let player {
 					NativeVideoPlayerView(player: player)
 						.frame(minWidth: 1, minHeight: 1)
 						.ignoresSafeArea()
 				} else if loadFailed {
 					VStack(spacing: 12) {
-						Image(systemName: "video.badge.exclamationmark")
+						Image(systemName: "video")
 							.font(.system(size: 56))
 							.foregroundStyle(.secondary)
 						Text("Cannot Display Video")
@@ -158,7 +189,13 @@ struct FullScreenPhotoView: View {
 		.focusable()
 		.focusEffectDisabled()
 		.onKeyPress(.escape) {
+			stopPlayback()
 			dismiss()
+			return .handled
+		}
+		.onKeyPress(.space) {
+			guard usesEmbeddedVLC else { return .ignored }
+			embeddedVLCController.togglePlayPause()
 			return .handled
 		}
 		.onKeyPress(.leftArrow) {
@@ -223,7 +260,7 @@ struct FullScreenPhotoView: View {
 		.onDisappear {
 			// If the user rotated but didn't explicitly save, persist the
 			// rotation automatically when the window closes.
-			player?.pause()
+			stopPlayback()
 			if !isCurrentVideo && hasPendingEdits {
 				Task.detached(priority: .utility) {
 					await saveEdits()
@@ -237,17 +274,88 @@ struct FullScreenPhotoView: View {
 		rotationDegrees % 360 != 0 || abs(brightnessAdjustment) >= 0.001 || abs(contrastAdjustment - 1) >= 0.001
 	}
 
+	private var embeddedVLCControlBar: some View {
+		HStack(spacing: 12) {
+			Button {
+				embeddedVLCController.skip(by: -10)
+			} label: {
+				Image(systemName: "gobackward.10")
+			}
+			.help("Back 10 seconds")
+
+			Button {
+				embeddedVLCController.togglePlayPause()
+			} label: {
+				Image(systemName: embeddedVLCController.isPlaying ? "pause.fill" : "play.fill")
+			}
+			.help(embeddedVLCController.isPlaying ? "Pause" : "Play")
+
+			Button {
+				embeddedVLCController.stop()
+			} label: {
+				Image(systemName: "stop.fill")
+			}
+			.help("Stop")
+
+			Button {
+				embeddedVLCController.skip(by: 10)
+			} label: {
+				Image(systemName: "goforward.10")
+			}
+			.help("Forward 10 seconds")
+
+			Text(formatPlaybackTime(embeddedVLCController.currentTime))
+				.monospacedDigit()
+				.foregroundStyle(.white)
+				.frame(width: 54, alignment: .trailing)
+
+			Slider(
+				value: Binding(
+					get: { embeddedVLCController.currentTime },
+					set: { embeddedVLCController.seek(to: $0) }
+				),
+				in: 0...max(embeddedVLCController.duration, 1)
+			)
+			.frame(minWidth: 180)
+
+			Text(formatPlaybackTime(embeddedVLCController.duration))
+				.monospacedDigit()
+				.foregroundStyle(.white)
+				.frame(width: 54, alignment: .leading)
+		}
+		.buttonStyle(.bordered)
+		.controlSize(.large)
+		.padding(.horizontal, 14)
+		.padding(.vertical, 10)
+		.frame(maxWidth: 760)
+		.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+		.overlay {
+			RoundedRectangle(cornerRadius: 8)
+				.stroke(.white.opacity(0.18), lineWidth: 1)
+		}
+		.shadow(color: .black.opacity(0.45), radius: 18, x: 0, y: 8)
+	}
+
+	private var embeddedVLCControlBarDragGesture: some Gesture {
+		DragGesture()
+			.onChanged { value in
+				embeddedVLCControlBarOffset = CGSize(
+					width: embeddedVLCControlBarDragStart.width + value.translation.width,
+					height: embeddedVLCControlBarDragStart.height + value.translation.height
+				)
+			}
+			.onEnded { _ in
+				embeddedVLCControlBarDragStart = embeddedVLCControlBarOffset
+			}
+	}
+
 	private var isCurrentVideo: Bool {
 		let contentType = try? currentURL.resourceValues(forKeys: [.contentTypeKey]).contentType
-		if let contentType {
-			return contentType.conforms(to: .movie)
-				|| contentType.conforms(to: .video)
-				|| contentType.conforms(to: .audiovisualContent)
-		}
-		guard let type = UTType(filenameExtension: currentURL.pathExtension) else { return false }
-		return type.conforms(to: .movie)
-			|| type.conforms(to: .video)
-			|| type.conforms(to: .audiovisualContent)
+		return PhotoLibrary.isVideoMediaFile(currentURL, contentType: contentType)
+	}
+
+	private var usesEmbeddedVLC: Bool {
+		isCurrentVideo && useVLCForVideoPlayback && EmbeddedVLCPlayerView.isAvailable
 	}
 
 	private func configure(window: NSWindow?) {
@@ -298,16 +406,34 @@ struct FullScreenPhotoView: View {
 		image = nil
 		player?.pause()
 		player = nil
+		materializedURL = nil
 		loadFailed = false
 		let target = currentURL
+		_ = SecurityScopedResourceAccess.ensureAccess(for: target)
+		let readableURL: URL
+		do {
+			readableURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(target)
+		} catch {
+			loadFailed = true
+			return
+		}
+		if Task.isCancelled { return }
+		materializedURL = readableURL
 		if isCurrentVideo {
-			let nextPlayer = AVPlayer(url: target)
+			if usesEmbeddedVLC {
+				return
+			}
+			if PhotoLibrary.requiresExternalVideoPlayer(readableURL) {
+				loadFailed = true
+				return
+			}
+			let nextPlayer = AVPlayer(url: readableURL)
 			player = nextPlayer
 			nextPlayer.play()
 			return
 		}
 		let loaded = await Task.detached(priority: .userInitiated) {
-			NSImage(contentsOf: target)
+			NSImage(contentsOf: readableURL)
 		}.value
 		if Task.isCancelled { return }
 		if let loaded {
@@ -349,7 +475,7 @@ struct FullScreenPhotoView: View {
 
 	private func navigate(to targetURL: URL) {
 		let previousURL = currentURL
-		player?.pause()
+		stopPlayback()
 		WindowStateStore.shared.recordClosedPhoto(previousURL)
 		currentURL = targetURL
 		resetAdjustments()
@@ -391,6 +517,23 @@ struct FullScreenPhotoView: View {
 		let window = candidate ?? NSApp.keyWindow
 		window?.title = newURL.lastPathComponent
 		window?.representedURL = newURL
+	}
+
+	private func stopPlayback() {
+		player?.pause()
+		embeddedVLCController.stop()
+	}
+
+	private func formatPlaybackTime(_ seconds: TimeInterval) -> String {
+		guard seconds.isFinite, seconds > 0 else { return "0:00" }
+		let totalSeconds = Int(seconds.rounded(.down))
+		let hours = totalSeconds / 3600
+		let minutes = (totalSeconds / 60) % 60
+		let remainingSeconds = totalSeconds % 60
+		if hours > 0 {
+			return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+		}
+		return String(format: "%d:%02d", minutes, remainingSeconds)
 	}
 
 	/// Save rotation/brightness/contrast by writing a versioned "-edit-#" file

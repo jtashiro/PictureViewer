@@ -91,9 +91,7 @@ actor PhotoVault {
 
     nonisolated static func clearWorkingCopiesOnDisk() {
         let fm = FileManager.default
-        guard let base = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-            .appendingPathComponent("PictureViewer/VaultWorking", isDirectory: true)
-        else { return }
+        let base = AppWorkingDirectory.vaultWorkingURL()
         if let contents = try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) {
             for url in contents {
                 try? fm.removeItem(at: url)
@@ -964,8 +962,7 @@ actor PhotoVault {
     }
 
     private nonisolated func workingDirectory() throws -> URL {
-        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("PictureViewer/VaultWorking", isDirectory: true)
+        let base = AppWorkingDirectory.vaultWorkingURL()
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }
@@ -1102,8 +1099,7 @@ actor PhotoVault {
     }
 
     private nonisolated static func workingMapFileURL() throws -> URL {
-        let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("PictureViewer", isDirectory: true)
+        let base = AppWorkingDirectory.vaultWorkingURL()
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent(Self.workingMapFilename, isDirectory: false)
     }

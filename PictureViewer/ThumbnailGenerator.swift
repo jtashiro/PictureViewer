@@ -66,6 +66,7 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		if AppLogLevel.current.allows(.debug) {
 			qlLogger.debug("generateThumbnail:start url=\(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
 		}
+		_ = SecurityScopedResourceAccess.ensureAccess(for: url)
 		// Determine scale on main actor if needed.
 		let actualScale: CGFloat
 		if let s = scale {
@@ -90,23 +91,30 @@ final class ThumbnailGenerator: @unchecked Sendable {
 			return rep.nsImage
 		} catch {
 			guard Self.isVideo(url) else { throw error }
-			let fallback = try Self.generateVideoFrameThumbnail(for: url)
-			Task { await Telemetry.shared.recordThumbnail() }
-			return fallback
+			do {
+				let fallback = try Self.generateVideoFrameThumbnail(for: url)
+				Task { await Telemetry.shared.recordThumbnail() }
+				return fallback
+			} catch {
+				qlLogger.error("generateThumbnail: video frame fallback failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				do {
+					let vlcThumbnail = try await EmbeddedVLCPlayerView.generateThumbnail(for: url)
+					qlLogger.log("generateThumbnail: generated VLC snapshot thumbnail url=\(url.path, privacy: .public)")
+					Task { await Telemetry.shared.recordThumbnail() }
+					return vlcThumbnail
+				} catch {
+					qlLogger.error("generateThumbnail: VLC snapshot fallback failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				}
+				let fallback = Self.genericVideoThumbnail(for: url)
+				Task { await Telemetry.shared.recordThumbnail() }
+				return fallback
+			}
 		}
 	}
 
 	private static func isVideo(_ url: URL) -> Bool {
 		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
-		if let contentType {
-			return contentType.conforms(to: .movie)
-				|| contentType.conforms(to: .video)
-				|| contentType.conforms(to: .audiovisualContent)
-		}
-		guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-		return type.conforms(to: .movie)
-			|| type.conforms(to: .video)
-			|| type.conforms(to: .audiovisualContent)
+		return PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
 	}
 
 	private static func generateVideoFrameThumbnail(for url: URL) throws -> NSImage {
@@ -114,8 +122,20 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		let generator = AVAssetImageGenerator(asset: asset)
 		generator.appliesPreferredTrackTransform = true
 		generator.maximumSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
-		let time = CMTime(seconds: 0.1, preferredTimescale: 600)
+		let duration = asset.duration
+		let durationSeconds = duration.seconds.isFinite ? duration.seconds : 0
+		let requestedSeconds = durationSeconds > 31 ? 30 : max(0.1, durationSeconds * 0.5)
+		let time = CMTime(seconds: requestedSeconds, preferredTimescale: 600)
 		let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+		if AppLogLevel.current.allows(.debug) {
+			qlLogger.debug("generateThumbnail: generated video frame thumbnail url=\(url.path, privacy: .public) requestedSeconds=\(requestedSeconds, privacy: .public)")
+		}
 		return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+	}
+
+	private static func genericVideoThumbnail(for url: URL) -> NSImage {
+		let icon = NSWorkspace.shared.icon(forFile: url.path)
+		icon.size = NSSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
+		return icon
 	}
 }

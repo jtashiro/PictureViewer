@@ -36,8 +36,20 @@ final class PhotoLibrary: ObservableObject {
 	}()
 
 	nonisolated static var supportedMediaContentTypes: [UTType] {
-		[.image, .movie, .video, .audiovisualContent]
+		var types: [UTType] = [.image, .movie, .video, .audiovisualContent]
+		if let wmvType = UTType(filenameExtension: "wmv") {
+			types.append(wmvType)
+		}
+		if let flvType = UTType(filenameExtension: "flv") {
+			types.append(flvType)
+		}
+		return types
 	}
+
+	private nonisolated static let supportedVideoExtensions: Set<String> = [
+		"flv",
+		"wmv"
+	]
 
 	nonisolated static func isSupportedMediaType(_ type: UTType) -> Bool {
 		supportedMediaContentTypes.contains { supportedType in
@@ -49,10 +61,32 @@ final class PhotoLibrary: ObservableObject {
 		if let contentType, isSupportedMediaType(contentType) {
 			return true
 		}
+		if supportedVideoExtensions.contains(url.pathExtension.lowercased()) {
+			return true
+		}
 		guard let extensionType = UTType(filenameExtension: url.pathExtension) else {
 			return false
 		}
 		return isSupportedMediaType(extensionType)
+	}
+
+	nonisolated static func isVideoMediaFile(_ url: URL, contentType: UTType? = nil) -> Bool {
+		if supportedVideoExtensions.contains(url.pathExtension.lowercased()) {
+			return true
+		}
+		if let contentType {
+			return contentType.conforms(to: .movie)
+				|| contentType.conforms(to: .video)
+				|| contentType.conforms(to: .audiovisualContent)
+		}
+		guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+		return type.conforms(to: .movie)
+			|| type.conforms(to: .video)
+			|| type.conforms(to: .audiovisualContent)
+	}
+
+	nonisolated static func requiresExternalVideoPlayer(_ url: URL) -> Bool {
+		supportedVideoExtensions.contains(url.pathExtension.lowercased())
 	}
 
 	nonisolated static var cpuSummary: String {

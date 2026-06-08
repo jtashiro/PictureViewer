@@ -54,7 +54,7 @@ struct ThumbnailView: View {
 						.scaledToFit()
 						.padding(2)
 				} else if loadFailed {
-					Image(systemName: isVideo ? "video.badge.exclamationmark" : "photo.badge.exclamationmark")
+					Image(systemName: isVideo ? "video" : "photo.badge.exclamationmark")
 						.imageScale(.large)
 						.foregroundStyle(.secondary)
 				} else {
@@ -120,15 +120,7 @@ struct ThumbnailView: View {
 
 	private var isVideo: Bool {
 		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
-		if let contentType {
-			return contentType.conforms(to: .movie)
-				|| contentType.conforms(to: .video)
-				|| contentType.conforms(to: .audiovisualContent)
-		}
-		guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
-		return type.conforms(to: .movie)
-			|| type.conforms(to: .video)
-			|| type.conforms(to: .audiovisualContent)
+		return PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
 	}
 
 	private func loadThumbnail() async {
@@ -147,6 +139,7 @@ struct ThumbnailView: View {
 		}
 
 		let target = url
+		_ = SecurityScopedResourceAccess.ensureAccess(for: target)
 
 		// 1) Try the persistent cache off the main thread.
 		let ns = namespace
@@ -192,9 +185,23 @@ struct ThumbnailView: View {
 		// low-res preview.
 		Task.detached(priority: .utility) {
 			do {
-				let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: target)
+				let thumbnailSource: URL
+				if SQLiteObjectStore.isWorkingCopyURL(target),
+				   !FileManager.default.fileExists(atPath: target.path) {
+					guard forceLoad else {
+						return
+					}
+					thumbnailSource = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(target)
+				} else {
+					thumbnailSource = target
+				}
+				let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: thumbnailSource)
 				// Store to cache (mem+disk) off the main actor.
 				await ThumbnailCache.shared.store(nsImage, for: target, namespace: namespace)
+				if SQLiteObjectStore.isWorkingCopyURL(target),
+				   let thumbnailData = await MainActor.run(body: { ThumbnailCache.jpegData(from: nsImage) }) {
+					try? await SQLiteObjectStore.shared.storeThumbnailData(thumbnailData, forWorkingFile: target)
+				}
 				// Publish to UI on the main actor if still relevant.
 				await MainActor.run {
 					if !Task.isCancelled {
