@@ -798,7 +798,21 @@ struct ContentView: View {
 	var body: some View {
 		NavigationStack {
 			VStack(spacing: 0) {
-				statusBar
+				StatusBarView(
+					library: library,
+					isRefreshing: isRefreshing,
+					isSQLiteObjectStoreView: isSQLiteObjectStoreView,
+					isVaultWorking: isVaultWorking,
+					vaultProgressMessage: vaultProgressMessage,
+					vaultProgressTotal: vaultProgressTotal,
+					vaultProgressCompleted: vaultProgressCompleted,
+					sqliteLoadStartDate: sqliteLoadStartDate,
+					sqliteLastLoadDuration: sqliteLastLoadDuration,
+					sqliteLastThumbnailLoadDuration: sqliteLastThumbnailLoadDuration,
+					lastRefreshDate: lastRefreshDate,
+					lastRefreshDuration: lastRefreshDuration,
+					onRefreshThumbnails: { refreshThumbnails() }
+				)
 					.fixedSize(horizontal: false, vertical: true)
 				Divider()
 				contentBody
@@ -1607,149 +1621,23 @@ struct ContentView: View {
 		)
 	}
 
-	// MARK: - Status bar (single, compact line)
-
-	private var statusBar: some View {
-		HStack(spacing: 8) {
-			statusIcon
-			statusText
-				.lineLimit(1)
-				.truncationMode(.middle)
-			Spacer(minLength: 8)
-			Button {
-				refreshThumbnails()
-			} label: {
-				Label("Refresh Thumbnails", systemImage: "arrow.clockwise")
-			}
-			.controlSize(.small)
-			.help("Clear cached thumbnails and regenerate them")
-			.disabled(library.photos.isEmpty || isRefreshing)
-		}
-		.font(.caption)
-		.padding(.horizontal, 10)
-		.padding(.vertical, 4)
-		.background(.bar)
-	}
-
-	@ViewBuilder
-	private var statusIcon: some View {
-		if library.isScanning || isRefreshing || (isSQLiteObjectStoreView && isVaultWorking) {
-			ProgressView().controlSize(.mini)
-		} else if library.lastScanDate != nil {
-			Image(systemName: "photo.stack").foregroundStyle(.secondary)
-		} else {
-			Image(systemName: "photo.on.rectangle.angled").foregroundStyle(.secondary)
-		}
-	}
-
-	@ViewBuilder
-	private var statusText: some View {
-		if library.isScanning {
-			HStack(spacing: 6) {
-				Text("Scanning \(library.folderURL?.lastPathComponent ?? "")…")
-				bullet
-				Text("\(mediaStatusSummary(for: library.photos)) found")
-					.foregroundStyle(.secondary)
-				if let start = library.scanStartDate {
-					bullet
-					TimelineView(.periodic(from: start, by: 0.5)) { context in
-						Text("elapsed \(Self.format(duration: context.date.timeIntervalSince(start)))")
-							.foregroundStyle(.secondary)
-							.monospacedDigit()
-					}
-				}
-			}
-		} else if isRefreshing {
-			Text("Refreshing thumbnails…").foregroundStyle(.secondary)
-		} else if isSQLiteObjectStoreView {
-			HStack(spacing: 6) {
-				Text("\(mediaStatusSummary(for: library.photos)) in SQLite store")
-					.foregroundStyle(.secondary)
-				if isVaultWorking {
-					bullet
-					Text(vaultProgressMessage.isEmpty ? "Opening SQLite store..." : vaultProgressMessage)
-						.foregroundStyle(.secondary)
-					if vaultProgressTotal > 0 {
-						bullet
-						Text("\(vaultProgressCompleted) of \(vaultProgressTotal)")
-							.foregroundStyle(.secondary)
-							.monospacedDigit()
-					}
-					if let sqliteLoadStartDate {
-						bullet
-						TimelineView(.periodic(from: sqliteLoadStartDate, by: 0.5)) { context in
-							Text("elapsed \(Self.format(duration: context.date.timeIntervalSince(sqliteLoadStartDate)))")
-								.foregroundStyle(.secondary)
-								.monospacedDigit()
-						}
-					}
-				} else if let sqliteLastLoadDuration {
-					bullet
-					Text("loaded in \(Self.format(duration: sqliteLastLoadDuration))")
-						.foregroundStyle(.secondary)
-						.monospacedDigit()
-					if let sqliteLastThumbnailLoadDuration {
-						bullet
-						Text("thumbnails in \(Self.format(duration: sqliteLastThumbnailLoadDuration))")
-							.foregroundStyle(.secondary)
-							.monospacedDigit()
-					}
-				}
-			}
-		} else if let date = library.lastScanDate {
-			HStack(spacing: 6) {
-				Text(mediaStatusSummary(for: library.photos))
-				bullet
-				Text("scanned \(date.formatted(date: .abbreviated, time: .shortened))")
-					.foregroundStyle(.secondary)
-				if let dur = library.lastScanDuration {
-					Text("in \(Self.format(duration: dur))")
-						.foregroundStyle(.secondary)
-						.monospacedDigit()
-				}
-				if let rDate = lastRefreshDate, let rDur = lastRefreshDuration {
-					bullet
-					Text("thumbnails refreshed \(rDate.formatted(date: .omitted, time: .shortened)) in \(Self.format(duration: rDur))")
-						.foregroundStyle(.secondary)
-						.monospacedDigit()
-				}
-			}
-		} else {
-			Text("No folder scanned yet").foregroundStyle(.secondary)
-		}
-	}
-
-	private var bullet: some View {
-		Text("·").foregroundStyle(.tertiary)
-	}
-
-	private func mediaStatusSummary(for items: [PhotoItem]) -> String {
-		let videoCount = items.reduce(into: 0) { count, item in
-			let contentType = try? item.url.resourceValues(forKeys: [.contentTypeKey]).contentType
-			if PhotoLibrary.isVideoMediaFile(item.url, contentType: contentType) {
-				count += 1
-			}
-		}
-		let totalCount = items.count
-		let photoCount = max(0, totalCount - videoCount)
-		let totalLabel = totalCount.formatted()
-		let photoLabel = "\(photoCount.formatted()) photo\(photoCount == 1 ? "" : "s")"
-		let videoLabel = "\(videoCount.formatted()) video\(videoCount == 1 ? "" : "s")"
-		return "\(totalLabel) (\(photoLabel), \(videoLabel))"
-	}
-
-	private static func format(duration: TimeInterval) -> String {
-		if duration < 1 {
-			return String(format: "%.0f ms", duration * 1000)
-		} else if duration < 60 {
-			return String(format: "%.1f s", duration)
-		} else {
-			let total = Int(duration)
-			return "\(total / 60)m \(total % 60)s"
-		}
-	}
-
 	// MARK: - Main content
+
+	private func triggerRepairMetadata(for url: URL) {
+		Task.detached(priority: .utility) {
+			let (ok, msg) = await Self.repairMetadata(for: url)
+			await MainActor.run {
+				if ok {
+					refreshToken = UUID()
+					repairResultMessage = "Repair succeeded for \(url.lastPathComponent)"
+				} else {
+					logger.error("Repair metadata failed: \(msg ?? "")")
+					repairResultMessage = "Repair failed for \(url.lastPathComponent): \(msg ?? "Unknown error")"
+				}
+				showRepairResult = true
+			}
+		}
+	}
 
 	@ViewBuilder
 	private var contentBody: some View {
@@ -1855,80 +1743,20 @@ struct ContentView: View {
 					spacing: 10
 				) {
 					ForEach(displayedPhotos) { photo in
-						let isSelected = isPhotoSelected(photo.url)
-						ZStack(alignment: .topTrailing) {
-							VStack(spacing: 4) {
-								ThumbnailView(
-									url: photo.url,
-									size: thumbnailSize,
-									refreshToken: refreshToken,
-									metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
-									forceLoad: forceThumbnailLoading
-								)
-								// Filename and keywords are rendered by ThumbnailView now.
-							}
-							.overlay {
-								RoundedRectangle(cornerRadius: 8)
-									.stroke(isSelected ? Color.accentColor : .clear, lineWidth: 3)
-							}
-							if selectionMode {
-								// Selection badge
-								Group {
-									if isSelected {
-										Image(systemName: "checkmark.circle.fill")
-											.foregroundStyle(.white, .blue)
-											.background(Circle().fill(Color.blue))
-									} else {
-										Image(systemName: "circle")
-											.foregroundStyle(.secondary)
-									}
-								}
-								.padding(6)
-							}
-						}
-						.id(photo.url)
-						.background {
-							GeometryReader { proxy in
-								Color.clear
-									.preference(key: ThumbnailFramePreferenceKey.self, value: [photo.url: proxy.frame(in: .named("photoGridArea"))])
-							}
-						}
-						.contentShape(Rectangle())
-						.onTapGesture {
-							handleThumbnailSingleClick(photo.url)
-						}
-						.onTapGesture(count: 2) {
-							openPhotoViewer(photo.url)
-						}
-						.contextMenu {
-							let contextURLs = contextActionURLs(for: photo.url)
-							Button(contextURLs.count > 1 ? "Show Selected in Finder" : "Show in Finder") {
-								NSWorkspace.shared.activateFileViewerSelecting(contextURLs)
-							}
-							Button(contextURLs.count > 1 ? "Open Selected with Default App" : "Open with Default App") {
-								for url in contextURLs { NSWorkspace.shared.open(url) }
-							}
-							Button(contextURLs.count > 1 ? "Copy Selected Files" : "Copy File") {
-								copyFilesToPasteboard(contextURLs)
-							}
-							Divider()
-							Button("Repair metadata") {
-								Task.detached(priority: .utility) {
-									let (ok, msg) = await Self.repairMetadata(for: photo.url)
-									await MainActor.run {
-										if ok {
-											// Force a thumbnail refresh and log
-											refreshToken = UUID()
-											repairResultMessage = "Repair succeeded for \(photo.url.lastPathComponent)"
-										} else {
-											logger.error("Repair metadata failed: \(msg ?? "")")
-											repairResultMessage = "Repair failed for \(photo.url.lastPathComponent): \(msg ?? "Unknown error")"
-										}
-										showRepairResult = true
-									}
-								}
-							}
-						}
+						PhotoGridCell(
+							url: photo.url,
+							size: thumbnailSize,
+							refreshToken: refreshToken,
+							metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
+							forceLoad: forceThumbnailLoading,
+							isSelected: isPhotoSelected(photo.url),
+							selectionMode: selectionMode,
+							contextActionURLs: { contextActionURLs(for: photo.url) },
+							onSingleClick: { handleThumbnailSingleClick(photo.url) },
+							onDoubleClick: { openPhotoViewer(photo.url) },
+							onCopyFiles: copyFilesToPasteboard,
+							onRepairMetadata: { triggerRepairMetadata(for: photo.url) }
+						)
 					}
 				}
 				.padding(12)
