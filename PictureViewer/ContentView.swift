@@ -36,6 +36,12 @@ struct ContentView: View {
 		}
 	}
 
+	private enum KeywordEditOperation: Sendable {
+		case append
+		case replace
+		case clear
+	}
+
 	@State private var initialFolderURL: URL?
 	@State private var initialSQLiteStoreName: String?
 	@State private var tabID = UUID()
@@ -607,6 +613,7 @@ struct ContentView: View {
 	@State private var photoGridScrollRequest: PhotoGridScrollRequest? = nil
 	private let thumbnailDraggingSource = ThumbnailDraggingSource()
 	@State private var isEditingKeywords: Bool = false
+	@State private var keywordEditTargets: [URL] = []
 	@State private var editKeywordsText: String = ""
 	@State private var isApplyingKeywords: Bool = false
 	@State private var editProgressCount: Int = 0
@@ -620,6 +627,14 @@ struct ContentView: View {
 	@State private var isRescanningFaces: Bool = false
 	@State private var showFaceRescanResult: Bool = false
 	@State private var faceRescanResultMessage: String = ""
+	@State private var isTeachingPersonRecognition: Bool = false
+	@State private var teachPersonRecognitionName: String = ""
+	@State private var isPersonRecognitionWorking: Bool = false
+	@State private var personRecognitionProgressMessage: String = ""
+	@State private var personRecognitionProgressCompleted: Int = 0
+	@State private var personRecognitionProgressTotal: Int = 0
+	@State private var showPersonRecognitionResult: Bool = false
+	@State private var personRecognitionResultMessage: String = ""
 	@State private var personFilterPaths: Set<String>? = nil
 	@State private var personFilterID: UUID? = nil
 	@State private var showDeleteConfirmation: Bool = false
@@ -719,6 +734,7 @@ struct ContentView: View {
 	@State private var isShowingOllamaPromptSheet: Bool = false
 	@AppStorage("ollamaLastPrompt") private var ollamaPrompt: String = OllamaRecognizer.defaultPrompt
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
+	@AppStorage("ollamaUpdateMetadata") private var ollamaUpdateMetadata: Bool = true
 	@State private var vaultUnlockPassword: String = ""
 	@State private var vaultUnlockConfirmation: String = ""
 	@State private var vaultUnlockMessage: String?
@@ -1058,14 +1074,17 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isEditingKeywords) {
 			VStack(spacing: 12) {
-				Text("Edit Keywords for \(selectedPhotoCount) photos")
+				Text("Edit Keywords for \(keywordEditTargets.count) photo\(keywordEditTargets.count == 1 ? "" : "s")")
 					.font(.headline)
 				TextField("Keywords (comma-separated)", text: $editKeywordsText)
 					.textFieldStyle(.roundedBorder)
 					.padding(.horizontal)
+				Text("Append adds to existing IPTC keywords. Replace overwrites them. Clear removes all IPTC keywords.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+					.padding(.horizontal)
 
-				// Results list + progress
-				let urls = selectedPhotoURLs
+				let urls = keywordEditTargets
 				if !urls.isEmpty {
 					ProgressView(value: Double(editProgressCount), total: Double(urls.count))
 						.padding(.horizontal)
@@ -1086,13 +1105,11 @@ struct ContentView: View {
 										} else {
 											Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
 										}
-									} else {
-										if let res = editingResults[u] {
-											if res == true {
-												Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-											} else {
-												Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-											}
+									} else if let res = editingResults[u] {
+										if res == true {
+											Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+										} else {
+											Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
 										}
 									}
 								}
@@ -1105,7 +1122,6 @@ struct ContentView: View {
 
 				HStack {
 					Button("Cancel") {
-						// Prevent cancel while applying; otherwise just close
 						if !isApplyingKeywords {
 							isEditingKeywords = false
 						}
@@ -1114,61 +1130,21 @@ struct ContentView: View {
 					Spacer()
 					if isApplyingKeywords {
 						Button("Close") {
-							// allow closing the sheet while apply runs in background
 							isEditingKeywords = false
 						}
 					} else {
-						Button("Apply") {
-							let parts = editKeywordsText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-							guard !parts.isEmpty else { return }
-							// Prepare progress state
-							let urls = selectedPhotoURLs
-							editingResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
-							editProgressCount = 0
-							isApplyingKeywords = true
-							Task.detached(priority: .utility) {
-								let workerCount = max(1, min(urls.count, PhotoLibrary.workerCount))
-								await withTaskGroup(of: (URL, Bool).self) { group in
-									var nextIndex = 0
-
-									func enqueueNext() {
-										guard nextIndex < urls.count else { return }
-										let url = urls[nextIndex]
-										nextIndex += 1
-										group.addTask {
-											if Task.isCancelled { return (url, false) }
-											let ok = await Self.writeKeywords(to: url, keywords: parts)
-											return (url, ok)
-										}
-									}
-
-									for _ in 0..<workerCount {
-										enqueueNext()
-									}
-
-									while let (url, ok) = await group.next() {
-										await MainActor.run {
-											editingResults[url] = ok
-											editProgressCount += 1
-											if ok {
-												queueMetadataRefresh(for: url)
-											}
-											logger.log("writeKeywords: success=\(ok, privacy: .public)")
-										}
-										enqueueNext()
-									}
-								}
-								await MainActor.run {
-									// Remove successful items from selection to indicate completion
-									for (u, res) in editingResults {
-										if res == true { removeFromSelection(u) }
-									}
-									isApplyingKeywords = false
-									scheduleSort()
-								}
-							}
+						Button("Clear Keywords") {
+							applyKeywordEdit(.clear)
 						}
-						.disabled(editKeywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasSelectedPhotos)
+						.disabled(keywordEditTargets.isEmpty)
+						Button("Append") {
+							applyKeywordEdit(.append)
+						}
+						.disabled(editKeywordsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || keywordEditTargets.isEmpty)
+						Button("Replace") {
+							applyKeywordEdit(.replace)
+						}
+						.disabled(keywordEditTargets.isEmpty)
 					}
 				}
 				.padding(.horizontal)
@@ -1295,6 +1271,57 @@ struct ContentView: View {
 		} message: {
 			Text(faceRescanResultMessage)
 		}
+		.alert("Person Recognition", isPresented: $showPersonRecognitionResult) {
+			Button("OK", role: .cancel) {}
+		} message: {
+			Text(personRecognitionResultMessage)
+		}
+		.sheet(isPresented: $isTeachingPersonRecognition) {
+			VStack(spacing: 12) {
+				Text("Teach Person Recognition")
+					.font(.headline)
+				Text("Add \(selectedPhotoCount) selected photo\(selectedPhotoCount == 1 ? "" : "s") as examples for this person.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+				TextField("Person name", text: $teachPersonRecognitionName)
+					.textFieldStyle(.roundedBorder)
+					.padding(.horizontal)
+				HStack {
+					Button("Cancel") {
+						isTeachingPersonRecognition = false
+					}
+					.keyboardShortcut(.cancelAction)
+					Spacer()
+					Button("Teach") {
+						trainPersonRecognitionFromSelection()
+					}
+					.keyboardShortcut(.defaultAction)
+					.disabled(teachPersonRecognitionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasSelectedPhotos)
+				}
+				.padding(.horizontal)
+			}
+			.padding()
+			.frame(width: 420)
+		}
+		.sheet(isPresented: $isPersonRecognitionWorking) {
+			VStack(spacing: 12) {
+				Text(personRecognitionProgressMessage)
+					.font(.headline)
+				if personRecognitionProgressTotal > 0 {
+					ProgressView(value: Double(personRecognitionProgressCompleted), total: Double(personRecognitionProgressTotal))
+						.padding(.horizontal)
+					Text("\(personRecognitionProgressCompleted) of \(personRecognitionProgressTotal)")
+						.font(.caption)
+						.foregroundStyle(.secondary)
+						.monospacedDigit()
+				} else {
+					ProgressView()
+						.controlSize(.large)
+				}
+			}
+			.padding()
+			.frame(minWidth: 360, minHeight: 140)
+		}
 		.onReceive(NotificationCenter.default.publisher(for: .embedWriteFailed)) { n in
 			if let info = n.userInfo as? [String: String] {
 				embedFailMessage = info["message"]
@@ -1324,6 +1351,7 @@ struct ContentView: View {
 				imageCount: ollamaRecognitionURLs().count,
 				modelName: ollamaSelectedModel,
 				prompt: $ollamaPrompt,
+				updateMetadata: $ollamaUpdateMetadata,
 				onCancel: { isShowingOllamaPromptSheet = false },
 				onRun: {
 					isShowingOllamaPromptSheet = false
@@ -1776,6 +1804,7 @@ struct ContentView: View {
 							onSingleClick: { handleThumbnailSingleClick(photo.url) },
 							onDoubleClick: { openPhotoViewer(photo.url) },
 							onCopyFiles: copyFilesToPasteboard,
+							onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: photo.url)) },
 							onRepairMetadata: { triggerRepairMetadata(for: photo.url) }
 						)
 					}
@@ -1982,14 +2011,27 @@ struct ContentView: View {
 					rescanFaceRecognitionForSelection()
 				}) {
 					Text("Rescan Faces")
-				}
-				.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
-				.help("Rescan selected photos, or all loaded photos when none are selected")
-				if selectionMode {
+					}
+					.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
+					.help("Rescan selected photos, or all loaded photos when none are selected")
 					Button(action: {
-						// Show bulk edit keywords sheet
-						isEditingKeywords = true
-						editKeywordsText = ""
+						teachPersonRecognitionName = assignPersonName
+						isTeachingPersonRecognition = true
+					}) {
+						Text("Teach Person")
+					}
+					.disabled(!hasSelectedPhotos || isPersonRecognitionWorking)
+					.help("Teach Ollama person recognition from the selected photos")
+					Button(action: {
+						recognizePeopleWithOllama()
+					}) {
+						Text("Recognize People")
+					}
+					.disabled(personRecognitionTargetURLs.isEmpty || isPersonRecognitionWorking)
+					.help("Recognize taught people in selected photos, or all displayed photos when none are selected")
+					if selectionMode {
+					Button(action: {
+						beginKeywordEditing(for: selectedPhotoURLs)
 					}) {
 						Text("Edit Keywords")
 					}
@@ -2158,6 +2200,99 @@ struct ContentView: View {
 		return library.photos.map { $0.url }
 	}
 
+	private func beginKeywordEditing(for urls: [URL]) {
+		var seen: Set<URL> = []
+		let targets = urls.filter { seen.insert($0).inserted }
+		guard !targets.isEmpty else { return }
+		keywordEditTargets = targets
+		editKeywordsText = ""
+		editProgressCount = 0
+		editingResults = [:]
+		isEditingKeywords = true
+
+		if targets.count == 1, let target = targets.first {
+			Task.detached(priority: .utility) {
+				let keywords = await Self.readKeywords(from: target)
+				await MainActor.run {
+					if keywordEditTargets == targets && !isApplyingKeywords {
+						editKeywordsText = keywords.joined(separator: ", ")
+					}
+				}
+			}
+		}
+	}
+
+	private func applyKeywordEdit(_ operation: KeywordEditOperation) {
+		let urls = keywordEditTargets
+		guard !urls.isEmpty else { return }
+
+		let keywords: [String]
+		switch operation {
+		case .append, .replace:
+			keywords = Self.parseKeywordInput(editKeywordsText)
+		case .clear:
+			keywords = []
+		}
+
+		if operation == .append && keywords.isEmpty {
+			return
+		}
+
+		editingResults = Dictionary(uniqueKeysWithValues: urls.map { ($0, nil as Bool?) })
+		editProgressCount = 0
+		isApplyingKeywords = true
+
+		Task.detached(priority: .utility) {
+			let workerCount = max(1, min(urls.count, PhotoLibrary.workerCount))
+			await withTaskGroup(of: (URL, Bool).self) { group in
+				var nextIndex = 0
+
+				func enqueueNext() {
+					guard nextIndex < urls.count else { return }
+					let url = urls[nextIndex]
+					nextIndex += 1
+					group.addTask {
+						if Task.isCancelled { return (url, false) }
+						let ok: Bool
+						switch operation {
+						case .append:
+							ok = await Self.writeKeywords(to: url, keywords: keywords)
+						case .replace:
+							ok = await Self.replaceKeywords(on: url, keywords: keywords)
+						case .clear:
+							ok = await Self.replaceKeywords(on: url, keywords: [])
+						}
+						return (url, ok)
+					}
+				}
+
+				for _ in 0..<workerCount {
+					enqueueNext()
+				}
+
+				while let (url, ok) = await group.next() {
+					await MainActor.run {
+						editingResults[url] = ok
+						editProgressCount += 1
+						if ok {
+							MetadataCache.shared.invalidate(for: url)
+							queueMetadataRefresh(for: url)
+						}
+					}
+					enqueueNext()
+				}
+			}
+
+			await MainActor.run {
+				for (url, result) in editingResults where result == true {
+					removeFromSelection(url)
+				}
+				isApplyingKeywords = false
+				scheduleSort()
+			}
+		}
+	}
+
 	private func openPhotoViewer(_ url: URL) {
 		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
 		let isVideo = PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
@@ -2308,17 +2443,104 @@ struct ContentView: View {
 			}
 	}
 
+	private var personRecognitionTargetURLs: [URL] {
+		let candidates = hasSelectedPhotos ? selectedPhotoURLs : displayedPhotos.map(\.url)
+		return candidates.filter { url in
+			let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+			return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
+		}
+	}
+
+	private func trainPersonRecognitionFromSelection() {
+		let name = teachPersonRecognitionName.trimmingCharacters(in: .whitespacesAndNewlines)
+		let urls = personRecognitionTargetURLs
+		guard !name.isEmpty, hasSelectedPhotos, !urls.isEmpty else { return }
+
+		isTeachingPersonRecognition = false
+		isPersonRecognitionWorking = true
+		personRecognitionProgressMessage = "Teaching \(name)"
+		personRecognitionProgressCompleted = 0
+		personRecognitionProgressTotal = urls.count
+		let model = ollamaSelectedModel
+		Task.detached(priority: .utility) {
+			let training = await PersonRecognitionStore.shared.train(name: name, imageURLs: urls, model: model) { completed, total, status in
+				Task { @MainActor in
+					personRecognitionProgressCompleted = completed
+					personRecognitionProgressTotal = total
+					personRecognitionProgressMessage = status
+				}
+			}
+			let assignment = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
+			await MainActor.run {
+				isPersonRecognitionWorking = false
+				if training.examplesAdded > 0 {
+					personRecognitionResultMessage = "Added \(training.examplesAdded) training example\(training.examplesAdded == 1 ? "" : "s") for \(name). \(assignment.photosWithFaces) photo\(assignment.photosWithFaces == 1 ? "" : "s") were also assigned in People."
+				} else {
+					personRecognitionResultMessage = "No training examples were added for \(name). \(training.failed) photo\(training.failed == 1 ? "" : "s") failed."
+				}
+				showPersonRecognitionResult = true
+			}
+		}
+	}
+
+	private func recognizePeopleWithOllama() {
+		let urls = personRecognitionTargetURLs
+		guard !urls.isEmpty else { return }
+		let model = ollamaSelectedModel
+		isPersonRecognitionWorking = true
+		personRecognitionProgressMessage = "Recognizing people"
+		personRecognitionProgressCompleted = 0
+		personRecognitionProgressTotal = urls.count
+
+		Task.detached(priority: .utility) {
+			let profileCount = await PersonRecognitionStore.shared.profileCount()
+			guard profileCount > 0 else {
+				await MainActor.run {
+					isPersonRecognitionWorking = false
+					personRecognitionResultMessage = "Teach at least one person before running recognition."
+					showPersonRecognitionResult = true
+				}
+				return
+			}
+
+			let result = await PersonRecognitionStore.shared.recognize(imageURLs: urls, model: model) { completed, total, status in
+				Task { @MainActor in
+					personRecognitionProgressCompleted = completed
+					personRecognitionProgressTotal = total
+					personRecognitionProgressMessage = status
+				}
+			} onRecognized: { url, names in
+				for name in names {
+					_ = await FaceProcessor.shared.assignPerson(named: name, toFiles: [url])
+					_ = await ContentView.writeKeywords(to: url, keywords: ["Person: \(name)"])
+				}
+				await MainActor.run {
+					queueMetadataRefresh(for: url)
+				}
+			}
+
+			await MainActor.run {
+				isPersonRecognitionWorking = false
+				personRecognitionResultMessage = "Processed \(result.photosProcessed) photo\(result.photosProcessed == 1 ? "" : "s"). Matched taught people in \(result.photosWithMatches) photo\(result.photosWithMatches == 1 ? "" : "s") and assigned \(result.namesAssigned) name\(result.namesAssigned == 1 ? "" : "s"). \(result.failed) failed."
+				showPersonRecognitionResult = true
+				scheduleSort()
+			}
+		}
+	}
+
 	private func runOllamaRecognition() {
 		let urls = ollamaRecognitionURLs()
 		guard !urls.isEmpty else { return }
 		let prompt = ollamaPrompt
 		let model = ollamaSelectedModel
+		let shouldUpdateMetadata = ollamaUpdateMetadata
 		let task = Task.detached(priority: .utility) {
 			_ = await OllamaRecognizer.shared.recognizeAndLog(
 				imageURLs: urls,
 				prompt: prompt,
 				model: model,
 				onRecognized: { url, text in
+					guard shouldUpdateMetadata else { return }
 					let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 					guard !trimmed.isEmpty, trimmed.lowercased() != "none" else { return }
 					_ = await ContentView.writeKeywords(to: url, keywords: [trimmed])
@@ -4976,6 +5198,31 @@ struct ContentView: View {
 	/// This performs a best-effort rewrite of the image file with updated
 	/// metadata. It should be invoked off the main actor.
 	static func writeKeywords(to url: URL, keywords: [String]) async -> Bool {
+		await updateKeywords(on: url, keywords: keywords, mode: .append)
+	}
+
+	static func replaceKeywords(on url: URL, keywords: [String]) async -> Bool {
+		await updateKeywords(on: url, keywords: keywords, mode: .replace)
+	}
+
+	static func readKeywords(from url: URL) async -> [String] {
+		await Task.detached(priority: .utility) {
+			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+				  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+				  let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
+			else {
+				return []
+			}
+			return Self.mergedKeywords([], Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords]))
+		}.value
+	}
+
+	private enum KeywordWriteMode: Sendable {
+		case append
+		case replace
+	}
+
+	private static func updateKeywords(on url: URL, keywords: [String], mode: KeywordWriteMode) async -> Bool {
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 		// Ensure security-scoped access if available
 		_ = await Self.ensureSecurityScopedAccess(for: url)
@@ -4993,7 +5240,18 @@ struct ContentView: View {
 		var metadata = props
 		var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
 		let existingKeywords = Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords])
-		iptc[kCGImagePropertyIPTCKeywords] = Self.mergedKeywords(existingKeywords, keywords) as CFArray
+		let nextKeywords: [String]
+		switch mode {
+		case .append:
+			nextKeywords = Self.mergedKeywords(existingKeywords, keywords)
+		case .replace:
+			nextKeywords = Self.mergedKeywords([], keywords)
+		}
+		if nextKeywords.isEmpty {
+			iptc.removeValue(forKey: kCGImagePropertyIPTCKeywords)
+		} else {
+			iptc[kCGImagePropertyIPTCKeywords] = nextKeywords as CFArray
+		}
 		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
 
 		// Create a temporary file next to the original so moves are atomic
@@ -5043,7 +5301,7 @@ struct ContentView: View {
 		}
 	}
 
-	private static func keywordStrings(from value: Any?) -> [String] {
+	private nonisolated static func keywordStrings(from value: Any?) -> [String] {
 		if let strings = value as? [String] {
 			return strings
 		}
@@ -5059,7 +5317,7 @@ struct ContentView: View {
 		return []
 	}
 
-	private static func mergedKeywords(_ existing: [String], _ appended: [String]) -> [String] {
+	private nonisolated static func mergedKeywords(_ existing: [String], _ appended: [String]) -> [String] {
 		var result: [String] = []
 		var seen: Set<String> = []
 		for keyword in existing + appended {

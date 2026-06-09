@@ -18,6 +18,7 @@ struct PhotoGridCell: View {
 	let onSingleClick: () -> Void
 	let onDoubleClick: () -> Void
 	let onCopyFiles: ([URL]) -> Void
+	let onEditKeywords: () -> Void
 	let onRepairMetadata: () -> Void
 
 	var body: some View {
@@ -71,6 +72,7 @@ struct PhotoGridCell: View {
 				onCopyFiles(contextURLs)
 			}
 			Divider()
+			Button(contextURLs.count > 1 ? "Edit Keywords for Selected" : "Edit Keywords", action: onEditKeywords)
 			Button("Repair metadata", action: onRepairMetadata)
 		}
 	}
