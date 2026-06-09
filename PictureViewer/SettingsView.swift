@@ -188,7 +188,7 @@ struct SettingsView: View {
 								.tag(ollamaSelectedModel)
 						}
 						ForEach(ollamaModels, id: \.self) { name in
-							Text(name).tag(name)
+							Text(modelPickerLabel(for: name)).tag(name)
 						}
 					}
 					.disabled(ollamaLoading)
@@ -224,6 +224,10 @@ struct SettingsView: View {
 				await reloadOllamaModels()
 			}
 		}
+	}
+
+	private func modelPickerLabel(for name: String) -> String {
+		OllamaRecognizer.isLikelyUncensored(name) ? "\(name) — uncensored" : name
 	}
 
 	@MainActor

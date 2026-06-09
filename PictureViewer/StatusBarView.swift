@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 
 struct StatusBarView: View {
 	@ObservedObject var library: PhotoLibrary
+	@ObservedObject private var ollamaProgress = OllamaProgress.shared
 	let isRefreshing: Bool
 	let isSQLiteObjectStoreView: Bool
 	let isVaultWorking: Bool
@@ -22,28 +23,51 @@ struct StatusBarView: View {
 	let onRefreshThumbnails: () -> Void
 
 	var body: some View {
-		HStack(spacing: 8) {
-			statusIcon
-			statusText
-				.lineLimit(1)
-				.truncationMode(.middle)
-			Spacer(minLength: 8)
-			Button(action: onRefreshThumbnails) {
-				Label("Refresh Thumbnails", systemImage: "arrow.clockwise")
+		VStack(spacing: 0) {
+			HStack(spacing: 8) {
+				statusIcon
+				statusText
+					.lineLimit(1)
+					.truncationMode(.middle)
+				Spacer(minLength: 8)
+				if ollamaProgress.isActive {
+					Button {
+						OllamaProgress.shared.cancel()
+					} label: {
+						Image(systemName: "xmark.circle.fill")
+							.imageScale(.medium)
+							.foregroundStyle(.secondary)
+					}
+					.buttonStyle(.plain)
+					.disabled(ollamaProgress.isCancelling)
+					.help(ollamaProgress.isCancelling ? "Cancelling…" : "Cancel Ollama recognition")
+				} else {
+					Button(action: onRefreshThumbnails) {
+						Label("Refresh Thumbnails", systemImage: "arrow.clockwise")
+					}
+					.controlSize(.small)
+					.help("Clear cached thumbnails and regenerate them")
+					.disabled(library.photos.isEmpty || isRefreshing)
+				}
 			}
-			.controlSize(.small)
-			.help("Clear cached thumbnails and regenerate them")
-			.disabled(library.photos.isEmpty || isRefreshing)
+			.font(.caption)
+			.padding(.horizontal, 10)
+			.padding(.vertical, 4)
+			if ollamaProgress.isActive {
+				ProgressView(value: ollamaProgress.fraction)
+					.progressViewStyle(.linear)
+					.padding(.horizontal, 10)
+					.padding(.bottom, 4)
+			}
 		}
-		.font(.caption)
-		.padding(.horizontal, 10)
-		.padding(.vertical, 4)
 		.background(.bar)
 	}
 
 	@ViewBuilder
 	private var statusIcon: some View {
-		if library.isScanning || isRefreshing || (isSQLiteObjectStoreView && isVaultWorking) {
+		if ollamaProgress.isActive {
+			ProgressView().controlSize(.mini)
+		} else if library.isScanning || isRefreshing || (isSQLiteObjectStoreView && isVaultWorking) {
 			ProgressView().controlSize(.mini)
 		} else if library.lastScanDate != nil {
 			Image(systemName: "photo.stack").foregroundStyle(.secondary)
@@ -54,7 +78,25 @@ struct StatusBarView: View {
 
 	@ViewBuilder
 	private var statusText: some View {
-		if library.isScanning {
+		if ollamaProgress.isActive {
+			HStack(spacing: 6) {
+				Text(ollamaProgress.isCancelling
+					 ? "Cancelling Ollama recognition…"
+					 : "Recognizing with Ollama\(ollamaProgress.model.isEmpty ? "" : " (\(ollamaProgress.model))")")
+					.foregroundStyle(.secondary)
+				StatusBarBullet()
+				Text("\(ollamaProgress.completed) of \(ollamaProgress.total)")
+					.foregroundStyle(.secondary)
+					.monospacedDigit()
+				if !ollamaProgress.currentFilename.isEmpty {
+					StatusBarBullet()
+					Text(ollamaProgress.currentFilename)
+						.foregroundStyle(.secondary)
+						.lineLimit(1)
+						.truncationMode(.middle)
+				}
+			}
+		} else if library.isScanning {
 			HStack(spacing: 6) {
 				Text("Scanning \(library.folderURL?.lastPathComponent ?? "")…")
 				StatusBarBullet()

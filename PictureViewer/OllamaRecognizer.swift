@@ -31,6 +31,21 @@ actor OllamaRecognizer {
 		"granite3.2-vision", "mistral-small3.2"
 	]
 
+	/// Substrings in a model name that indicate the model has had its safety
+	/// alignment removed or weakened ("uncensored" / "abliterated" / Dolphin
+	/// fine-tune family). Used purely for tagging the model in the picker so
+	/// the user knows what they're selecting.
+	private static let uncensoredSubstrings: [String] = [
+		"uncensored", "abliterated", "dolphin"
+	]
+
+	/// True when the model name suggests an uncensored variant. Heuristic —
+	/// based on common naming conventions, not an authoritative Ollama flag.
+	static func isLikelyUncensored(_ model: String) -> Bool {
+		let lowered = model.lowercased()
+		return uncensoredSubstrings.contains { lowered.contains($0) }
+	}
+
 	private let logger = Logger(subsystem: "com.example.PictureViewer", category: "ollama")
 
 	private struct GenerateRequest: Encodable {
@@ -97,33 +112,53 @@ actor OllamaRecognizer {
 	}
 
 	/// Recognizes a sequence of image URLs sequentially, logging one line per
-	/// image. Cancellation cooperatively stops the sequence between items.
+	/// image and publishing progress to `OllamaProgress.shared`. Cancellation
+	/// cooperatively stops the sequence between items. `onRecognized` is
+	/// invoked after each successful recognition; the caller is responsible
+	/// for any post-processing (e.g. writing metadata + refreshing UI).
 	/// Returns the number of successfully recognized items.
-	func recognizeAndLog(imageURLs urls: [URL], prompt: String, model: String) async -> Int {
+	func recognizeAndLog(
+		imageURLs urls: [URL],
+		prompt: String,
+		model: String,
+		onRecognized: (@Sendable (URL, String) async -> Void)? = nil
+	) async -> Int {
 		var success = 0
 		let start = Date()
+		let total = urls.count
 		let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
 		let effectivePrompt = trimmedPrompt.isEmpty ? Self.defaultPrompt : trimmedPrompt
 		let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
 		let effectiveModel = trimmedModel.isEmpty ? Self.defaultModel : trimmedModel
-		logger.log("ollama:batch start count=\(urls.count, privacy: .public) model=\(effectiveModel, privacy: .public) prompt=\(effectivePrompt, privacy: .public)")
+		logger.log("ollama:batch start count=\(total, privacy: .public) model=\(effectiveModel, privacy: .public) prompt=\(effectivePrompt, privacy: .public)")
 		for (index, url) in urls.enumerated() {
 			if Task.isCancelled {
-				logger.log("ollama:batch cancelled after=\(index, privacy: .public) of=\(urls.count, privacy: .public)")
+				logger.log("ollama:batch cancelled after=[\(index, privacy: .public)/\(total, privacy: .public)]")
 				break
+			}
+			let filename = url.lastPathComponent
+			let position = "[\(index + 1)/\(total)]"
+			await MainActor.run {
+				OllamaProgress.shared.update(completed: index, currentFilename: filename)
 			}
 			do {
 				let text = try await recognize(imageURL: url, prompt: effectivePrompt, model: effectiveModel)
-				logger.log("ollama:recognized \(url.lastPathComponent, privacy: .public) — \(text, privacy: .public)")
+				logger.log("ollama:recognized \(position, privacy: .public) \(filename, privacy: .public) — \(text, privacy: .public)")
 				success += 1
+				if let onRecognized {
+					await onRecognized(url, text)
+				}
 			} catch is CancellationError {
-				logger.log("ollama:batch cancelled at=\(url.lastPathComponent, privacy: .public)")
+				logger.log("ollama:batch cancelled at=\(position, privacy: .public) \(filename, privacy: .public)")
 				break
 			} catch {
-				logger.error("ollama:failed \(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				logger.error("ollama:failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
+			await MainActor.run {
+				OllamaProgress.shared.update(completed: index + 1, currentFilename: filename)
 			}
 		}
-		logger.log("ollama:batch end success=\(success, privacy: .public) of=\(urls.count, privacy: .public) duration=\(Date().timeIntervalSince(start), privacy: .public)")
+		logger.log("ollama:batch end success=\(success, privacy: .public) of=\(total, privacy: .public) duration=\(Date().timeIntervalSince(start), privacy: .public)")
 		return success
 	}
 

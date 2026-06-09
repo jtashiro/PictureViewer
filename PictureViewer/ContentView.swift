@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
 	@StateObject private var library = PhotoLibrary()
 	@StateObject private var faceScanProgress = FaceScanProgress.shared
+	@ObservedObject private var ollamaProgress = OllamaProgress.shared
 	@StateObject private var personFilterState = PersonFilterState.shared
 	@State private var thumbnailSize: CGFloat = 160
 	@AppStorage("sortMode") private var sortModeRaw: Int = 0
@@ -1330,6 +1331,9 @@ struct ContentView: View {
 				}
 			)
 		}
+		.onChange(of: ollamaProgress.lastCompletedURL) { _, newURL in
+			if let newURL { queueMetadataRefresh(for: newURL) }
+		}
 		.sheet(isPresented: $isShowingVaultUnlockPrompt, onDismiss: clearVaultUnlockPrompt) {
 			VaultUnlockPromptView(
 				vaultHasPassword: vaultStatus.hasPassword,
@@ -2309,9 +2313,23 @@ struct ContentView: View {
 		guard !urls.isEmpty else { return }
 		let prompt = ollamaPrompt
 		let model = ollamaSelectedModel
-		Task.detached(priority: .utility) {
-			_ = await OllamaRecognizer.shared.recognizeAndLog(imageURLs: urls, prompt: prompt, model: model)
+		let task = Task.detached(priority: .utility) {
+			_ = await OllamaRecognizer.shared.recognizeAndLog(
+				imageURLs: urls,
+				prompt: prompt,
+				model: model,
+				onRecognized: { url, text in
+					let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+					guard !trimmed.isEmpty, trimmed.lowercased() != "none" else { return }
+					_ = await ContentView.writeKeywords(to: url, keywords: [trimmed])
+					await MainActor.run {
+						OllamaProgress.shared.markMetadataUpdated(for: url)
+					}
+				}
+			)
+			await MainActor.run { OllamaProgress.shared.end() }
 		}
+		OllamaProgress.shared.begin(total: urls.count, model: model, cancel: { task.cancel() })
 	}
 
 	private func applyPersonAssignmentToSelection() {
@@ -4957,7 +4975,7 @@ struct ContentView: View {
 	/// Writes IPTC keywords to the image at `url`. Returns true on success.
 	/// This performs a best-effort rewrite of the image file with updated
 	/// metadata. It should be invoked off the main actor.
-	private static func writeKeywords(to url: URL, keywords: [String]) async -> Bool {
+	static func writeKeywords(to url: URL, keywords: [String]) async -> Bool {
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 		// Ensure security-scoped access if available
 		_ = await Self.ensureSecurityScopedAccess(for: url)
