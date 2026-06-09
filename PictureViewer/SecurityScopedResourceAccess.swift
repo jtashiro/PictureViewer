@@ -2,11 +2,11 @@ import Foundation
 import os
 
 enum SecurityScopedResourceAccess {
-	private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "security-scope")
-	private static let lock = NSLock()
-	private static var activeURLs: [URL] = []
+	nonisolated private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "security-scope")
+	nonisolated private static let lock = NSLock()
+	nonisolated(unsafe) private static var activeURLs: [URL] = []
 
-	static func ensureAccess(for url: URL) -> Bool {
+	nonisolated static func ensureAccess(for url: URL) -> Bool {
 		let standardizedURL = url.standardizedFileURL
 		lock.lock()
 		if activeURLs.contains(where: { standardizedURL.path.hasPrefix($0.standardizedFileURL.path) }) {
@@ -30,7 +30,7 @@ enum SecurityScopedResourceAccess {
 		return false
 	}
 
-	private static func startAccessing(_ url: URL) -> Bool {
+	nonisolated private static func startAccessing(_ url: URL) -> Bool {
 		guard url.startAccessingSecurityScopedResource() else { return false }
 		lock.lock()
 		if !activeURLs.contains(url) {
@@ -40,8 +40,9 @@ enum SecurityScopedResourceAccess {
 		return true
 	}
 
-	private static func resolvePersistedBookmark(for url: URL) -> Bool {
+	nonisolated private static func resolvePersistedBookmark(for url: URL) -> Bool {
 		let bookmarkLists = [
+			UserDefaults.standard.data(forKey: AppWorkingDirectory.directoryBookmarkKey).map { [$0] },
 			UserDefaults.standard.array(forKey: "lastFolderBookmarks") as? [Data],
 			UserDefaults.standard.data(forKey: "lastFolderBookmark").map { [$0] }
 		]

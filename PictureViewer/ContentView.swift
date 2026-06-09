@@ -12,6 +12,12 @@ import CryptoKit
 import os
 import UniformTypeIdentifiers
 
+private struct PhotoGridSection: Identifiable {
+	let id: String
+	let title: String
+	let photos: [PhotoItem]
+}
+
 struct ContentView: View {
 	@StateObject private var library = PhotoLibrary()
 	@StateObject private var faceScanProgress = FaceScanProgress.shared
@@ -19,11 +25,14 @@ struct ContentView: View {
 	@StateObject private var personFilterState = PersonFilterState.shared
 	@State private var thumbnailSize: CGFloat = 160
 	@AppStorage("sortMode") private var sortModeRaw: Int = 0
+	@AppStorage("groupGridByDescription") private var groupGridByDescription = false
 	private enum SortMode: Int, CaseIterable, Identifiable {
 		case alphaAsc = 0
 		case alphaDesc = 1
 		case fileDate = 2
 		case imageDate = 3
+		case descriptionAsc = 4
+		case descriptionDesc = 5
 
 		var id: Int { rawValue }
 		var title: String {
@@ -32,6 +41,8 @@ struct ContentView: View {
 			case .alphaDesc: return "Name ↓"
 			case .fileDate: return "File Date"
 			case .imageDate: return "Image Date"
+			case .descriptionAsc: return "Description ↑"
+			case .descriptionDesc: return "Description ↓"
 			}
 		}
 	}
@@ -184,8 +195,9 @@ struct ContentView: View {
 						deduped.sort {
 							$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
 						}
+						let dedupedCount = deduped.count
 						await MainActor.run {
-							logger.log("launch folder restore: source=legacy-bookmark storage=cache folder=\(url.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
+							logger.log("launch folder restore: source=legacy-bookmark storage=cache folder=\(url.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(dedupedCount, privacy: .public)")
 						}
 						let batchSize = 512
 						await MainActor.run { library.photos = [] }
@@ -206,7 +218,7 @@ struct ContentView: View {
 									if Task.isCancelled { break }
 									do {
 										let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-										await ThumbnailCache.shared.store(img, for: item.url)
+										ThumbnailCache.shared.store(img, for: item.url)
 									} catch { }
 								}
 							}
@@ -262,7 +274,6 @@ struct ContentView: View {
 	/// (adjacent or app-support) and re-embedding its contents into the
 	/// image file. Returns (success, errorMessage).
 	static func repairMetadata(for url: URL) async -> (Bool, String?) {
-		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 		let fm = FileManager.default
 		// Try adjacent sidecar first
 		let scURL = sidecarURL(for: url)
@@ -584,6 +595,8 @@ struct ContentView: View {
 		// Displayed (sorted) snapshot of photos. Computed in background when
 		// the underlying library or the sort mode changes.
 	@State private var displayedPhotos: [PhotoItem] = []
+	@State private var displayedPhotoSections: [PhotoGridSection] = []
+	@State private var collapsedPhotoSectionIDs: Set<String> = []
 	@State private var sortTask: Task<Void, Never>? = nil
 	@State private var photoChangeTask: Task<Void, Never>? = nil
 	@State private var refreshToken = UUID()
@@ -619,16 +632,15 @@ struct ContentView: View {
 	@State private var editProgressCount: Int = 0
 	@State private var editingResults: [URL: Bool?] = [:]
 	@State private var isAssigningPerson: Bool = false
+	@State private var assignPersonTargetURLs: [URL] = []
 	@State private var assignPersonName: String = ""
 	@State private var existingPersonNames: [String] = []
-	@State private var isApplyingPersonAssignment: Bool = false
 	@State private var showPersonAssignmentResult: Bool = false
 	@State private var personAssignmentResultMessage: String = ""
 	@State private var isRescanningFaces: Bool = false
 	@State private var showFaceRescanResult: Bool = false
 	@State private var faceRescanResultMessage: String = ""
-	@State private var isTeachingPersonRecognition: Bool = false
-	@State private var teachPersonRecognitionName: String = ""
+
 	@State private var isPersonRecognitionWorking: Bool = false
 	@State private var personRecognitionTask: Task<Void, Never>? = nil
 	@State private var personRecognitionProgressMessage: String = ""
@@ -816,7 +828,68 @@ struct ContentView: View {
 		}
 	}
 
+	private var galleryNavigationTitle: String {
+		if activeFolderNames.isEmpty {
+			return library.folderURL?.lastPathComponent ?? "Picture Viewer"
+		}
+		if activeFolderNames.count == 1 {
+			return activeFolderNames[0]
+		}
+		return activeFolderNames.joined(separator: " · ")
+	}
+
+	private var fileNavigationCommandActions: FileNavigationCommandActions {
+		FileNavigationCommandActions(
+			openFolder: { openBookmarkedFolder($0) },
+			openSQLiteStore: { openSQLiteStoreFromMenu(named: $0) },
+			openPhoto: { openWindow(id: "photo-viewer", value: $0) },
+			restoreSavedGallerySession: { restoreSavedGallerySession() },
+			showBookmarkManager: { showBookmarkManager = true }
+		)
+	}
+
+	private var vaultCommandActions: VaultCommandActions {
+		VaultCommandActions(
+			newItem: { newItem() },
+			openItem: { chooseFolder() },
+			newVault: { newVault() },
+			importFolders: { importFolderToVault() },
+			importSelected: { importSelectedImagesToVault() },
+			chooseAndOpenVault: { chooseAndOpenVault() },
+			openVault: { openVault() },
+			closeVault: { closeVault() },
+			renameVault: { renameVault() },
+			manageVaults: { showVaultManager() },
+			exportPhotos: { exportVaultSelection() },
+			syncToTab: { syncToAnotherTab() },
+			syncToSQLiteStore: { syncCurrentTabToSQLiteStore() },
+			syncSelectedToSQLiteStore: { syncSelectedMediaToSQLiteStore() },
+			openSQLiteStore: { chooseAndOpenSQLiteObjectStore() },
+			copy: { copySelectedFiles() },
+			paste: { pasteFilesToVault() },
+			selectAll: { selectAllDisplayedPhotos() },
+			recognizeDisplayed: { recognizeDisplayedImagesWithOllama() },
+			canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
+			canRenameVault: isActiveVaultView && library.folderURL != nil,
+			canImportSelected: hasSelectedPhotos,
+			canExport: !library.photos.isEmpty,
+			canSyncToTab: !library.photos.isEmpty,
+			canSyncToSQLiteStore: !library.photos.isEmpty,
+			canSyncSelectedToSQLiteStore: hasSelectedPhotos,
+			canOpenSQLiteStore: true,
+			canCopy: hasSelectedPhotos,
+			canPaste: canPasteFilesToVault,
+			canSelectAll: !displayedPhotos.isEmpty,
+			canRecognize: !displayedPhotos.isEmpty
+		)
+	}
+
 	var body: some View {
+		galleryShell
+	}
+
+	@ViewBuilder
+	private var galleryNavigationRoot: some View {
 		NavigationStack {
 			VStack(spacing: 0) {
 				StatusBarView(
@@ -839,43 +912,10 @@ struct ContentView: View {
 				contentBody
 					.frame(maxWidth: .infinity, maxHeight: .infinity)
 			}
-						.navigationTitle(
-							activeFolderNames.isEmpty ? (library.folderURL?.lastPathComponent ?? "Picture Viewer") : (activeFolderNames.count == 1 ? activeFolderNames.first! : activeFolderNames.joined(separator: " · "))
-						)
+			.navigationTitle(galleryNavigationTitle)
 			.toolbar { toolbarItems }
-			.focusedSceneValue(\.vaultCommandActions, VaultCommandActions(
-				newItem: { newItem() },
-				openItem: { chooseFolder() },
-				newVault: { newVault() },
-				importFolders: { importFolderToVault() },
-				importSelected: { importSelectedImagesToVault() },
-				chooseAndOpenVault: { chooseAndOpenVault() },
-				openVault: { openVault() },
-				closeVault: { closeVault() },
-				renameVault: { renameVault() },
-				manageVaults: { showVaultManager() },
-				exportPhotos: { exportVaultSelection() },
-				syncToTab: { syncToAnotherTab() },
-				syncToSQLiteStore: { syncCurrentTabToSQLiteStore() },
-				syncSelectedToSQLiteStore: { syncSelectedMediaToSQLiteStore() },
-				openSQLiteStore: { chooseAndOpenSQLiteObjectStore() },
-				copy: { copySelectedFiles() },
-				paste: { pasteFilesToVault() },
-				selectAll: { selectAllDisplayedPhotos() },
-				recognizeDisplayed: { recognizeDisplayedImagesWithOllama() },
-				canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
-				canRenameVault: isActiveVaultView && library.folderURL != nil,
-				canImportSelected: hasSelectedPhotos,
-				canExport: !library.photos.isEmpty,
-				canSyncToTab: !library.photos.isEmpty,
-				canSyncToSQLiteStore: !library.photos.isEmpty,
-				canSyncSelectedToSQLiteStore: hasSelectedPhotos,
-				canOpenSQLiteStore: true,
-				canCopy: hasSelectedPhotos,
-				canPaste: canPasteFilesToVault,
-				canSelectAll: !displayedPhotos.isEmpty,
-				canRecognize: !displayedPhotos.isEmpty
-			))
+			.focusedSceneValue(\.fileNavigationActions, fileNavigationCommandActions)
+			.focusedSceneValue(\.vaultCommandActions, vaultCommandActions)
 		}
 		.frame(minWidth: 760, minHeight: 540)
 		// Attach a WindowAccessor so we can set window-level defaults like
@@ -967,19 +1007,39 @@ struct ContentView: View {
 				}
 			}
 		}
-		.onChange(of: library.photos) { _ in
+		.onChange(of: library.photos) {
 			queuePhotoChangeRefresh()
 		}
-		.onChange(of: activeFolderNames) { _ in updateTabRegistry() }
-		.onChange(of: library.folderURL) { _ in updateTabRegistry() }
-		.onChange(of: sortModeRaw) { _ in scheduleSort() }
-		.onChange(of: searchText) { _ in scheduleSort() }
-		.onChange(of: personFilterState.active) { active in
-			applyPersonFilter(active)
+		.onChange(of: activeFolderNames) {
+			updateTabRegistry()
+		}
+		.onChange(of: library.folderURL) {
+			updateTabRegistry()
+		}
+		.onChange(of: sortModeRaw) {
+			let mode = SortMode(rawValue: sortModeRaw) ?? .alphaAsc
+			if mode == .descriptionAsc || mode == .descriptionDesc {
+				groupGridByDescription = true
+			}
+			scheduleSort()
+		}
+		.onChange(of: groupGridByDescription) {
+			scheduleSort()
+		}
+		.onChange(of: searchText) {
+			scheduleSort()
+		}
+		.onChange(of: personFilterState.active) {
+			applyPersonFilter(personFilterState.active)
 		}
 		.task {
 			applyPersonFilter(personFilterState.active)
 		}
+	}
+
+	@ViewBuilder
+	private var galleryShell: some View {
+		galleryNavigationRoot
 		.sheet(isPresented: $showBookmarkManager) {
 			VStack(spacing: 12) {
 				Text("Manage Bookmarks")
@@ -1154,9 +1214,9 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isAssigningPerson) {
 			VStack(spacing: 12) {
-				Text("Assign Person Name")
+				Text("Assign Person")
 					.font(.headline)
-				Text("Apply a person name to faces detected in \(faceActionTargetURLs.count) photo\(faceActionTargetURLs.count == 1 ? "" : "s").")
+				Text("Assign faces, write the person name to metadata, and teach Ollama recognition for \(assignPersonTargetURLs.count) photo\(assignPersonTargetURLs.count == 1 ? "" : "s").")
 					.font(.caption)
 					.foregroundStyle(.secondary)
 					.multilineTextAlignment(.leading)
@@ -1198,17 +1258,15 @@ struct ContentView: View {
 				}
 				HStack {
 					Button("Cancel") {
-						if !isApplyingPersonAssignment { isAssigningPerson = false }
+						isAssigningPerson = false
 					}
-					.disabled(isApplyingPersonAssignment)
+					.keyboardShortcut(.cancelAction)
 					Spacer()
-					if isApplyingPersonAssignment {
-						ProgressView().controlSize(.small)
-					}
 					Button("Apply") {
-						applyPersonAssignmentToSelection()
+						applyPersonNameToSelection()
 					}
-					.disabled(faceActionTargetURLs.isEmpty || assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isApplyingPersonAssignment)
+					.keyboardShortcut(.defaultAction)
+					.disabled(assignPersonTargetURLs.isEmpty || assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isPersonRecognitionWorking)
 				}
 				.padding(.horizontal)
 			}
@@ -1275,33 +1333,6 @@ struct ContentView: View {
 			Button("OK", role: .cancel) {}
 		} message: {
 			Text(personRecognitionResultMessage)
-		}
-		.sheet(isPresented: $isTeachingPersonRecognition) {
-			VStack(spacing: 12) {
-				Text("Teach Person Recognition")
-					.font(.headline)
-				Text("Add \(selectedPhotoCount) selected photo\(selectedPhotoCount == 1 ? "" : "s") as examples for this person.")
-					.font(.caption)
-					.foregroundStyle(.secondary)
-				TextField("Person name", text: $teachPersonRecognitionName)
-					.textFieldStyle(.roundedBorder)
-					.padding(.horizontal)
-				HStack {
-					Button("Cancel") {
-						isTeachingPersonRecognition = false
-					}
-					.keyboardShortcut(.cancelAction)
-					Spacer()
-					Button("Teach") {
-						trainPersonRecognitionFromSelection()
-					}
-					.keyboardShortcut(.defaultAction)
-					.disabled(teachPersonRecognitionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !hasSelectedPhotos)
-				}
-				.padding(.horizontal)
-			}
-			.padding()
-			.frame(width: 420)
 		}
 		.sheet(isPresented: $isPersonRecognitionWorking) {
 			VStack(spacing: 12) {
@@ -1735,56 +1766,54 @@ struct ContentView: View {
 	}
 
 	private nonisolated static func collectFileURLs(from providers: [NSItemProvider]) async -> [URL] {
-		await withTaskGroup(of: URL?.self, returning: [URL].self) { group in
-			for provider in providers {
-				group.addTask {
-					if provider.canLoadObject(ofClass: URL.self) {
-						let loadedURL = await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
-							_ = provider.loadObject(ofClass: URL.self) { url, _ in
-								if let url, url.isFileURL {
-									cont.resume(returning: url)
-								} else {
-									cont.resume(returning: nil)
-								}
-							}
-						}
-						if loadedURL != nil {
-							return loadedURL
-						}
-					}
+		var result: [URL] = []
+		var seen: Set<String> = []
+		for provider in providers {
+			if let url = await loadFileURL(from: provider),
+			   seen.insert(url.standardizedFileURL.path).inserted {
+				result.append(url)
+			}
+		}
+		return result
+	}
 
-					return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
-						provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-							if let url = item as? URL, url.isFileURL {
-								cont.resume(returning: url)
-								return
-							}
-							if let data = item as? Data,
-							   let string = String(data: data, encoding: .utf8),
-							   let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
-							   url.isFileURL {
-								cont.resume(returning: url)
-								return
-							}
-							if let string = item as? String,
-							   let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
-							   url.isFileURL {
-								cont.resume(returning: url)
-								return
-							}
-							cont.resume(returning: nil)
-						}
+	private nonisolated static func loadFileURL(from provider: NSItemProvider) async -> URL? {
+		if provider.canLoadObject(ofClass: URL.self) {
+			let loadedURL = await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+				_ = provider.loadObject(ofClass: URL.self) { url, _ in
+					if let url, url.isFileURL {
+						cont.resume(returning: url)
+					} else {
+						cont.resume(returning: nil)
 					}
 				}
 			}
-			var result: [URL] = []
-			var seen: Set<String> = []
-			for await url in group {
-				if let url, seen.insert(url.standardizedFileURL.path).inserted {
-					result.append(url)
-				}
+			if let loadedURL {
+				return loadedURL
 			}
-			return result
+		}
+
+		return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+			provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+				if let url = item as? URL, url.isFileURL {
+					cont.resume(returning: url)
+					return
+				}
+				if let data = item as? Data,
+				   let string = String(data: data, encoding: .utf8),
+				   let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
+				   url.isFileURL {
+					cont.resume(returning: url)
+					return
+				}
+				if let string = item as? String,
+				   let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
+				   url.isFileURL {
+					cont.resume(returning: url)
+					return
+				}
+				cont.resume(returning: nil)
+			}
 		}
 	}
 
@@ -1792,26 +1821,16 @@ struct ContentView: View {
 	private var photoGrid: some View {
 		ScrollViewReader { scrollProxy in
 			ScrollView {
-				LazyVGrid(
-					columns: [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.4), spacing: 10)],
-					spacing: 10
-				) {
-					ForEach(displayedPhotos) { photo in
-						PhotoGridCell(
-							url: photo.url,
-							size: thumbnailSize,
-							refreshToken: refreshToken,
-							metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
-							forceLoad: forceThumbnailLoading,
-							isSelected: isPhotoSelected(photo.url),
-							selectionMode: selectionMode,
-							contextActionURLs: { contextActionURLs(for: photo.url) },
-							onSingleClick: { handleThumbnailSingleClick(photo.url) },
-							onDoubleClick: { openPhotoViewer(photo.url) },
-							onCopyFiles: copyFilesToPasteboard,
-							onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: photo.url)) },
-							onRepairMetadata: { triggerRepairMetadata(for: photo.url) }
-						)
+				LazyVStack(alignment: .leading, spacing: 16) {
+					if shouldGroupGridByDescription, !displayedPhotoSections.isEmpty {
+						ForEach(displayedPhotoSections) { section in
+							photoGridSectionHeader(section)
+							if !isPhotoSectionCollapsed(section) {
+								photoGridCells(for: section.photos)
+							}
+						}
+					} else {
+						photoGridCells(for: displayedPhotos)
 					}
 				}
 				.padding(12)
@@ -1972,6 +1991,12 @@ struct ContentView: View {
 				.pickerStyle(.menu)
 				.help("Sort photos")
 				Button {
+					groupGridByDescription.toggle()
+				} label: {
+					Image(systemName: groupGridByDescription ? "rectangle.split.3x1.fill" : "rectangle.split.3x1")
+				}
+				.help(groupGridByDescription ? "Showing sections by Description — click to show a flat grid" : "Group thumbnails into sections by Description (person name)")
+				Button {
 					// Open the dedicated People window.
 					openWindow(id: "people")
 				} label: {
@@ -1999,34 +2024,26 @@ struct ContentView: View {
 				// Edit / selection controls
 				Button {
 					selectionMode.toggle()
-					if !selectionMode { clearSelection() }
 				} label: {
 					Text(selectionMode ? "Done" : "Edit")
 				}
 				.help("Select multiple thumbnails for bulk operations")
 				Button(action: {
 					loadExistingPersonNamesForAssignment()
+					assignPersonTargetURLs = faceActionTargetURLs
 					isAssigningPerson = true
 				}) {
 					Text("Assign Person")
 				}
-				.disabled(faceActionTargetURLs.isEmpty)
-				.help("Assign faces from selected photos, or all loaded photos when none are selected")
+				.disabled(faceActionTargetURLs.isEmpty || isPersonRecognitionWorking)
+				.help("Assign faces, write metadata, and teach Ollama recognition for selected or displayed photos")
 				Button(action: {
 					rescanFaceRecognitionForSelection()
 				}) {
 					Text("Rescan Faces")
 					}
 					.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
-					.help("Rescan selected photos, or all loaded photos when none are selected")
-					Button(action: {
-						teachPersonRecognitionName = assignPersonName
-						isTeachingPersonRecognition = true
-					}) {
-						Text("Teach Person")
-					}
-					.disabled(!hasSelectedPhotos || isPersonRecognitionWorking)
-					.help("Teach Ollama person recognition from the selected photos")
+					.help("Rescan selected photos, or all currently displayed photos when none are selected")
 					Button(action: {
 						recognizePeopleWithOllama()
 					}) {
@@ -2100,8 +2117,15 @@ struct ContentView: View {
 					.help("Clear selection")
 				}
 				// Search field for filtering thumbnails by regex against
-				// filename and image metadata. Runs filtering in the
-				// background via `scheduleSort()`.
+				// filename, DESCRIPTION (person name), and other metadata.
+				// Runs filtering in the background via `scheduleSort()`.
+				if let galleryStatusText {
+					Text(galleryStatusText)
+						.font(.caption)
+						.foregroundStyle(.secondary)
+						.lineLimit(1)
+						.help(galleryStatusHelpText)
+				}
 				HStack(spacing: 6) {
 					Image(systemName: "magnifyingglass")
 					TextField("Search (regex)", text: $searchText)
@@ -2141,6 +2165,109 @@ struct ContentView: View {
 
 	private var hasSelectedPhotos: Bool {
 		selectedPhotoCount > 0
+	}
+
+	private var isGalleryFilterActive: Bool {
+		!searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || personFilterPaths != nil
+	}
+
+	private var activeSortMode: SortMode {
+		SortMode(rawValue: sortModeRaw) ?? .alphaAsc
+	}
+
+	private var shouldGroupGridByDescription: Bool {
+		groupGridByDescription
+	}
+
+	private static let noDescriptionSectionKey = "\u{0000}No Description"
+
+	private func isPhotoSectionCollapsed(_ section: PhotoGridSection) -> Bool {
+		collapsedPhotoSectionIDs.contains(section.id)
+	}
+
+	private func togglePhotoSectionCollapse(_ sectionID: String) {
+		if collapsedPhotoSectionIDs.contains(sectionID) {
+			collapsedPhotoSectionIDs.remove(sectionID)
+		} else {
+			collapsedPhotoSectionIDs.insert(sectionID)
+		}
+	}
+
+	@ViewBuilder
+	private func photoGridSectionHeader(_ section: PhotoGridSection) -> some View {
+		Button {
+			withAnimation(.easeInOut(duration: 0.2)) {
+				togglePhotoSectionCollapse(section.id)
+			}
+		} label: {
+			HStack(spacing: 8) {
+				Image(systemName: isPhotoSectionCollapsed(section) ? "chevron.right" : "chevron.down")
+					.font(.caption.weight(.semibold))
+					.foregroundStyle(.secondary)
+					.frame(width: 12)
+				Text(section.title)
+					.font(.headline)
+					.foregroundStyle(.primary)
+				Text("\(section.photos.count)")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+					.monospacedDigit()
+				Spacer()
+			}
+			.frame(maxWidth: .infinity, alignment: .leading)
+			.contentShape(Rectangle())
+		}
+		.buttonStyle(.plain)
+		.help(isPhotoSectionCollapsed(section) ? "Expand section" : "Collapse section")
+	}
+
+	@ViewBuilder
+	private func photoGridCells(for photos: [PhotoItem]) -> some View {
+		LazyVGrid(
+			columns: [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.4), spacing: 10)],
+			spacing: 10
+		) {
+			ForEach(photos) { photo in
+				PhotoGridCell(
+					url: photo.url,
+					size: thumbnailSize,
+					refreshToken: refreshToken,
+					metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
+					forceLoad: forceThumbnailLoading,
+					isSelected: isPhotoSelected(photo.url),
+					selectionMode: selectionMode,
+					contextActionURLs: { contextActionURLs(for: photo.url) },
+					onSingleClick: { handleThumbnailSingleClick(photo.url) },
+					onDoubleClick: { openPhotoViewer(photo.url) },
+					onCopyFiles: copyFilesToPasteboard,
+					onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: photo.url)) },
+					onRepairMetadata: { triggerRepairMetadata(for: photo.url) }
+				)
+			}
+		}
+	}
+
+	private var galleryStatusText: String? {
+		var parts: [String] = []
+		if isGalleryFilterActive {
+			parts.append("\(displayedPhotos.count) visible")
+		}
+		if hasSelectedPhotos {
+			parts.append("\(selectedPhotoCount) selected")
+		}
+		guard !parts.isEmpty else { return nil }
+		return parts.joined(separator: " · ")
+	}
+
+	private var galleryStatusHelpText: String {
+		var parts: [String] = []
+		if isGalleryFilterActive {
+			parts.append("\(displayedPhotos.count) of \(library.photos.count) thumbnails match the active filter")
+		}
+		if hasSelectedPhotos {
+			parts.append("\(selectedPhotoCount) thumbnail\(selectedPhotoCount == 1 ? "" : "s") selected")
+		}
+		return parts.joined(separator: ". ")
 	}
 
 	private var selectedPhotoURLs: [URL] {
@@ -2202,7 +2329,7 @@ struct ContentView: View {
 
 	private var faceActionTargetURLs: [URL] {
 		if hasSelectedPhotos { return selectedPhotoURLs }
-		return library.photos.map { $0.url }
+		return displayedPhotos.map(\.url)
 	}
 
 	private func beginKeywordEditing(for urls: [URL]) {
@@ -2450,54 +2577,134 @@ struct ContentView: View {
 
 	private var personRecognitionTargetURLs: [URL] {
 		let candidates = hasSelectedPhotos ? selectedPhotoURLs : displayedPhotos.map(\.url)
-		return candidates.filter { url in
+		return teachableImageURLs(from: candidates)
+	}
+
+	private func teachableImageURLs(from urls: [URL]) -> [URL] {
+		urls.filter { url in
 			let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
 			return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
 		}
 	}
 
-	private func trainPersonRecognitionFromSelection() {
-		let name = teachPersonRecognitionName.trimmingCharacters(in: .whitespacesAndNewlines)
-		let urls = personRecognitionTargetURLs
-		guard !name.isEmpty, hasSelectedPhotos, !urls.isEmpty else { return }
+	private func applyPersonNameToSelection() {
+		let name = assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
+		let urls = assignPersonTargetURLs
+		guard !name.isEmpty, !urls.isEmpty else { return }
 
-		isTeachingPersonRecognition = false
+		let teachableURLs = teachableImageURLs(from: urls)
+		let totalPhotos = urls.count
+
+		isAssigningPerson = false
 		isPersonRecognitionWorking = true
-		personRecognitionProgressMessage = "Teaching \(name)"
+		personRecognitionProgressMessage = "Assigning \(name)"
 		personRecognitionProgressCompleted = 0
-		personRecognitionProgressTotal = urls.count
+		personRecognitionProgressTotal = max(totalPhotos, 1)
+
 		let model = ollamaSelectedModel
 		personRecognitionTask?.cancel()
 		let task = Task.detached(priority: .utility) {
-			let training = await PersonRecognitionStore.shared.train(name: name, imageURLs: urls, model: model) { completed, total, status in
-				Task { @MainActor in
-					personRecognitionProgressCompleted = completed
-					personRecognitionProgressTotal = total
-					personRecognitionProgressMessage = status
+			let assignment = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
+
+			var updatedURLs: [URL] = []
+			for u in urls {
+				if Task.isCancelled { break }
+				if await ContentView.writeDescription(to: u, description: name) {
+					updatedURLs.append(u)
 				}
 			}
+
 			if Task.isCancelled {
 				await MainActor.run {
 					isPersonRecognitionWorking = false
 					personRecognitionTask = nil
-					personRecognitionResultMessage = "Person recognition training was cancelled."
-					showPersonRecognitionResult = true
+					personAssignmentResultMessage = "Assigning \(name) was cancelled."
+					showPersonAssignmentResult = true
 				}
 				return
 			}
-			let assignment = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
+
+			let metadataUpdatedURLs = updatedURLs
+			await MainActor.run {
+				refreshMetadataAfterWrite(for: metadataUpdatedURLs)
+			}
+
+			let training: PersonRecognitionTrainingResult
+			if teachableURLs.isEmpty {
+				training = PersonRecognitionTrainingResult(examplesAdded: 0, failed: 0)
+			} else {
+				await MainActor.run {
+					personRecognitionProgressMessage = "Teaching \(name)"
+					personRecognitionProgressCompleted = 0
+					personRecognitionProgressTotal = teachableURLs.count
+				}
+				training = await PersonRecognitionStore.shared.train(name: name, imageURLs: teachableURLs, model: model) { completed, total, status in
+					Task { @MainActor in
+						personRecognitionProgressCompleted = completed
+						personRecognitionProgressTotal = total
+						personRecognitionProgressMessage = status
+					}
+				}
+			}
+
+			if Task.isCancelled {
+				await MainActor.run {
+					isPersonRecognitionWorking = false
+					personRecognitionTask = nil
+					personAssignmentResultMessage = "Assigning \(name) was cancelled."
+					showPersonAssignmentResult = true
+				}
+				return
+			}
+
 			await MainActor.run {
 				isPersonRecognitionWorking = false
 				personRecognitionTask = nil
-				if training.examplesAdded > 0 {
-					personRecognitionResultMessage = "Added \(training.examplesAdded) training example\(training.examplesAdded == 1 ? "" : "s") for \(name). \(assignment.photosWithFaces) photo\(assignment.photosWithFaces == 1 ? "" : "s") were also assigned in People."
-				} else {
-					personRecognitionResultMessage = "No training examples were added for \(name). \(training.failed) photo\(training.failed == 1 ? "" : "s") failed."
-				}
-				showPersonRecognitionResult = true
+				personAssignmentResultMessage = Self.personAssignAndTeachResultMessage(
+					name: name,
+					totalPhotos: totalPhotos,
+					assignment: assignment,
+					training: training,
+					teachableCount: teachableURLs.count
+				)
+				showPersonAssignmentResult = true
 			}
 		}
 		personRecognitionTask = task
+	}
+
+	private static func personAssignAndTeachResultMessage(
+		name: String,
+		totalPhotos: Int,
+		assignment: PersonAssignmentResult,
+		training: PersonRecognitionTrainingResult,
+		teachableCount: Int
+	) -> String {
+		var parts: [String] = []
+		if assignment.facesAssigned > 0 {
+			let faces = assignment.facesAssigned
+			let photosUsed = assignment.photosWithFaces
+			let skipped = totalPhotos - photosUsed
+			var message = "Assigned \(faces) face\(faces == 1 ? "" : "s") from \(photosUsed) of \(totalPhotos) photo\(totalPhotos == 1 ? "" : "s") to \"\(name)\"."
+			if skipped > 0 {
+				message += " \(skipped) photo\(skipped == 1 ? "" : "s") had no detectable face."
+			}
+			parts.append(message)
+		} else {
+			parts.append("No detectable faces were found in the selected photos, but metadata was updated where possible.")
+		}
+
+		if teachableCount == 0 {
+			parts.append("No teachable image\(totalPhotos == 1 ? "" : "s") were available for Ollama recognition.")
+		} else if training.examplesAdded > 0 {
+			parts.append("Added \(training.examplesAdded) Ollama training example\(training.examplesAdded == 1 ? "" : "s") for \(name).")
+			if training.failed > 0 {
+				parts.append("\(training.failed) training photo\(training.failed == 1 ? "" : "s") failed.")
+			}
+		} else {
+			parts.append("No Ollama training examples were added for \(name). \(training.failed) photo\(training.failed == 1 ? "" : "s") failed.")
+		}
+		return parts.joined(separator: " ")
 	}
 
 	private func recognizePeopleWithOllama() {
@@ -2531,10 +2738,10 @@ struct ContentView: View {
 				} onRecognized: { url, names in
 					for name in names {
 						_ = await FaceProcessor.shared.assignPerson(named: name, toFiles: [url])
-						let existingMetadata = await MetadataCache.shared.candidateString(for: url)
-						if !existingMetadata.localizedCaseInsensitiveContains(name) {
-							_ = await ContentView.writeKeywords(to: url, keywords: [name])
-						}
+					}
+					if !names.isEmpty {
+						let desc = names.joined(separator: ", ")
+						_ = await ContentView.writeDescription(to: url, description: desc)
 					}
 					await MainActor.run {
 						queueMetadataRefresh(for: url)
@@ -2586,34 +2793,6 @@ struct ContentView: View {
 			await MainActor.run { OllamaProgress.shared.end() }
 		}
 		OllamaProgress.shared.begin(total: urls.count, model: model, cancel: { task.cancel() })
-	}
-
-	private func applyPersonAssignmentToSelection() {
-		let name = assignPersonName.trimmingCharacters(in: .whitespacesAndNewlines)
-		let urls = faceActionTargetURLs
-		guard !name.isEmpty, !urls.isEmpty else { return }
-		let totalPhotos = urls.count
-		isApplyingPersonAssignment = true
-		Task.detached(priority: .utility) {
-			let result = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
-			await MainActor.run {
-				isApplyingPersonAssignment = false
-				isAssigningPerson = false
-				if result.facesAssigned > 0 {
-					let faces = result.facesAssigned
-					let photosUsed = result.photosWithFaces
-					let skipped = totalPhotos - photosUsed
-					var message = "Assigned \(faces) face\(faces == 1 ? "" : "s") from \(photosUsed) of \(totalPhotos) photo\(totalPhotos == 1 ? "" : "s") to \"\(name)\"."
-					if skipped > 0 {
-						message += " \(skipped) photo\(skipped == 1 ? "" : "s") had no detectable face."
-					}
-					personAssignmentResultMessage = message
-				} else {
-					personAssignmentResultMessage = "No detectable faces were found in the selected photos."
-				}
-				showPersonAssignmentResult = true
-			}
-		}
 	}
 
 	private func rescanFaceRecognitionForSelection() {
@@ -2851,6 +3030,7 @@ struct ContentView: View {
 		registeredSQLiteStoreName = currentSQLiteStoreName
 		Task { @MainActor in
 			GalleryTabRegistry.shared.update(snapshot)
+			FileNavigationMenuState.shared.reload()
 		}
 	}
 
@@ -3219,10 +3399,11 @@ struct ContentView: View {
 		deselectedItemsFromAll.removeAll()
 		vaultStoreTask?.cancel()
 
+		let openedStoreName = storeNameForOpen
 		let task = Task.detached(priority: .userInitiated) {
 			do {
-				logger.log("sqlite ui: open begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public)")
-				let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(storeName: storeNameForOpen) { completed, total, batch in
+				logger.log("sqlite ui: open begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public)")
+				let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(storeName: openedStoreName) { completed, total, batch in
 					await MainActor.run {
 						if !batch.isEmpty {
 							let batchPhotos = batch.map { PhotoItem(url: $0) }
@@ -3239,8 +3420,8 @@ struct ContentView: View {
 				await MainActor.run {
 					let duration = Date().timeIntervalSince(sqliteOpenStart)
 					library.folderURL = nil
-					activeSQLiteStoreName = storeNameForOpen
-					activeFolderNames = ["\(storeNameForOpen) (SQLite)"]
+					activeSQLiteStoreName = openedStoreName
+					activeFolderNames = ["\(openedStoreName) (SQLite)"]
 					isVaultWorking = false
 					vaultStoreTask = nil
 					sqliteLoadStartDate = nil
@@ -3250,29 +3431,29 @@ struct ContentView: View {
 					lastRefreshDate = Date()
 					forceThumbnailLoading = false
 					scheduleSort()
-					logger.log("sqlite ui: open complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public) objects=\(urls.count, privacy: .public) duration=\(duration, privacy: .public)")
+					logger.log("sqlite ui: open complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) objects=\(urls.count, privacy: .public) duration=\(duration, privacy: .public)")
 				}
 				Task.detached(priority: .utility) {
 					do {
 						let thumbnailStart = Date()
-						logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public)")
+						logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public)")
 						let count = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects { decoded, total in
 							await MainActor.run {
-								if isSQLiteObjectStoreView && activeSQLiteStoreName == storeNameForOpen && decoded > 0 {
+								if isSQLiteObjectStoreView && activeSQLiteStoreName == openedStoreName && decoded > 0 {
 									refreshToken = UUID()
-									logger.log("sqlite ui: background thumbnail hydration progress filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public) decoded=\(decoded, privacy: .public) total=\(total, privacy: .public)")
+									logger.log("sqlite ui: background thumbnail hydration progress filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) decoded=\(decoded, privacy: .public) total=\(total, privacy: .public)")
 								}
 							}
 						}
 						await MainActor.run {
 							let thumbnailDuration = Date().timeIntervalSince(thumbnailStart)
-							if isSQLiteObjectStoreView && activeSQLiteStoreName == storeNameForOpen {
+							if isSQLiteObjectStoreView && activeSQLiteStoreName == openedStoreName {
 								sqliteLastThumbnailLoadDuration = thumbnailDuration
 							}
-							logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
+							logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
 						}
 					} catch {
-						logger.error("sqlite ui: background thumbnail hydration failed filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeNameForOpen), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+						logger.error("sqlite ui: background thumbnail hydration failed filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 					}
 				}
 			} catch {
@@ -3570,6 +3751,7 @@ struct ContentView: View {
 
 		UserDefaults.standard.set(resolvedData, forKey: Self.kKnownFolderBookmarks)
 		bookmarkURLs = resolved
+		FileNavigationMenuState.shared.reload()
 	}
 
 	private func rememberKnownBookmarks(_ urls: [URL]) {
@@ -3595,6 +3777,43 @@ struct ContentView: View {
 			return
 		}
 		openWindow(id: "folder", value: url)
+	}
+
+	private func openSQLiteStoreFromMenu(named storeName: String) {
+		let trimmed = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !trimmed.isEmpty else { return }
+		guard !GalleryTabRegistry.shared.containsBookmarkName(trimmed) else {
+			vaultAlertMessage = "\(trimmed) is already open in this window."
+			showVaultAlert = true
+			return
+		}
+		openWindow(id: "sqlite-store", value: trimmed)
+	}
+
+	private func restoreSavedGallerySession() {
+		let sessionItems = Self.uniqueGallerySessionItems(WindowStateStore.shared.openGallerySessionItems())
+		guard !sessionItems.isEmpty else { return }
+		for (index, item) in sessionItems.enumerated() {
+			switch item {
+			case .folder(let url):
+				if index == 0 {
+					if !tryOpenFolderAsVault(url) {
+						library.folderURL = url
+						activeFolderNames = [url.lastPathComponent]
+						library.scan(folder: url)
+					}
+				} else {
+					openBookmarkedFolder(url)
+				}
+			case .sqliteStore(let storeName):
+				if index == 0 {
+					openSQLiteObjectStore(named: storeName)
+				} else {
+					openSQLiteStoreFromMenu(named: storeName)
+				}
+			}
+		}
+		FileNavigationMenuState.shared.reload()
 	}
 
 	private func filterAlreadyOpenBookmarkNames(_ urls: [URL]) -> [URL] {
@@ -4596,7 +4815,7 @@ struct ContentView: View {
 														if Task.isCancelled { break }
 														do {
 															let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-															await ThumbnailCache.shared.store(img, for: item.url)
+															ThumbnailCache.shared.store(img, for: item.url)
 														} catch { }
 													}
 												}
@@ -4625,7 +4844,7 @@ struct ContentView: View {
 		let start = Date()
 		Task {
 			let clear = Task.detached(priority: .userInitiated) {
-				await ThumbnailCache.shared.clear()
+				ThumbnailCache.shared.clear()
 			}
 			_ = await clear.value
 
@@ -4693,6 +4912,8 @@ struct ContentView: View {
 			sqliteLoadStartDate = start
 			sqliteLastLoadDuration = nil
 			sqliteLastThumbnailLoadDuration = nil
+			library.photos = []
+			displayedPhotos = []
 			vaultStoreTask?.cancel()
 		}
 		do {
@@ -4884,10 +5105,10 @@ struct ContentView: View {
 		deletingURLs = urls
 		logger.log("performSQLiteDelete: removing \(urls.count) records from SQLite store")
 		Task.detached(priority: .utility) {
-			var deletedCount = 0
+			var deletedURLs: Set<URL> = []
 			var failureMessage: String? = nil
 			do {
-				deletedCount = try await SQLiteObjectStore.shared.deleteObjects(at: urls)
+				deletedURLs = try await SQLiteObjectStore.shared.deleteObjects(at: urls)
 			} catch {
 				failureMessage = error.localizedDescription
 				await MainActor.run {
@@ -4895,39 +5116,44 @@ struct ContentView: View {
 				}
 			}
 			let fm = FileManager.default
-			for u in urls {
+			for u in deletedURLs {
 				try? fm.removeItem(at: u)
 			}
+			let resolvedFailureMessage = failureMessage
+			let resolvedDeletedURLs = deletedURLs
 			await MainActor.run {
-				let succeeded = failureMessage == nil
+				var successCount = 0
+				var failureCount = 0
 				for u in urls {
+					let succeeded = resolvedFailureMessage == nil && resolvedDeletedURLs.contains(u)
 					deleteResults[u] = succeeded
-					deleteErrorMessages[u] = failureMessage
+					deleteErrorMessages[u] = succeeded ? nil : (resolvedFailureMessage ?? "Could not remove object from SQLite store.")
 					deleteProgressCount += 1
 					if succeeded {
+						successCount += 1
 						selectedItems.remove(u)
 						library.photos.removeAll { $0.url == u }
 						displayedPhotos.removeAll { $0.url == u }
+					} else {
+						failureCount += 1
 					}
 				}
 				var detailLines: [String] = []
 				let sorted = urls.sorted { $0.lastPathComponent < $1.lastPathComponent }
-				let successCount = succeeded ? urls.count : 0
-				let failureCount = succeeded ? 0 : urls.count
 				for u in sorted {
-					if succeeded {
+					if resolvedDeletedURLs.contains(u) {
 						detailLines.append("[OK] \(u.lastPathComponent)")
 					} else {
-						detailLines.append("[FAIL] \(u.lastPathComponent): \(failureMessage ?? "Unknown delete error.")")
+						let errorText = (deleteErrorMessages[u] ?? nil) ?? "Unknown delete error."
+						detailLines.append("[FAIL] \(u.lastPathComponent): \(errorText)")
 					}
 				}
-				deleteHadFailures = !succeeded
-				deleteErrorSummary = (["Requested: \(urls.count), Removed from SQLite: \(deletedCount), Failed: \(failureCount)"] + detailLines).joined(separator: "\n")
-				_ = successCount
+				deleteHadFailures = failureCount > 0
+				deleteErrorSummary = (["Requested: \(urls.count), Removed from SQLite: \(successCount), Failed: \(failureCount)"] + detailLines).joined(separator: "\n")
 				showDeleteErrorSummary = true
 				deletingURLs = []
 				isDeleting = false
-				if deletedCount > 0 {
+				if successCount > 0 {
 					NotificationCenter.default.post(name: .sqliteObjectStoreDidChange, object: tabID)
 				}
 			}
@@ -4969,8 +5195,9 @@ struct ContentView: View {
 		} else {
 			photos = allPhotos
 		}
-		let mode = SortMode(rawValue: sortModeRaw) ?? .alphaAsc
+		let mode = activeSortMode
 		let filter = searchText
+		let groupByDescription = shouldGroupGridByDescription
 
 		// Quick-pass: update displayedPhotos with a filename-only match
 		// performed on the main actor so typing feels snappy.
@@ -4980,24 +5207,29 @@ struct ContentView: View {
 				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending }
 			case .alphaDesc:
 				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedDescending }
-			case .fileDate, .imageDate:
+			case .fileDate, .imageDate, .descriptionAsc, .descriptionDesc:
 				displayedPhotos = photos
 			}
 		} else {
-			// Attempt to compile regex for filename-only check; if invalid,
-			// fall back to case-insensitive substring match.
+			// Quick pass uses cached filename + description + metadata when
+			// available; the debounced pass fills in uncached items.
 			if let regex = try? NSRegularExpression(pattern: filter, options: [.caseInsensitive]) {
 				let quick = photos.filter { p in
-					let filename = p.url.lastPathComponent
-					let range = NSRange(filename.startIndex..<filename.endIndex, in: filename)
-					return regex.firstMatch(in: filename, options: [], range: range) != nil
+					Self.matchesRegex(regex, in: MetadataCache.shared.cachedSearchCandidate(for: p.url))
 				}
-				// Publish quick results immediately.
 				displayedPhotos = quick
 			} else {
 				let needle = filter.lowercased()
-				displayedPhotos = photos.filter { $0.url.lastPathComponent.lowercased().contains(needle) }
+				displayedPhotos = photos.filter { p in
+					MetadataCache.shared.cachedSearchCandidate(for: p.url).lowercased().contains(needle)
+				}
 			}
+		}
+
+		if groupByDescription {
+			displayedPhotoSections = buildQuickPhotoSections(from: displayedPhotos, sortMode: mode)
+		} else {
+			displayedPhotoSections = []
 		}
 
 		// Debounced full filter/sort task (metadata-aware). Small sleep
@@ -5008,9 +5240,85 @@ struct ContentView: View {
 			if Task.isCancelled { return }
 			let sorted = await Self.computeSorted(photos: photos, mode: mode, filter: filter)
 			if Task.isCancelled { return }
+			let sections = groupByDescription
+				? await Self.buildPhotoSections(from: sorted, sortMode: mode)
+				: []
 			await MainActor.run {
 				displayedPhotos = sorted
+				displayedPhotoSections = sections
 			}
+		}
+	}
+
+	private func buildQuickPhotoSections(from photos: [PhotoItem], sortMode: SortMode) -> [PhotoGridSection] {
+		var buckets: [String: [PhotoItem]] = [:]
+		var insertionOrder: [String] = []
+		for photo in photos {
+			let raw = MetadataCache.shared.cachedDescription(for: photo.url)?
+				.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+			let key = raw.isEmpty ? Self.noDescriptionSectionKey : raw
+			if buckets[key] == nil {
+				insertionOrder.append(key)
+				buckets[key] = []
+			}
+			buckets[key]?.append(photo)
+		}
+		return Self.orderedPhotoSections(
+			buckets: buckets,
+			insertionOrder: insertionOrder,
+			sortMode: sortMode
+		)
+	}
+
+	private static func buildPhotoSections(from photos: [PhotoItem], sortMode: SortMode) async -> [PhotoGridSection] {
+		var buckets: [String: [PhotoItem]] = [:]
+		var insertionOrder: [String] = []
+		for photo in photos {
+			let raw = await MetadataCache.shared.description(for: photo.url)?
+				.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+			let key = raw.isEmpty ? noDescriptionSectionKey : raw
+			if buckets[key] == nil {
+				insertionOrder.append(key)
+				buckets[key] = []
+			}
+			buckets[key]?.append(photo)
+		}
+		return orderedPhotoSections(
+			buckets: buckets,
+			insertionOrder: insertionOrder,
+			sortMode: sortMode
+		)
+	}
+
+	private static func orderedPhotoSections(
+		buckets: [String: [PhotoItem]],
+		insertionOrder: [String],
+		sortMode: SortMode
+	) -> [PhotoGridSection] {
+		let namedKeys = insertionOrder.filter { $0 != noDescriptionSectionKey }
+		var orderedKeys: [String]
+		switch sortMode {
+		case .descriptionAsc:
+			orderedKeys = namedKeys.sorted {
+				$0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+			}
+		case .descriptionDesc:
+			orderedKeys = namedKeys.sorted {
+				$0.localizedCaseInsensitiveCompare($1) == .orderedDescending
+			}
+		default:
+			orderedKeys = namedKeys
+		}
+		if buckets[noDescriptionSectionKey] != nil {
+			orderedKeys.append(noDescriptionSectionKey)
+		}
+		return orderedKeys.compactMap { key in
+			guard let sectionPhotos = buckets[key], !sectionPhotos.isEmpty else { return nil }
+			return PhotoGridSection(
+				id: key,
+				title: key == noDescriptionSectionKey ? "No Description" : key,
+				photos: sectionPhotos
+			)
 		}
 	}
 
@@ -5027,6 +5335,15 @@ struct ContentView: View {
 			}
 			metadataRefreshTask = nil
 		}
+	}
+
+	private func refreshMetadataAfterWrite(for urls: [URL]) {
+		guard !urls.isEmpty else { return }
+		for url in urls {
+			MetadataCache.shared.invalidate(for: url)
+			queueMetadataRefresh(for: url)
+		}
+		scheduleSort()
 	}
 
 	private func queuePhotoChangeRefresh() {
@@ -5098,6 +5415,11 @@ struct ContentView: View {
 		}
 	}
 
+	private static func matchesRegex(_ regex: NSRegularExpression, in text: String) -> Bool {
+		let range = NSRange(text.startIndex..<text.endIndex, in: text)
+		return regex.firstMatch(in: text, options: [], range: range) != nil
+	}
+
 	private static func computeSorted(photos: [PhotoItem], mode: SortMode, filter: String) async -> [PhotoItem] {
 		// If no filter provided, just sort normally.
 		let filtered: [PhotoItem]
@@ -5106,49 +5428,52 @@ struct ContentView: View {
 		} else {
 			// Attempt to compile the filter as a regular expression. If
 			// compilation fails, fall back to a case-insensitive substring
-			// match on filename only.
+			// match on filename, description, and other metadata.
 			if let regex = try? NSRegularExpression(pattern: filter, options: [.caseInsensitive]) {
 				var matches: [PhotoItem] = []
 				for p in photos {
-					// First test filename quickly without touching image data.
 					let filename = p.url.lastPathComponent
-					let fnameRange = NSRange(filename.startIndex..<filename.endIndex, in: filename)
-					if regex.firstMatch(in: filename, options: [], range: fnameRange) != nil {
+					if matchesRegex(regex, in: filename) {
 						matches.append(p)
 						continue
 					}
-					// Filename didn't match; only now read lightweight image
-					// properties for metadata matching. This avoids expensive
-					// CGImageSource work for the majority of items.
+					if let description = await MetadataCache.shared.description(for: p.url),
+					   !description.isEmpty,
+					   matchesRegex(regex, in: description) {
+						matches.append(p)
+						continue
+					}
 					let fullCandidate = await MetadataCache.shared.candidateString(for: p.url)
-					let range = NSRange(fullCandidate.startIndex..<fullCandidate.endIndex, in: fullCandidate)
-					if regex.firstMatch(in: fullCandidate, options: [], range: range) != nil {
+					if matchesRegex(regex, in: fullCandidate) {
 						matches.append(p)
 					}
 				}
 				filtered = matches
 			} else {
-				// Invalid regex: fallback to case-insensitive substring match
-				// against filename _and_ embedded metadata. Previously we only
-				// matched the filename here which made invalid-regex cases
-				// miss metadata. Use the MetadataCache to obtain the cached
-				// candidate string (filename + metadata) for each item.
 				let needle = filter.lowercased()
 				var matches: [PhotoItem] = []
 				for p in photos {
 					let filename = p.url.lastPathComponent.lowercased()
-					if filename.contains(needle) { matches.append(p); continue }
-					// Check cached candidate string (may perform a lightweight
-					// ImageIO read if not present in the cache).
-					let full = await MetadataCache.shared.candidateString(for: p.url)
-									if full.lowercased().contains(needle) { matches.append(p) }
-									}
-									filtered = matches
-								}
-							}
-
-							return await Self.sortPhotos(filtered, mode: mode)
+					if filename.contains(needle) {
+						matches.append(p)
+						continue
 					}
+					if let description = await MetadataCache.shared.description(for: p.url),
+					   description.lowercased().contains(needle) {
+						matches.append(p)
+						continue
+					}
+					let full = await MetadataCache.shared.candidateString(for: p.url)
+					if full.lowercased().contains(needle) {
+						matches.append(p)
+					}
+				}
+				filtered = matches
+			}
+		}
+
+		return await Self.sortPhotos(filtered, mode: mode)
+	}
 
 	private static func sortPhotos(_ photos: [PhotoItem], mode: SortMode) async -> [PhotoItem] {
 		switch mode {
@@ -5189,6 +5514,22 @@ struct ContentView: View {
 				let da = imageDate(for: a.url) ?? (try? a.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
 				let db = imageDate(for: b.url) ?? (try? b.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
 				return da > db
+			}
+		case .descriptionAsc, .descriptionDesc:
+			var descriptions: [String: String] = [:]
+			for photo in photos {
+				descriptions[photo.url.path] = await MetadataCache.shared.description(for: photo.url) ?? ""
+			}
+			return photos.sorted { a, b in
+				let da = descriptions[a.url.path] ?? ""
+				let db = descriptions[b.url.path] ?? ""
+				let aEmpty = da.isEmpty
+				let bEmpty = db.isEmpty
+				if aEmpty != bEmpty {
+					return !aEmpty && bEmpty
+				}
+				let cmp = da.localizedCaseInsensitiveCompare(db)
+				return mode == .descriptionAsc ? cmp == .orderedAscending : cmp == .orderedDescending
 			}
 		}
 	}
@@ -5258,10 +5599,22 @@ struct ContentView: View {
 
 	private static func updateKeywords(on url: URL, keywords: [String], mode: KeywordWriteMode) async -> Bool {
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
+		let targetURL: URL
+		if SQLiteObjectStore.isWorkingCopyURL(url) {
+			_ = AppWorkingDirectory.ensureAccess()
+			do {
+				targetURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
+			} catch {
+				logger.error("writeKeywords: failed to materialize sqlite working copy filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				return false
+			}
+		} else {
+			targetURL = url
+		}
 		// Ensure security-scoped access if available
-		_ = await Self.ensureSecurityScopedAccess(for: url)
+		_ = await Self.ensureSecurityScopedAccess(for: targetURL)
 		// Read source
-		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let type = CGImageSourceGetType(src) else {
+		guard let src = CGImageSourceCreateWithURL(targetURL as CFURL, nil), let type = CGImageSourceGetType(src) else {
 			logger.log("writeKeywords: cannot create CGImageSource")
 			return false
 		}
@@ -5288,13 +5641,13 @@ struct ContentView: View {
 		// and don't fail across volumes. Use a hidden filename to avoid
 		// exposing partial artifacts.
 		let fm = FileManager.default
-		let dir = url.deletingLastPathComponent()
+		let dir = targetURL.deletingLastPathComponent()
 		let tempFilename = ".pvtmp-\(UUID().uuidString)"
-		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(url.pathExtension)
+		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(targetURL.pathExtension)
 
 		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
 			logger.error("writeKeywords: cannot create CGImageDestination")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
 			// Embedded write failed; do not fall back to sidecar per policy.
 			return false
 		}
@@ -5303,7 +5656,7 @@ struct ContentView: View {
 		if !CGImageDestinationFinalize(dest) {
 			logger.error("writeKeywords: CGImageDestinationFinalize failed")
 			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
 			// Finalize failed; do not write sidecar – report failure so caller
 			// can surface an error or request additional permissions.
 			return false
@@ -5311,21 +5664,21 @@ struct ContentView: View {
 
 		do {
 			// Replace original file with temp file
-			let backupURL = url.appendingPathExtension("backup")
+			let backupURL = targetURL.appendingPathExtension("backup")
 			if fm.fileExists(atPath: backupURL.path) { try? fm.removeItem(at: backupURL) }
-			try fm.moveItem(at: url, to: backupURL)
-			try fm.moveItem(at: tempURL, to: url)
+			try fm.moveItem(at: targetURL, to: backupURL)
+			try fm.moveItem(at: tempURL, to: targetURL)
 			try? fm.removeItem(at: backupURL)
-			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(url)
+			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
 			if SQLiteObjectStore.isWorkingCopyURL(url) {
-				try await SQLiteObjectStore.shared.storeObjectFile(at: url)
+				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
 			}
 			return true
 		} catch {
 			logger.error("writeKeywords: failed to replace original file: \(error.localizedDescription, privacy: .public)")
 			// Attempt to cleanup
 			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "writeKeywords", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
 			// Do not fall back to sidecar; surface failure to caller.
 			return false
 		}
@@ -5359,6 +5712,93 @@ struct ContentView: View {
 			}
 		}
 		return result
+	}
+
+	// MARK: - Description (person name) metadata writing
+
+	/// Writes (overwrites) the DESCRIPTION / caption metadata for the image.
+	/// Person names (manual assignment or via recognition) are stored here.
+	/// Sets TIFF ImageDescription and IPTC Caption/Abstract.
+	static func writeDescription(to url: URL, description: String) async -> Bool {
+		await updateDescription(on: url, description: description)
+	}
+
+	private static func updateDescription(on url: URL, description: String) async -> Bool {
+		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
+		let targetURL: URL
+		if SQLiteObjectStore.isWorkingCopyURL(url) {
+			_ = AppWorkingDirectory.ensureAccess()
+			do {
+				targetURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
+			} catch {
+				logger.error("writeDescription: failed to materialize sqlite working copy filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				return false
+			}
+		} else {
+			targetURL = url
+		}
+		_ = await Self.ensureSecurityScopedAccess(for: targetURL)
+
+		guard let src = CGImageSourceCreateWithURL(targetURL as CFURL, nil),
+			  let type = CGImageSourceGetType(src) else {
+			logger.log("writeDescription: cannot create CGImageSource")
+			return false
+		}
+
+		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
+			logger.log("writeDescription: cannot copy properties")
+			return false
+		}
+
+		var metadata = props
+
+		// Primary: TIFF ImageDescription (surfaced by app in thumbnails/search and commonly used for description)
+		var tiff = (metadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any]) ?? [:]
+		tiff[kCGImagePropertyTIFFImageDescription] = description
+		metadata[kCGImagePropertyTIFFDictionary] = tiff as CFDictionary
+
+		// Also set standard IPTC caption field for interoperability with other tools
+		var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
+		iptc[kCGImagePropertyIPTCCaptionAbstract] = description
+		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
+
+		// Create temp + atomic replace (same pattern as keywords)
+		let fm = FileManager.default
+		let dir = targetURL.deletingLastPathComponent()
+		let tempFilename = ".pvtmp-\(UUID().uuidString)"
+		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(targetURL.pathExtension)
+
+		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
+			logger.error("writeDescription: cannot create CGImageDestination")
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
+			return false
+		}
+
+		CGImageDestinationAddImageFromSource(dest, src, 0, metadata as CFDictionary)
+		if !CGImageDestinationFinalize(dest) {
+			logger.error("writeDescription: CGImageDestinationFinalize failed")
+			try? fm.removeItem(at: tempURL)
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
+			return false
+		}
+
+		do {
+			let backupURL = targetURL.appendingPathExtension("backup")
+			if fm.fileExists(atPath: backupURL.path) { try? fm.removeItem(at: backupURL) }
+			try fm.moveItem(at: targetURL, to: backupURL)
+			try fm.moveItem(at: tempURL, to: targetURL)
+			try? fm.removeItem(at: backupURL)
+			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
+			if SQLiteObjectStore.isWorkingCopyURL(url) {
+				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
+			}
+			return true
+		} catch {
+			logger.error("writeDescription: failed to replace original file: \(error.localizedDescription, privacy: .public)")
+			try? fm.removeItem(at: tempURL)
+			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
+			return false
+		}
 	}
 
 	private func restoreSavedWindowsIfNeeded(skipSavedFolder: Bool) {
@@ -5409,8 +5849,9 @@ struct ContentView: View {
 					deduped.sort {
 						$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
 					}
+					let dedupedCount = deduped.count
 					await MainActor.run {
-						logger.log("launch folder restore: source=saved-window-state storage=cache folder=\(folder.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(deduped.count, privacy: .public)")
+						logger.log("launch folder restore: source=saved-window-state storage=cache folder=\(folder.path, privacy: .public) cachedFiles=\(urls.count, privacy: .public) uniqueFiles=\(dedupedCount, privacy: .public)")
 					}
 					// Publish in batches to avoid a big main-thread spike.
 					let batchSize = 512
@@ -5436,7 +5877,7 @@ struct ContentView: View {
 								if Task.isCancelled { break }
 								do {
 									let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-									await ThumbnailCache.shared.store(img, for: item.url)
+									ThumbnailCache.shared.store(img, for: item.url)
 								} catch {
 									// Ignore individual thumbnail failures — it's
 									// acceptable for some items to fail to generate.

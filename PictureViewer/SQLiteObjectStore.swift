@@ -62,6 +62,11 @@ actor SQLiteObjectStore {
         let dbURL: URL
     }
 
+    struct StoredObjectMetadata: Sendable {
+        let description: String?
+        let keywords: [String]
+    }
+
     struct PendingObject: Sendable {
         let objectData: Data
         let originalURL: URL
@@ -200,7 +205,9 @@ actor SQLiteObjectStore {
         contentHash: String,
         contentTypeIdentifier: String?,
         thumbnailData: Data? = nil,
-        storeName: String? = nil
+        storeName: String? = nil,
+        replacingObjectID: Int64? = nil,
+        databaseURL: URL? = nil
     ) throws {
         guard Self.isEnabled else { return }
         let shouldEncrypt = Self.encryptsBlobs
@@ -215,31 +222,58 @@ actor SQLiteObjectStore {
             storedData = objectData
         }
 
-        let dbURL = try resolvedDatabaseURL(storeName: storeName)
+        let lazyFile = lazyWorkingFiles[Self.workingCopyKey(for: originalURL)]
+        let dbURL = try databaseURL ?? lazyFile?.dbURL ?? resolvedDatabaseURL(storeName: storeName)
+        let objectIDToReplace = replacingObjectID ?? lazyFile?.id
         let objectMetadata = Self.objectMetadata(from: objectData, originalURL: originalURL, contentTypeIdentifier: contentTypeIdentifier)
         let fileValues = try? originalURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey, .fileSizeKey])
         try withDatabase(at: dbURL) { db in
             try Self.createSchema(in: db)
-            let objectID = try Self.upsertObject(
-                in: db,
-                filename: originalURL.lastPathComponent,
-                originalPath: originalURL.path,
-                contentHash: contentHash,
-                contentTypeIdentifier: objectMetadata.contentType,
-                fileExtension: originalURL.pathExtension,
-                fileSize: fileValues?.fileSize ?? objectData.count,
-                pixelWidth: objectMetadata.pixelWidth,
-                pixelHeight: objectMetadata.pixelHeight,
-                createdAt: fileValues?.creationDate,
-                modifiedAt: fileValues?.contentModificationDate,
-                importedAt: Date(),
-                isEncrypted: shouldEncrypt,
-                blobData: storedData,
-                thumbnailData: thumbnailData
-            )
+            let objectID: Int64
+            if let objectIDToReplace {
+                try Self.updateObject(
+                    in: db,
+                    objectID: objectIDToReplace,
+                    filename: originalURL.lastPathComponent,
+                    originalPath: originalURL.path,
+                    contentHash: contentHash,
+                    contentTypeIdentifier: objectMetadata.contentType,
+                    fileExtension: originalURL.pathExtension,
+                    fileSize: fileValues?.fileSize ?? objectData.count,
+                    pixelWidth: objectMetadata.pixelWidth,
+                    pixelHeight: objectMetadata.pixelHeight,
+                    description: objectMetadata.description,
+                    createdAt: fileValues?.creationDate,
+                    modifiedAt: fileValues?.contentModificationDate,
+                    importedAt: Date(),
+                    isEncrypted: shouldEncrypt,
+                    blobData: storedData,
+                    thumbnailData: thumbnailData
+                )
+                objectID = objectIDToReplace
+            } else {
+                objectID = try Self.upsertObject(
+                    in: db,
+                    filename: originalURL.lastPathComponent,
+                    originalPath: originalURL.path,
+                    contentHash: contentHash,
+                    contentTypeIdentifier: objectMetadata.contentType,
+                    fileExtension: originalURL.pathExtension,
+                    fileSize: fileValues?.fileSize ?? objectData.count,
+                    pixelWidth: objectMetadata.pixelWidth,
+                    pixelHeight: objectMetadata.pixelHeight,
+                    description: objectMetadata.description,
+                    createdAt: fileValues?.creationDate,
+                    modifiedAt: fileValues?.contentModificationDate,
+                    importedAt: Date(),
+                    isEncrypted: shouldEncrypt,
+                    blobData: storedData,
+                    thumbnailData: thumbnailData
+                )
+            }
             try Self.replaceKeywords(objectMetadata.keywords, forObjectID: objectID, in: db)
         }
-        logger.log("sqlite object store: stored filename=\(originalURL.lastPathComponent, privacy: .public) encrypted=\(shouldEncrypt, privacy: .public)")
+        logger.log("sqlite object store: stored filename=\(originalURL.lastPathComponent, privacy: .public) encrypted=\(shouldEncrypt, privacy: .public) replacedExisting=\(objectIDToReplace != nil, privacy: .public)")
     }
 
     func storeObjectBatchThrowing(_ objects: [PendingObject], storeName: String? = nil) throws -> Int {
@@ -283,6 +317,7 @@ actor SQLiteObjectStore {
                         fileSize: fileValues?.fileSize ?? object.objectData.count,
                         pixelWidth: objectMetadata.pixelWidth,
                         pixelHeight: objectMetadata.pixelHeight,
+                        description: objectMetadata.description,
                         createdAt: fileValues?.creationDate,
                         modifiedAt: fileValues?.contentModificationDate,
                         importedAt: Date(),
@@ -308,6 +343,7 @@ actor SQLiteObjectStore {
         guard Self.isEnabled else { return }
         let started = url.startAccessingSecurityScopedResource()
         defer { if started { url.stopAccessingSecurityScopedResource() } }
+        let lazyFile = lazyWorkingFiles[Self.workingCopyKey(for: url)]
         let data = try Data(contentsOf: url)
         let contentHash = Self.contentHash(of: data)
         let contentType = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
@@ -318,7 +354,9 @@ actor SQLiteObjectStore {
             originalURL: url,
             contentHash: contentHash,
             contentTypeIdentifier: contentType,
-            thumbnailData: thumbnailData
+            thumbnailData: thumbnailData,
+            replacingObjectID: lazyFile?.id,
+            databaseURL: lazyFile?.dbURL
         )
     }
 
@@ -334,7 +372,7 @@ actor SQLiteObjectStore {
         do {
             let image = try await ThumbnailGenerator.shared.generateThumbnail(for: url)
             await MainActor.run { ThumbnailCache.shared.store(image, for: url) }
-            return ThumbnailCache.jpegData(from: image)
+            return await MainActor.run { ThumbnailCache.jpegData(from: image) }
         } catch {
             logger.error("sqlite object store: on-demand thumbnail failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return nil
@@ -346,6 +384,9 @@ actor SQLiteObjectStore {
         progress: (@Sendable (_ completed: Int, _ total: Int, _ urls: [URL]) async -> Void)? = nil
     ) async throws -> [URL] {
         guard Self.isEnabled else { return [] }
+        guard AppWorkingDirectory.ensureAccess() else {
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
         let loadStart = Date()
         logger.log("sqlite object store: load begin storeName=\(storeName ?? Self.configuredStoreName, privacy: .public)")
         let dbURL = try resolvedDatabaseURL(storeName: storeName)
@@ -432,6 +473,37 @@ actor SQLiteObjectStore {
         return urls
     }
 
+    func metadataForWorkingFile(_ url: URL) async -> StoredObjectMetadata? {
+        guard Self.isWorkingCopyURL(url),
+              let lazyFile = lazyWorkingFiles[Self.workingCopyKey(for: url)] else {
+            return nil
+        }
+        do {
+            let keyData = lazyFile.isEncrypted ? try accessKeyData() : nil
+            return try withDatabase(at: lazyFile.dbURL, flags: SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX) { db in
+                var description = try Self.objectDescription(id: lazyFile.id, in: db)
+                let keywords = try Self.objectKeywords(id: lazyFile.id, in: db)
+                if description == nil,
+                   let objectData = try? Self.objectData(
+                       id: lazyFile.id,
+                       isEncrypted: lazyFile.isEncrypted,
+                       keyData: keyData,
+                       dbURL: lazyFile.dbURL
+                   ) {
+                    description = Self.objectMetadata(
+                        from: objectData,
+                        originalURL: url,
+                        contentTypeIdentifier: nil
+                    ).description
+                }
+                return StoredObjectMetadata(description: description, keywords: keywords)
+            }
+        } catch {
+            logger.error("sqlite object store: metadata lookup failed filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     func materializeWorkingCopyIfNeeded(_ url: URL) async throws -> URL {
         guard Self.isWorkingCopyURL(url) else { return url }
         if FileManager.default.fileExists(atPath: url.path) {
@@ -444,6 +516,10 @@ actor SQLiteObjectStore {
 
         let materializeStart = Date()
         logger.log("sqlite object store: materialize begin filename=\(url.lastPathComponent, privacy: .public)")
+        guard AppWorkingDirectory.ensureAccess() else {
+            logger.error("sqlite object store: materialize failed missing working-directory access filename=\(url.lastPathComponent, privacy: .public)")
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let existingThumbnail = await MainActor.run {
             ThumbnailCache.shared.memoryImage(for: url)
@@ -541,52 +617,103 @@ actor SQLiteObjectStore {
     }
 
     /// Deletes objects from the SQLite store identified by the working-file
-    /// URLs returned from `loadObjectWorkingFiles`. The working file's content
-    /// is the same data we stored (after decryption when applicable), so its
-    /// SHA-256 maps 1:1 to the `content_hash` column. Records are removed
-    /// from the database; the original imported source file on disk is never
-    /// touched.
-    func deleteObjects(at urls: [URL]) async throws -> Int {
-        guard Self.isEnabled, !urls.isEmpty else { return 0 }
-        let dbURL = try resolvedDatabaseURL()
-        let hashes = urls.compactMap { url -> String? in
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            return Self.contentHash(of: data)
+    /// URLs returned from `loadObjectWorkingFiles`. Lazy working files may not
+    /// exist on disk yet, so deletion resolves object IDs from the in-memory
+    /// registry first and only falls back to content-hash matching when a
+    /// materialized working copy is present.
+    func deleteObjects(at urls: [URL]) async throws -> Set<URL> {
+        guard Self.isEnabled, !urls.isEmpty else { return [] }
+
+        struct PendingDelete {
+            let url: URL
+            let objectID: Int64?
+            let contentHash: String?
+            let dbURL: URL
         }
-        guard !hashes.isEmpty else { return 0 }
-        return try withDatabase(at: dbURL, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX) { db in
-            var deleted = 0
-            for hash in hashes {
-                var statement: OpaquePointer?
-                guard sqlite3_prepare_v2(db, "DELETE FROM objects WHERE content_hash = ?;", -1, &statement, nil) == SQLITE_OK,
-                      let statement else { continue }
-                Self.bindText(hash, at: 1, in: statement)
-                if sqlite3_step(statement) == SQLITE_DONE {
-                    deleted += Int(sqlite3_changes(db))
-                }
-                sqlite3_finalize(statement)
+
+        let defaultDBURL = try resolvedDatabaseURL()
+        var pending: [PendingDelete] = []
+        for url in urls {
+            if let lazyFile = lazyWorkingFiles[Self.workingCopyKey(for: url)] {
+                pending.append(PendingDelete(url: url, objectID: lazyFile.id, contentHash: nil, dbURL: lazyFile.dbURL))
+            } else if let data = try? Data(contentsOf: url) {
+                pending.append(
+                    PendingDelete(
+                        url: url,
+                        objectID: nil,
+                        contentHash: Self.contentHash(of: data),
+                        dbURL: defaultDBURL
+                    )
+                )
+            } else {
+                logger.error("sqlite object store: delete skipped unresolved working file filename=\(url.lastPathComponent, privacy: .public)")
             }
-            return deleted
         }
+        guard !pending.isEmpty else { return [] }
+
+        var deletedURLs: Set<URL> = []
+        let grouped = Dictionary(grouping: pending, by: \.dbURL)
+        for (dbURL, items) in grouped {
+            let deletedInDB = try withDatabase(at: dbURL, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX) { db in
+                var deleted = 0
+                for item in items {
+                    let didDelete: Bool
+                    if let objectID = item.objectID {
+                        didDelete = Self.runPreparedUpdate(
+                            in: db,
+                            sql: "DELETE FROM objects WHERE id = ?;"
+                        ) { stmt in
+                            sqlite3_bind_int64(stmt, 1, objectID)
+                        }
+                    } else if let contentHash = item.contentHash {
+                        didDelete = Self.runPreparedUpdate(
+                            in: db,
+                            sql: "DELETE FROM objects WHERE content_hash = ?;"
+                        ) { stmt in
+                            Self.bindText(contentHash, at: 1, in: stmt)
+                        }
+                    } else {
+                        continue
+                    }
+                    if didDelete {
+                        deleted += 1
+                        deletedURLs.insert(item.url)
+                    }
+                }
+                return deleted
+            }
+            logger.log("sqlite object store: deleted count=\(deletedInDB, privacy: .public) database=\(dbURL.lastPathComponent, privacy: .public)")
+        }
+
+        for url in deletedURLs {
+            let key = Self.workingCopyKey(for: url)
+            if let lazyFile = lazyWorkingFiles.removeValue(forKey: key) {
+                lazyWorkingURLsByID.removeValue(forKey: lazyFile.id)
+                lazyWorkingThumbnailOrder.removeAll { $0 == lazyFile.id }
+            }
+        }
+
+        return deletedURLs
     }
 
     func storeThumbnailData(_ thumbnailData: Data, forWorkingFile url: URL) async throws {
         guard Self.isEnabled, Self.isWorkingCopyURL(url), !thumbnailData.isEmpty else { return }
-        let objectData = try Data(contentsOf: url)
-        let contentHash = Self.contentHash(of: objectData)
-        let dbURL = try resolvedDatabaseURL()
+        let lazyFile = lazyWorkingFiles[Self.workingCopyKey(for: url)]
+        let dbURL = try lazyFile?.dbURL ?? resolvedDatabaseURL()
         try withDatabase(at: dbURL, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX) { db in
             try Self.createSchema(in: db)
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "UPDATE objects SET thumbnail_data = ? WHERE content_hash = ?;", -1, &statement, nil) == SQLITE_OK,
-                  let statement else {
-                throw SQLiteObjectStoreError.databaseWriteFailed
-            }
-            defer { sqlite3_finalize(statement) }
-            Self.bindBlob(thumbnailData, at: 1, in: statement)
-            Self.bindText(contentHash, at: 2, in: statement)
-            guard sqlite3_step(statement) == SQLITE_DONE else {
-                throw SQLiteObjectStoreError.databaseWriteFailed
+            if let objectID = lazyFile?.id {
+                try Self.execPrepared(in: db, sql: "UPDATE objects SET thumbnail_data = ? WHERE id = ?;") { stmt in
+                    Self.bindBlob(thumbnailData, at: 1, in: stmt)
+                    sqlite3_bind_int64(stmt, 2, objectID)
+                }
+            } else {
+                let objectData = try Data(contentsOf: url)
+                let contentHash = Self.contentHash(of: objectData)
+                try Self.execPrepared(in: db, sql: "UPDATE objects SET thumbnail_data = ? WHERE content_hash = ?;") { stmt in
+                    Self.bindBlob(thumbnailData, at: 1, in: stmt)
+                    Self.bindText(contentHash, at: 2, in: stmt)
+                }
             }
             let changed = sqlite3_changes(db)
             if changed > 0 {
@@ -774,6 +901,9 @@ actor SQLiteObjectStore {
         if !columnExists("thumbnail_data", inTable: "objects", db: db) {
             try exec("ALTER TABLE objects ADD COLUMN thumbnail_data BLOB;", in: db)
         }
+        if !columnExists("description", inTable: "objects", db: db) {
+            try exec("ALTER TABLE objects ADD COLUMN description TEXT;", in: db)
+        }
     }
 
     private nonisolated static func upsertObject(
@@ -786,6 +916,7 @@ actor SQLiteObjectStore {
         fileSize: Int,
         pixelWidth: Int?,
         pixelHeight: Int?,
+        description: String?,
         createdAt: Date?,
         modifiedAt: Date?,
         importedAt: Date,
@@ -796,9 +927,9 @@ actor SQLiteObjectStore {
         let sql = """
         INSERT INTO objects (
             original_filename, original_path, content_hash, content_type,
-            file_extension, file_size, pixel_width, pixel_height,
+            file_extension, file_size, pixel_width, pixel_height, description,
             created_at, modified_at, imported_at, is_encrypted, blob_data, thumbnail_data
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(content_hash) DO UPDATE SET
             original_filename=excluded.original_filename,
             original_path=excluded.original_path,
@@ -807,6 +938,7 @@ actor SQLiteObjectStore {
             file_size=excluded.file_size,
             pixel_width=excluded.pixel_width,
             pixel_height=excluded.pixel_height,
+            description=COALESCE(excluded.description, objects.description),
             created_at=excluded.created_at,
             modified_at=excluded.modified_at,
             imported_at=excluded.imported_at,
@@ -827,18 +959,85 @@ actor SQLiteObjectStore {
         sqlite3_bind_int64(statement, 6, Int64(fileSize))
         bindInt(pixelWidth, at: 7, in: statement)
         bindInt(pixelHeight, at: 8, in: statement)
-        bindDate(createdAt, at: 9, in: statement)
-        bindDate(modifiedAt, at: 10, in: statement)
-        sqlite3_bind_double(statement, 11, importedAt.timeIntervalSince1970)
-        sqlite3_bind_int(statement, 12, isEncrypted ? 1 : 0)
+        bindText(description, at: 9, in: statement)
+        bindDate(createdAt, at: 10, in: statement)
+        bindDate(modifiedAt, at: 11, in: statement)
+        sqlite3_bind_double(statement, 12, importedAt.timeIntervalSince1970)
+        sqlite3_bind_int(statement, 13, isEncrypted ? 1 : 0)
         _ = blobData.withUnsafeBytes { bytes in
-            sqlite3_bind_blob64(statement, 13, bytes.baseAddress, sqlite3_uint64(blobData.count), sqliteTransientDestructor())
+            sqlite3_bind_blob64(statement, 14, bytes.baseAddress, sqlite3_uint64(blobData.count), sqliteTransientDestructor())
         }
-        bindBlob(thumbnailData, at: 14, in: statement)
+        bindBlob(thumbnailData, at: 15, in: statement)
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw SQLiteObjectStoreError.databaseWriteFailed
         }
         return findObjectID(contentHash: contentHash, in: db)
+    }
+
+    private nonisolated static func updateObject(
+        in db: OpaquePointer,
+        objectID: Int64,
+        filename: String,
+        originalPath: String,
+        contentHash: String,
+        contentTypeIdentifier: String?,
+        fileExtension: String,
+        fileSize: Int,
+        pixelWidth: Int?,
+        pixelHeight: Int?,
+        description: String?,
+        createdAt: Date?,
+        modifiedAt: Date?,
+        importedAt: Date,
+        isEncrypted: Bool,
+        blobData: Data,
+        thumbnailData: Data?
+    ) throws {
+        let sql = """
+        UPDATE objects SET
+            original_filename = ?,
+            original_path = ?,
+            content_hash = ?,
+            content_type = ?,
+            file_extension = ?,
+            file_size = ?,
+            pixel_width = ?,
+            pixel_height = ?,
+            description = ?,
+            created_at = ?,
+            modified_at = ?,
+            imported_at = ?,
+            is_encrypted = ?,
+            blob_data = ?,
+            thumbnail_data = COALESCE(?, thumbnail_data)
+        WHERE id = ?;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw SQLiteObjectStoreError.databaseWriteFailed
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(filename, at: 1, in: statement)
+        bindText(originalPath, at: 2, in: statement)
+        bindText(contentHash, at: 3, in: statement)
+        bindText(contentTypeIdentifier, at: 4, in: statement)
+        bindText(fileExtension, at: 5, in: statement)
+        sqlite3_bind_int64(statement, 6, Int64(fileSize))
+        bindInt(pixelWidth, at: 7, in: statement)
+        bindInt(pixelHeight, at: 8, in: statement)
+        bindText(description, at: 9, in: statement)
+        bindDate(createdAt, at: 10, in: statement)
+        bindDate(modifiedAt, at: 11, in: statement)
+        sqlite3_bind_double(statement, 12, importedAt.timeIntervalSince1970)
+        sqlite3_bind_int(statement, 13, isEncrypted ? 1 : 0)
+        _ = blobData.withUnsafeBytes { bytes in
+            sqlite3_bind_blob64(statement, 14, bytes.baseAddress, sqlite3_uint64(blobData.count), sqliteTransientDestructor())
+        }
+        bindBlob(thumbnailData, at: 15, in: statement)
+        sqlite3_bind_int64(statement, 16, objectID)
+        guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) > 0 else {
+            throw SQLiteObjectStoreError.databaseWriteFailed
+        }
     }
 
     private nonisolated static func replaceKeywords(_ keywords: [String], forObjectID objectID: Int64, in db: OpaquePointer) throws {
@@ -950,6 +1149,9 @@ actor SQLiteObjectStore {
     }
 
     private nonisolated static func prepareWorkingDirectory() throws -> URL {
+        guard AppWorkingDirectory.ensureAccess() else {
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
         let directory = workingDirectoryURL()
         if FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.removeItem(at: directory)
@@ -995,6 +1197,7 @@ actor SQLiteObjectStore {
     }
 
     nonisolated static func clearWorkingCopiesOnDisk() {
+        guard AppWorkingDirectory.ensureAccess() else { return }
         let directory = workingDirectoryURL()
         try? FileManager.default.removeItem(at: directory)
     }
@@ -1044,20 +1247,53 @@ actor SQLiteObjectStore {
         from data: Data,
         originalURL: URL,
         contentTypeIdentifier: String?
-    ) -> (contentType: String?, pixelWidth: Int?, pixelHeight: Int?, keywords: [String]) {
+    ) -> (contentType: String?, pixelWidth: Int?, pixelHeight: Int?, keywords: [String], description: String?) {
         let detectedType = contentTypeIdentifier ?? UTType(filenameExtension: originalURL.pathExtension)?.identifier
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
-            return (detectedType, nil, nil, [])
+            return (detectedType, nil, nil, [], nil)
         }
         let width = props[kCGImagePropertyPixelWidth] as? Int
         let height = props[kCGImagePropertyPixelHeight] as? Int
-        var keywords: [String] = []
-        if let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any],
-           let values = iptc[kCGImagePropertyIPTCKeywords] {
-            keywords.append(contentsOf: keywordStrings(from: values))
+        let embedded = ImageEmbeddedMetadataReader.read(from: props)
+        return (detectedType, width, height, embedded.keywords, embedded.description)
+    }
+
+    private nonisolated static func objectDescription(id: Int64, in db: OpaquePointer) throws -> String? {
+        guard columnExists("description", inTable: "objects", db: db) else { return nil }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT description FROM objects WHERE id = ?;", -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw SQLiteObjectStoreError.databaseReadFailed
         }
-        return (detectedType, width, height, normalizedKeywords(keywords))
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, id)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return columnText(statement, 0)
+    }
+
+    private nonisolated static func objectKeywords(id: Int64, in db: OpaquePointer) throws -> [String] {
+        let sql = """
+        SELECT k.keyword
+        FROM keywords k
+        JOIN object_keywords ok ON ok.keyword_id = k.id
+        WHERE ok.object_id = ?
+        ORDER BY k.keyword COLLATE NOCASE;
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, id)
+        var keywords: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let keyword = columnText(statement, 0) {
+                keywords.append(keyword)
+            }
+        }
+        return keywords
     }
 
     private nonisolated static func contentHash(of data: Data) -> String {
@@ -1084,6 +1320,40 @@ actor SQLiteObjectStore {
             }
         }
         return result
+    }
+
+    private nonisolated static func execPrepared(
+        in db: OpaquePointer,
+        sql: String,
+        bind: (OpaquePointer) -> Void
+    ) throws {
+        var rawStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &rawStatement, nil) == SQLITE_OK,
+              let stmt = rawStatement else {
+            throw SQLiteObjectStoreError.databaseWriteFailed
+        }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw SQLiteObjectStoreError.databaseWriteFailed
+        }
+    }
+
+    @discardableResult
+    private nonisolated static func runPreparedUpdate(
+        in db: OpaquePointer,
+        sql: String,
+        bind: (OpaquePointer) -> Void
+    ) -> Bool {
+        var rawStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &rawStatement, nil) == SQLITE_OK,
+              let stmt = rawStatement else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        bind(stmt)
+        guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+        return sqlite3_changes(db) > 0
     }
 
     private nonisolated static func bindText(_ value: String?, at index: Int32, in statement: OpaquePointer) {

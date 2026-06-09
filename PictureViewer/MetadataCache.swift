@@ -5,19 +5,20 @@ import os
 /// Caches image metadata (e.g., EXIF date) and performs metadata reads
 /// concurrently. The previous actor-based implementation serialized all
 /// metadata requests which became a bottleneck when scanning many files.
-final class MetadataCache {
-	static let shared = MetadataCache()
+nonisolated final class MetadataCache: @unchecked Sendable {
+	nonisolated static let shared = MetadataCache()
 
 	// Concurrent caches protected by a concurrent dispatch queue. Readers
 	// can access the dictionaries concurrently; writers use a barrier.
-	private var imageDateCache: [String: Date?] = [:]
-	private var fileDateCache: [String: Date?] = [:]
-	private var candidateCache: [String: String] = [:]
-	private let cacheQueue = DispatchQueue(label: "MetadataCache.cacheQueue", attributes: .concurrent)
+	nonisolated(unsafe) private var imageDateCache: [String: Date?] = [:]
+	nonisolated(unsafe) private var fileDateCache: [String: Date?] = [:]
+	nonisolated(unsafe) private var candidateCache: [String: String] = [:]
+	nonisolated(unsafe) private var descriptionCache: [String: String?] = [:]
+	nonisolated private let cacheQueue = DispatchQueue(label: "MetadataCache.cacheQueue", attributes: .concurrent)
 
-	private let limiter: AsyncLimiter
+	nonisolated private let limiter: AsyncLimiter
 
-	init() {
+	nonisolated init() {
 		// Allow up to the scanner worker count concurrent metadata reads so
 		// the system can utilize available CPU while scanning. This moves
 		// toward "max CPU" behavior; if this overloads a slow device you
@@ -32,7 +33,26 @@ final class MetadataCache {
 			self?.imageDateCache.removeValue(forKey: key)
 			self?.fileDateCache.removeValue(forKey: key)
 			self?.candidateCache.removeValue(forKey: key)
+			self?.descriptionCache.removeValue(forKey: key)
 		}
+	}
+
+	/// Returns the embedded DESCRIPTION / person name for sorting and display.
+	func description(for url: URL) async -> String? {
+		let key = url.path
+		if let cached = cacheQueue.sync(execute: { descriptionCache[key] }) {
+			return cached
+		}
+
+		await limiter.acquire()
+		defer { Task { await limiter.release() } }
+
+		let value = await Self.readDescription(for: url)
+
+		cacheQueue.async(flags: .barrier) { [weak self] in
+			self?.descriptionCache[key] = value
+		}
+		return value
 	}
 
 	/// Returns the cached image date if available, otherwise parses the
@@ -83,9 +103,33 @@ final class MetadataCache {
 		return d
 	}
 
-	/// Returns a concatenated candidate string (filename + common embedded
-	/// metadata fields) suitable for substring/regex matching. Results are
-	/// cached in-memory to avoid repeated ImageIO property reads.
+	/// Returns a cached DESCRIPTION / person name when available.
+	func cachedDescription(for url: URL) -> String? {
+		let key = url.path
+		return cacheQueue.sync {
+			descriptionCache[key] ?? nil
+		}
+	}
+
+	/// Best-effort synchronous search text for the quick filter pass.
+	/// Uses cached filename, description, and metadata when available.
+	func cachedSearchCandidate(for url: URL) -> String {
+		let key = url.path
+		return cacheQueue.sync {
+			if let candidate = candidateCache[key] {
+				return candidate
+			}
+			var parts: [String] = [url.lastPathComponent]
+			if let description = descriptionCache[key], let description, !description.isEmpty {
+				parts.append(description)
+			}
+			return parts.joined(separator: " ")
+		}
+	}
+
+	/// Returns a concatenated candidate string (filename, DESCRIPTION / person
+	/// name, and common embedded metadata fields) suitable for substring/regex
+	/// matching. Results are cached in-memory to avoid repeated reads.
 	func candidateString(for url: URL) async -> String {
 		let key = url.path
 		if let v = cacheQueue.sync(execute: { candidateCache[key] }) { return v }
@@ -93,47 +137,7 @@ final class MetadataCache {
 		await limiter.acquire()
 		defer { Task { await limiter.release() } }
 
-		// Perform the ImageIO work off the calling thread.
-		let candidate = await Task.detached(priority: .utility) {
-			var parts: [String] = []
-			parts.append(url.lastPathComponent)
-
-			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return parts.joined(separator: " ") }
-			guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return parts.joined(separator: " ") }
-
-			func appendValue(_ value: Any) {
-				if let s = value as? String {
-					parts.append(s)
-				} else if let arr = value as? [Any] {
-					for v in arr { appendValue(v) }
-				} else if let nsarr = value as? NSArray {
-					for v in nsarr { appendValue(v) }
-				} else if let dict = value as? [CFString: Any] {
-					for (_, v) in dict { appendValue(v) }
-				} else if let dict = value as? [String: Any] {
-					for (_, v) in dict { appendValue(v) }
-				} else if let num = value as? NSNumber {
-					parts.append(num.stringValue)
-				}
-			}
-
-			func appendDict(_ key: CFString) {
-				if let dict = props[key] as? [CFString: Any] {
-					for (_, value) in dict { appendValue(value) }
-				} else if let dict2 = props[key] as? [String: Any] {
-					for (_, value) in dict2 { appendValue(value) }
-				}
-			}
-
-			appendDict(kCGImagePropertyExifDictionary)
-			appendDict(kCGImagePropertyTIFFDictionary)
-			appendDict(kCGImagePropertyIPTCDictionary)
-			if let t = props[kCGImagePropertyPNGDictionary] as? [CFString: Any], let text = t[kCGImagePropertyPNGTitle] as? String {
-				parts.append(text)
-			}
-
-			return parts.joined(separator: " ")
-		}.value
+		let candidate = await Self.buildSearchCandidate(for: url)
 
 		cacheQueue.async(flags: .barrier) { [weak self] in
 			self?.candidateCache[key] = candidate
@@ -141,7 +145,66 @@ final class MetadataCache {
 		return candidate
 	}
 
-	private static func readImageDate(url: URL) -> Date? {
+	private static func buildSearchCandidate(for url: URL) async -> String {
+		var parts: [String] = []
+		parts.append(url.lastPathComponent)
+
+		let description = await readDescription(for: url)
+		if let description, !description.isEmpty {
+			parts.append(description)
+		}
+
+		guard FileManager.default.fileExists(atPath: url.path),
+			  let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+			  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+		else {
+			return parts.joined(separator: " ")
+		}
+
+		func appendValue(_ value: Any) {
+			if let s = value as? String {
+				parts.append(s)
+			} else if let arr = value as? [Any] {
+				for v in arr { appendValue(v) }
+			} else if let nsarr = value as? NSArray {
+				for v in nsarr { appendValue(v) }
+			} else if let dict = value as? [CFString: Any] {
+				for (_, v) in dict { appendValue(v) }
+			} else if let dict = value as? [String: Any] {
+				for (_, v) in dict { appendValue(v) }
+			} else if let num = value as? NSNumber {
+				parts.append(num.stringValue)
+			}
+		}
+
+		func appendDict(_ key: CFString) {
+			if let dict = props[key] as? [CFString: Any] {
+				for (_, value) in dict { appendValue(value) }
+			} else if let dict2 = props[key] as? [String: Any] {
+				for (_, value) in dict2 { appendValue(value) }
+			}
+		}
+
+		appendDict(kCGImagePropertyExifDictionary)
+		appendDict(kCGImagePropertyTIFFDictionary)
+		appendDict(kCGImagePropertyIPTCDictionary)
+		if let t = props[kCGImagePropertyPNGDictionary] as? [CFString: Any],
+		   let text = t[kCGImagePropertyPNGTitle] as? String {
+			parts.append(text)
+		}
+
+		return parts.joined(separator: " ")
+	}
+
+	private static func readDescription(for url: URL) async -> String? {
+		if SQLiteObjectStore.isWorkingCopyURL(url),
+		   !FileManager.default.fileExists(atPath: url.path) {
+			return await SQLiteObjectStore.shared.metadataForWorkingFile(url)?.description
+		}
+		return ImageEmbeddedMetadataReader.read(from: url).description
+	}
+
+	nonisolated private static func readImageDate(url: URL) -> Date? {
 		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
 		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return nil }
 

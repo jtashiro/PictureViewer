@@ -8,13 +8,13 @@ import Foundation
 import CryptoKit
 import os
 
-private let thumbnailLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-cache")
+nonisolated private let thumbnailLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-cache")
 
 /// Two-tier (memory + disk) thumbnail cache. Disk entries survive across
 /// launches, are keyed by a hash of the source file's absolute path, and
 /// are validated against the source's modification date before use.
-final class ThumbnailCache: @unchecked Sendable {
-	static let shared = ThumbnailCache()
+nonisolated final class ThumbnailCache: @unchecked Sendable {
+	nonisolated static let shared = ThumbnailCache()
 
 	/// Thumbnails are generated at this canonical pixel size. SwiftUI scales
 	/// them to the current slider value, so we only need to cache one size
@@ -31,17 +31,17 @@ final class ThumbnailCache: @unchecked Sendable {
 		}
 	}
 
-	private let memCache = NSCache<NSString, NSImage>()
-	private var pinnedImages: [String: PinnedImage] = [:]
-	private let pinnedImagesLock = NSLock()
-	let cacheDirectory: URL
-	private let writeQueue = DispatchQueue(
+	nonisolated(unsafe) private let memCache = NSCache<NSString, NSImage>()
+	nonisolated(unsafe) private var pinnedImages: [String: PinnedImage] = [:]
+	nonisolated private let pinnedImagesLock = NSLock()
+	nonisolated let cacheDirectory: URL
+	nonisolated private let writeQueue = DispatchQueue(
 		label: "ThumbnailCache.write",
 		qos: .utility,
 		attributes: .concurrent
 	)
 
-	private init() {
+	nonisolated private init() {
 		let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
 			?? URL(fileURLWithPath: NSTemporaryDirectory())
 		cacheDirectory = caches.appendingPathComponent("PictureViewer/Thumbnails", isDirectory: true)
@@ -125,7 +125,7 @@ final class ThumbnailCache: @unchecked Sendable {
 		return Self.jpegData(from: image)
 	}
 
-	static func jpegData(from image: NSImage, compressionFactor: CGFloat = 0.85) -> Data? {
+	nonisolated static func jpegData(from image: NSImage, compressionFactor: CGFloat = 0.85) -> Data? {
 		guard
 			let tiff = image.tiffRepresentation,
 			let rep = NSBitmapImageRep(data: tiff)

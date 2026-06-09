@@ -5,6 +5,25 @@
 
 import SwiftUI
 
+struct FileNavigationCommandActions {
+	let openFolder: (URL) -> Void
+	let openSQLiteStore: (String) -> Void
+	let openPhoto: (URL) -> Void
+	let restoreSavedGallerySession: () -> Void
+	let showBookmarkManager: () -> Void
+}
+
+private struct FileNavigationCommandActionsKey: FocusedValueKey {
+	typealias Value = FileNavigationCommandActions
+}
+
+extension FocusedValues {
+	var fileNavigationActions: FileNavigationCommandActions? {
+		get { self[FileNavigationCommandActionsKey.self] }
+		set { self[FileNavigationCommandActionsKey.self] = newValue }
+	}
+}
+
 struct VaultCommandActions {
 	let newItem: () -> Void
 	let openItem: () -> Void

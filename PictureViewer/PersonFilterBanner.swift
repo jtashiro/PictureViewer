@@ -15,7 +15,7 @@ struct PersonFilterBanner: View {
 					.foregroundStyle(.tint)
 				Text("Showing photos of ")
 					.foregroundStyle(.secondary)
-				+ Text(active.personName)
+				Text(active.personName)
 					.fontWeight(.semibold)
 				Spacer()
 				Button("Clear Filter") {

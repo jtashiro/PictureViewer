@@ -21,8 +21,10 @@ struct WindowAccessor: NSViewRepresentable {
             if let win {
                 // Avoid installing multiple observers for the same view.
                 if objc_getAssociatedObject(view, &WindowAccessorObserverKey) == nil {
-                    let token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: win, queue: nil) { _ in
-                        WindowStateStore.shared.snapshotTabs(of: win)
+                    let token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: win, queue: .main) { _ in
+                        MainActor.assumeIsolated {
+                            WindowStateStore.shared.snapshotTabs(of: win)
+                        }
                     }
                     objc_setAssociatedObject(view, &WindowAccessorObserverKey, token, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
                 }

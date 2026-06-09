@@ -5,8 +5,8 @@ enum AppLogLevel: String, CaseIterable, Identifiable, Sendable {
 	case info
 	case error
 
-	static let userDefaultsKey = "logLevel"
-	static let defaultLevel: AppLogLevel = .info
+	nonisolated static let userDefaultsKey = "logLevel"
+	nonisolated static let defaultLevel: AppLogLevel = .info
 
 	var id: String { rawValue }
 
@@ -18,7 +18,7 @@ enum AppLogLevel: String, CaseIterable, Identifiable, Sendable {
 		}
 	}
 
-	var rank: Int {
+	nonisolated var rank: Int {
 		switch self {
 		case .debug: return 0
 		case .info: return 1
@@ -26,11 +26,11 @@ enum AppLogLevel: String, CaseIterable, Identifiable, Sendable {
 		}
 	}
 
-	func allows(_ level: AppLogLevel) -> Bool {
+	nonisolated func allows(_ level: AppLogLevel) -> Bool {
 		level.rank >= rank
 	}
 
-	static var current: AppLogLevel {
+	nonisolated static var current: AppLogLevel {
 		let value = UserDefaults.standard.string(forKey: userDefaultsKey) ?? defaultLevel.rawValue
 		return AppLogLevel(rawValue: value) ?? defaultLevel
 	}

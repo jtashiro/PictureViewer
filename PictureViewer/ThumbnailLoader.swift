@@ -7,10 +7,9 @@ import AppKit
 import QuickLookThumbnailing
 import os
 
-private let tlLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-loader")
+private nonisolated let tlLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-loader")
 
-// Static constant avoids the "cannot use instance member as default parameter" error.
-private let kDefaultMemoryLimitBytes: UInt64 = 5 * 1024 * 1024 * 1024  // 5 GB
+private nonisolated let kDefaultMemoryLimitBytes: UInt64 = 5 * 1024 * 1024 * 1024  // 5 GB
 
 /// Priority-queue-based thumbnail loader.  Call `enqueue(_:)` to add URLs,
 /// then `loadAllThumbnails()` to batch-generate them with bounded concurrency.
@@ -26,7 +25,15 @@ actor ThumbnailLoader {
     private var loadedImages: [URL: NSImage] = [:]
 
     init() {
-        loadPriorityQueue()
+        if let data = UserDefaults.standard.data(forKey: UserDefaults.thumbnailLoadOrderKey) {
+            do {
+                let urls = try JSONDecoder().decode([URL].self, from: data)
+                priorityQueue.append(contentsOf: urls)
+                tlLogger.log("ThumbnailLoader: restored \(urls.count) priority URLs")
+            } catch {
+                tlLogger.error("ThumbnailLoader: failed to decode priority queue: \(error)")
+            }
+        }
     }
 
     // MARK: - Public API
@@ -35,7 +42,8 @@ actor ThumbnailLoader {
         priorityQueue.append(contentsOf: urls)
     }
 
-    func loadAllThumbnails(maxMemoryBytes: UInt64 = kDefaultMemoryLimitBytes) async -> [URL: NSImage] {
+    func loadAllThumbnails(maxMemoryBytes: UInt64? = nil) async -> [URL: NSImage] {
+        let memoryLimit = maxMemoryBytes ?? memoryLimitBytes
         let start = Date()
         let total = priorityQueue.count
 
@@ -49,7 +57,7 @@ actor ThumbnailLoader {
             for (url, image) in results {
                 loadedImages[url] = image
             }
-            releaseMemoryIfNeeded(maxMemoryBytes: maxMemoryBytes)
+            releaseMemoryIfNeeded(maxMemoryBytes: memoryLimit)
         }
 
         let duration = Date().timeIntervalSince(start)
@@ -119,24 +127,14 @@ actor ThumbnailLoader {
         return result == KERN_SUCCESS ? info.resident_size : 0
     }
 
-    private func loadPriorityQueue() {
-        guard let data = UserDefaults.standard.data(forKey: UserDefaults.thumbnailLoadOrderKey) else { return }
-        do {
-            let urls = try JSONDecoder().decode([URL].self, from: data)
-            priorityQueue.append(contentsOf: urls)
-            tlLogger.log("ThumbnailLoader: restored \(urls.count) priority URLs")
-        } catch {
-            tlLogger.error("ThumbnailLoader: failed to decode priority queue: \(error)")
-        }
-    }
 }
 
 // MARK: - UserDefaults helper
 
 extension UserDefaults {
-    static let thumbnailLoadOrderKey = "thumbnailLoadOrder"
+    nonisolated static let thumbnailLoadOrderKey = "thumbnailLoadOrder"
 
-    static func saveRecentAccess(urls: [URL], maxCount: Int = 100) {
+    nonisolated static func saveRecentAccess(urls: [URL], maxCount: Int = 100) {
         let recent = Array(urls.prefix(maxCount))
         guard let data = try? JSONEncoder().encode(recent) else { return }
         UserDefaults.standard.set(data, forKey: thumbnailLoadOrderKey)

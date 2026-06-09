@@ -9,7 +9,7 @@ import Combine
 import Darwin
 import os
 
-private final class LibVLCRuntime {
+private final class LibVLCRuntime: @unchecked Sendable {
 	private static let loadLogger = Logger(subsystem: "com.example.PictureViewer", category: "vlc")
 
 	private typealias LibVLCNew = @convention(c) (Int32, UnsafeMutablePointer<UnsafePointer<CChar>?>?) -> OpaquePointer?
@@ -35,9 +35,9 @@ private final class LibVLCRuntime {
 	}()
 
 	private let logger = Logger(subsystem: "com.example.PictureViewer", category: "vlc")
-	private let handle: UnsafeMutableRawPointer
-	private let coreHandle: UnsafeMutableRawPointer?
-	private let instance: OpaquePointer
+	nonisolated(unsafe) private let handle: UnsafeMutableRawPointer
+	nonisolated(unsafe) private let coreHandle: UnsafeMutableRawPointer?
+	nonisolated(unsafe) private let instance: OpaquePointer
 	private let mediaNewPath: LibVLCMediaNewPath
 	private let mediaRelease: LibVLCMediaRelease
 	private let mediaPlayerNewFromMedia: LibVLCMediaPlayerNewFromMedia
@@ -52,7 +52,7 @@ private final class LibVLCRuntime {
 	private let mediaPlayerGetLength: LibVLCMediaPlayerGetLength
 	private let videoGetSize: LibVLCVideoGetSize
 	private let videoTakeSnapshot: LibVLCVideoTakeSnapshot
-	private let libVLCRelease: LibVLCRelease
+	nonisolated(unsafe) private let libVLCRelease: LibVLCRelease
 
 	static var isAvailable: Bool {
 		shared != nil
@@ -83,7 +83,7 @@ private final class LibVLCRuntime {
 		libVLCRelease = runtime.libVLCRelease
 	}
 
-	deinit {
+	nonisolated deinit {
 		libVLCRelease(instance)
 		dlclose(handle)
 		if let coreHandle {
@@ -377,23 +377,23 @@ private final class LibVLCRuntime {
 	}
 }
 
-private final class LibVLCPlayer {
+private final class LibVLCPlayer: @unchecked Sendable {
 	let url: URL
 	private let startedAccess: Bool
-	private let media: OpaquePointer
-	private let player: OpaquePointer
+	nonisolated(unsafe) private let media: OpaquePointer
+	nonisolated(unsafe) private let player: OpaquePointer
 	private let mediaPlayerPlay: (OpaquePointer?) -> Int32
 	private let mediaPlayerPause: (OpaquePointer?) -> Void
-	private let mediaPlayerStop: (OpaquePointer?) -> Void
+	nonisolated(unsafe) private let mediaPlayerStop: (OpaquePointer?) -> Void
 	private let mediaPlayerIsPlaying: (OpaquePointer?) -> Int32
 	private let mediaPlayerGetTime: (OpaquePointer?) -> Int64
 	private let mediaPlayerSetTime: (OpaquePointer?, Int64) -> Void
 	private let mediaPlayerGetLength: (OpaquePointer?) -> Int64
 	private let videoGetSize: (OpaquePointer?, UInt32, UnsafeMutablePointer<UInt32>?, UnsafeMutablePointer<UInt32>?) -> Int32
 	private let videoTakeSnapshot: (OpaquePointer?, UInt32, UnsafePointer<CChar>?, UInt32, UInt32) -> Int32
-	private let mediaRelease: (OpaquePointer?) -> Void
-	private let mediaPlayerRelease: (OpaquePointer?) -> Void
-	private var didStop = false
+	nonisolated(unsafe) private let mediaRelease: (OpaquePointer?) -> Void
+	nonisolated(unsafe) private let mediaPlayerRelease: (OpaquePointer?) -> Void
+	nonisolated(unsafe) private var didStop = false
 
 	init(
 		url: URL,
@@ -453,7 +453,7 @@ private final class LibVLCPlayer {
 		mediaPlayerPause(player)
 	}
 
-	func stop() {
+	nonisolated func stop() {
 		guard !didStop else { return }
 		didStop = true
 		mediaPlayerStop(player)
@@ -495,7 +495,7 @@ private final class LibVLCPlayer {
 		}
 	}
 
-	deinit {
+	nonisolated deinit {
 		stop()
 		mediaPlayerRelease(player)
 		mediaRelease(media)

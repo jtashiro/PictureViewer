@@ -27,6 +27,7 @@ struct ThumbnailView: View {
 	@State private var image: NSImage?
 	@State private var loadFailed = false
 	@State private var metadataState: MetadataState = .none
+	@State private var embeddedDescription: String?
 	@State private var embeddedKeywords: [String] = []
 	private static let defaultMetadataRefreshToken = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 	// Default to false so thumbnails load by default. Setting this to true
@@ -88,13 +89,22 @@ struct ThumbnailView: View {
 				.frame(maxWidth: size)
 				.foregroundStyle(.primary)
 
+			if let embeddedDescription, !embeddedDescription.isEmpty {
+				Text(embeddedDescription)
+					.font(.caption2)
+					.lineLimit(2)
+					.truncationMode(.tail)
+					.frame(maxWidth: size)
+					.foregroundStyle(.secondary)
+			}
+
 			if !embeddedKeywords.isEmpty {
 				Text(embeddedKeywords.joined(separator: ", "))
 					.font(.caption2)
 					.lineLimit(1)
 					.truncationMode(.tail)
 					.frame(maxWidth: size)
-					.foregroundStyle(.secondary)
+					.foregroundStyle(.tertiary)
 			}
 		}
 		.help(url.lastPathComponent)
@@ -144,7 +154,7 @@ struct ThumbnailView: View {
 		// 1) Try the persistent cache off the main thread.
 		let ns = namespace
 		let cacheLookup = Task.detached(priority: .userInitiated) {
-			await ThumbnailCache.shared.image(for: target, namespace: ns)
+			ThumbnailCache.shared.image(for: target, namespace: ns)
 		}
 		if let cached = await cacheLookup.value {
 			if Task.isCancelled { return }
@@ -188,6 +198,7 @@ struct ThumbnailView: View {
 				let thumbnailSource: URL
 				if SQLiteObjectStore.isWorkingCopyURL(target),
 				   !FileManager.default.fileExists(atPath: target.path) {
+					_ = AppWorkingDirectory.ensureAccess()
 					guard forceLoad else {
 						return
 					}
@@ -197,7 +208,7 @@ struct ThumbnailView: View {
 				}
 				let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: thumbnailSource)
 				// Store to cache (mem+disk) off the main actor.
-				await ThumbnailCache.shared.store(nsImage, for: target, namespace: namespace)
+				ThumbnailCache.shared.store(nsImage, for: target, namespace: namespace)
 				if SQLiteObjectStore.isWorkingCopyURL(target),
 				   let thumbnailData = await MainActor.run(body: { ThumbnailCache.jpegData(from: nsImage) }) {
 					try? await SQLiteObjectStore.shared.storeThumbnailData(thumbnailData, forWorkingFile: target)
@@ -224,36 +235,36 @@ struct ThumbnailView: View {
 	}
 
 	private func updateMetadataState() async {
-		var foundEmbedded = false
-		var kws: [String] = []
-		if let src = CGImageSourceCreateWithURL(url as CFURL, nil), let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
-			// IPTC keywords
-			if let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any] {
-				if let arr = iptc[kCGImagePropertyIPTCKeywords] as? [Any] {
-					for v in arr {
-						if let s = v as? String, !s.isEmpty { kws.append(s) }
-					}
-				}
+		if SQLiteObjectStore.isWorkingCopyURL(url),
+		   !FileManager.default.fileExists(atPath: url.path),
+		   let stored = await SQLiteObjectStore.shared.metadataForWorkingFile(url) {
+			await MainActor.run {
+				embeddedDescription = stored.description
+				embeddedKeywords = stored.keywords
+				metadataState = stored.description != nil || !stored.keywords.isEmpty ? .embedded : .none
 			}
-
-			// EXIF user comment (treat as a keyword-like freeform string)
-			if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any], let user = exif[kCGImagePropertyExifUserComment] as? String, !user.isEmpty {
-				foundEmbedded = true
-				kws.append(user)
-			}
-
-			// TIFF image description
-			if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any], let desc = tiff[kCGImagePropertyTIFFImageDescription] as? String, !desc.isEmpty {
-				foundEmbedded = true
-				kws.append(desc)
-			}
-
-			if !kws.isEmpty { foundEmbedded = true }
+			return
 		}
 
+		ensureMetadataAccess(for: url)
+		let target = url
+		let metadata = await Task.detached(priority: .utility) {
+			ImageEmbeddedMetadataReader.read(from: target)
+		}.value
+
 		await MainActor.run {
-			metadataState = foundEmbedded ? .embedded : .none
-			embeddedKeywords = kws
+			embeddedDescription = metadata.description
+			embeddedKeywords = metadata.keywords
+			metadataState = metadata.hasEmbeddedMetadata ? .embedded : .none
+		}
+	}
+
+	private func ensureMetadataAccess(for url: URL) {
+		_ = SecurityScopedResourceAccess.ensureAccess(for: url)
+		let workingBase = AppWorkingDirectory.baseURL.standardizedFileURL.path
+		let candidatePath = url.standardizedFileURL.path
+		if candidatePath == workingBase || candidatePath.hasPrefix(workingBase + "/") {
+			_ = AppWorkingDirectory.ensureAccess()
 		}
 	}
 }

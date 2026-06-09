@@ -40,7 +40,7 @@ struct PictureViewerApp: App {
 			// Refresh the persistent thumbnail cache in the background — drop
 			// entries we haven't used recently so the cache stays bounded.
 			Task.detached(priority: .background) {
-				await ThumbnailCache.shared.sweepStale()
+				ThumbnailCache.shared.sweepStale()
 			}
 		}
 
@@ -54,35 +54,43 @@ struct PictureViewerApp: App {
 		// is more reliable than depending solely on view lifecycle hooks
 		// (onAppear/onDisappear) which may not be invoked for background
 		// tabs.
-		NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
-			let save = UserDefaults.standard.bool(forKey: "saveOpenWindows")
-			let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
-			WindowStateStore.shared.markAppTerminating()
-			PhotoVault.clearWorkingCopiesOnDisk()
-			SQLiteObjectStore.clearWorkingCopiesOnDisk()
-			// Log only restorable windows/tabs. NSApplication.shared.windows
-			// includes utility and system windows, so counting all windows
-			// overstates the user-visible gallery/photo session.
-			var photoWindowEntries: [String] = []
-			for w in NSApplication.shared.windows {
-				guard let representedURL = w.representedURL else { continue }
-				let title = w.title.isEmpty ? "<untitled>" : w.title
-				photoWindowEntries.append("\(title):\(representedURL.path)")
+		NotificationCenter.default.addObserver(
+			forName: NSApplication.willTerminateNotification,
+			object: nil,
+			queue: .main
+		) { _ in
+			MainActor.assumeIsolated {
+				Self.snapshotSessionOnTermination()
 			}
-			let galleryTabCount = WindowStateStore.shared.openGallerySessionItems().count
-			if save {
-				logger.log("App will terminate; snapshotting restorable session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
-				if AppLogLevel.current.allows(.debug) {
-					logger.debug("App will terminate; open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
-				}
-				WindowStateStore.shared.snapshotOpenPhotosFromSystem()
-			} else {
-				logger.log("App will terminate; saveOpenWindows disabled; clearing saved session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
-				if AppLogLevel.current.allows(.debug) {
-					logger.debug("App will terminate; skipped open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
-				}
-				WindowStateStore.shared.clearOpenPhotos()
+		}
+	}
+
+	@MainActor
+	private static func snapshotSessionOnTermination() {
+		let save = UserDefaults.standard.bool(forKey: "saveOpenWindows")
+		let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
+		WindowStateStore.shared.markAppTerminating()
+		PhotoVault.clearWorkingCopiesOnDisk()
+		SQLiteObjectStore.clearWorkingCopiesOnDisk()
+		var photoWindowEntries: [String] = []
+		for w in NSApplication.shared.windows {
+			guard let representedURL = w.representedURL else { continue }
+			let title = w.title.isEmpty ? "<untitled>" : w.title
+			photoWindowEntries.append("\(title):\(representedURL.path)")
+		}
+		let galleryTabCount = WindowStateStore.shared.openGallerySessionItems().count
+		if save {
+			logger.log("App will terminate; snapshotting restorable session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
+			if AppLogLevel.current.allows(.debug) {
+				logger.debug("App will terminate; open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
 			}
+			WindowStateStore.shared.snapshotOpenPhotosFromSystem()
+		} else {
+			logger.log("App will terminate; saveOpenWindows disabled; clearing saved session; galleryTabCount=\(galleryTabCount, privacy: .public) photoWindowCount=\(photoWindowEntries.count, privacy: .public)")
+			if AppLogLevel.current.allows(.debug) {
+				logger.debug("App will terminate; skipped open photo window details=\(photoWindowEntries.joined(separator: ","), privacy: .public)")
+			}
+			WindowStateStore.shared.clearOpenPhotos()
 		}
 	}
 
@@ -311,7 +319,10 @@ struct WindowMergeCommands: Commands {
 }
 
 struct VaultFileCommands: Commands {
+	@ObservedObject private var fileNavigation = FileNavigationMenuState.shared
 	@FocusedValue(\.vaultCommandActions) private var vaultActions
+	@FocusedValue(\.fileNavigationActions) private var fileNavigationActions
+	@Environment(\.openWindow) private var openWindow
 
 	var body: some Commands {
 		CommandGroup(after: .newItem) {
@@ -324,6 +335,54 @@ struct VaultFileCommands: Commands {
 				vaultActions?.openItem()
 			}
 			.disabled(vaultActions == nil)
+
+			Menu("Open Recent") {
+				if fileNavigation.recentFolders.isEmpty {
+					Text("No Recent Folders")
+				} else {
+					ForEach(fileNavigation.recentFolders) { entry in
+						Button(entry.title) {
+							openFolderEntry(entry)
+						}
+					}
+				}
+			}
+
+			Menu("Bookmarks") {
+				if fileNavigation.bookmarks.isEmpty {
+					Text("No Bookmarks")
+				} else {
+					ForEach(fileNavigation.bookmarks) { entry in
+						Button(entry.title) {
+							openFolderEntry(entry)
+						}
+					}
+					Divider()
+				}
+				Button("Manage Bookmarks…") {
+					fileNavigationActions?.showBookmarkManager()
+				}
+				.disabled(fileNavigationActions == nil)
+			}
+
+			Menu("Open Session") {
+				if fileNavigation.sessionEntries.isEmpty {
+					Text("No Saved Session")
+				} else {
+					ForEach(fileNavigation.sessionEntries) { entry in
+						Button(entry.title) {
+							openSessionEntry(entry)
+						}
+					}
+					Divider()
+					Button("Restore Gallery Session") {
+						fileNavigationActions?.restoreSavedGallerySession()
+					}
+					.disabled(fileNavigationActions == nil)
+				}
+			}
+
+			Divider()
 
 			Button("Close") {
 				vaultActions?.closeVault()
@@ -402,6 +461,39 @@ struct VaultFileCommands: Commands {
 			}
 			.keyboardShortcut("a", modifiers: .command)
 			.disabled(vaultActions?.canSelectAll != true)
+		}
+	}
+
+	private func openFolderEntry(_ entry: FileNavigationMenuState.FolderEntry) {
+		if let actions = fileNavigationActions {
+			actions.openFolder(entry.url)
+		} else {
+			_ = entry.url.startAccessingSecurityScopedResource()
+			openWindow(id: "folder", value: entry.url)
+		}
+	}
+
+	private func openSessionEntry(_ entry: FileNavigationMenuState.SessionEntry) {
+		switch entry {
+		case .galleryFolder(let url):
+			if let actions = fileNavigationActions {
+				actions.openFolder(url)
+			} else {
+				_ = url.startAccessingSecurityScopedResource()
+				openWindow(id: "folder", value: url)
+			}
+		case .gallerySQLite(let storeName):
+			if let actions = fileNavigationActions {
+				actions.openSQLiteStore(storeName)
+			} else {
+				openWindow(id: "sqlite-store", value: storeName)
+			}
+		case .photo(let url):
+			if let actions = fileNavigationActions {
+				actions.openPhoto(url)
+			} else {
+				openWindow(id: "photo-viewer", value: url)
+			}
 		}
 	}
 }

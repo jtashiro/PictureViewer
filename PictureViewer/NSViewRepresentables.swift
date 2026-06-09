@@ -88,13 +88,13 @@ struct SelectAllKeyboardShortcutView: NSViewRepresentable {
 
 	}
 
-	final class Coordinator {
+	final class Coordinator: @unchecked Sendable {
 		weak var view: NSView?
 		var isEnabled = false
 		var action: (() -> Void)?
-		var monitor: Any?
+		nonisolated(unsafe) var monitor: Any?
 
-		deinit {
+		nonisolated deinit {
 			if let monitor {
 				NSEvent.removeMonitor(monitor)
 			}
@@ -178,13 +178,13 @@ struct GridArrowKeyboardShortcutView: NSViewRepresentable {
 		}
 	}
 
-	final class Coordinator {
+	final class Coordinator: @unchecked Sendable {
 		weak var view: NSView?
 		var isEnabled = false
 		var action: ((GridNavigationDirection) -> Void)?
-		var monitor: Any?
+		nonisolated(unsafe) var monitor: Any?
 
-		deinit {
+		nonisolated deinit {
 			if let monitor {
 				NSEvent.removeMonitor(monitor)
 			}

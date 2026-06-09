@@ -138,6 +138,7 @@ final class WindowStateStore: @unchecked Sendable {
 		if !paths.contains(path) {
 			paths.append(path)
 			UserDefaults.standard.set(paths, forKey: openWindowsKey)
+			NotificationCenter.default.post(name: .fileNavigationMenuShouldReload, object: nil)
 		}
 	}
 
@@ -146,6 +147,7 @@ final class WindowStateStore: @unchecked Sendable {
 		var paths = currentPaths()
 		paths.removeAll { $0 == url.path }
 		UserDefaults.standard.set(paths, forKey: openWindowsKey)
+		NotificationCenter.default.post(name: .fileNavigationMenuShouldReload, object: nil)
 	}
 
 	func openPhotoURLs() -> [URL] {
@@ -283,6 +285,7 @@ final class WindowStateStore: @unchecked Sendable {
 			windowStateLogger.log("snapshotOpenPhotosFromSystem found no represented photo windows")
 		}
 		UserDefaults.standard.set(paths, forKey: openWindowsKey)
+		NotificationCenter.default.post(name: .fileNavigationMenuShouldReload, object: nil)
 	}
 
 	/// Snapshot the tabs belonging to a single window (the window being
@@ -314,6 +317,7 @@ final class WindowStateStore: @unchecked Sendable {
 			}
 		}
 		UserDefaults.standard.set(paths, forKey: openWindowsKey)
+		NotificationCenter.default.post(name: .fileNavigationMenuShouldReload, object: nil)
 	}
 
 	// MARK: - Per-folder tab name persistence

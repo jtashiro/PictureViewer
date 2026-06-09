@@ -63,6 +63,13 @@ enum AppWorkingDirectory {
         UserDefaults.standard.removeObject(forKey: directoryBookmarkKey)
     }
 
+    /// Ensures security-scoped access to the configured working directory,
+    /// including user-chosen folders on external volumes.
+    @discardableResult
+    nonisolated static func ensureAccess() -> Bool {
+        SecurityScopedResourceAccess.ensureAccess(for: baseURL)
+    }
+
     nonisolated static func sqliteObjectStoreURL() -> URL {
         baseURL.appendingPathComponent("SQLiteObjectStore", isDirectory: true)
     }

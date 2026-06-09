@@ -13,18 +13,18 @@ import os
 /// FaceProcessor: detects faces in scanned image files, writes cropped
 /// face thumbnails to Application Support, stores a small JSON index, and
 /// provides clustering and person-management APIs.
-final class FaceProcessor {
+final class FaceProcessor: @unchecked Sendable {
 	nonisolated static let shared = FaceProcessor()
 	nonisolated private static let logger = Logger(subsystem: "com.example.PictureViewer", category: "face")
 
 	// Face processing work is performed on detached tasks; database
 	// access is managed by an actor to avoid data races.
-	private let fm = FileManager.default
+	nonisolated(unsafe) private let fm = FileManager.default
 	private let limiter: AsyncLimiter
 	private let baseURL: URL?
 	private let dbActor: FaceDatabaseActor
 
-	private init() {
+	nonisolated private init() {
 		let cap = max(1, PhotoLibrary.workerCount)
 		self.limiter = AsyncLimiter(capacity: cap)
 
@@ -62,7 +62,7 @@ final class FaceProcessor {
 			let handler = VNImageRequestHandler(cgImage: cg, options: [:])
 			let detect = VNDetectFaceRectanglesRequest()
 			do { try handler.perform([detect]) } catch { return [] }
-			guard let faces = detect.results as? [VNFaceObservation], !faces.isEmpty else { return [] }
+			guard let faces = detect.results, !faces.isEmpty else { return [] }
 
 			var localCreated: [FaceEntry] = []
 			for face in faces {
@@ -94,12 +94,12 @@ final class FaceProcessor {
 
 	// MARK: - Image helpers
 
-	private func loadCGImage(url: URL) -> CGImage? {
+	nonisolated private func loadCGImage(url: URL) -> CGImage? {
 		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
 		return CGImageSourceCreateImageAtIndex(src, 0, nil)
 	}
 
-	private func cropFace(cgImage: CGImage, boundingBox: CGRect) -> CGImage? {
+	nonisolated private func cropFace(cgImage: CGImage, boundingBox: CGRect) -> CGImage? {
 		let w = CGFloat(cgImage.width)
 		let h = CGFloat(cgImage.height)
 		let x = boundingBox.origin.x * w
@@ -109,7 +109,7 @@ final class FaceProcessor {
 		return cgImage.cropping(to: rect)
 	}
 
-	private func writeJPEG(cgImage: CGImage, to url: URL, quality: CGFloat) -> Bool {
+	nonisolated private func writeJPEG(cgImage: CGImage, to url: URL, quality: CGFloat) -> Bool {
 		guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else { return false }
 		let props = [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
 		CGImageDestinationAddImage(dest, cgImage, props)
@@ -322,26 +322,26 @@ struct PersonAssignmentResult: Sendable {
 
 // MARK: - Persistence types
 
-struct FaceDatabase: Codable {
+nonisolated struct FaceDatabase: Codable, Sendable {
 	var records: [String: [FaceEntry]] = [:]
 	var persons: [String: [String]] = [:]
 	var personNames: [String: String] = [:]
 
-	static func load(from base: URL?) -> FaceDatabase {
+	nonisolated static func load(from base: URL?) -> FaceDatabase {
 		guard let base = base else { return FaceDatabase() }
 		let file = base.appendingPathComponent("face-db.json")
 		guard let data = try? Data(contentsOf: file) else { return FaceDatabase() }
 		return (try? JSONDecoder().decode(FaceDatabase.self, from: data)) ?? FaceDatabase()
 	}
 
-	func save(to base: URL?) {
+	nonisolated func save(to base: URL?) {
 		guard let base = base else { return }
 		let file = base.appendingPathComponent("face-db.json")
 		if let data = try? JSONEncoder().encode(self) { try? data.write(to: file, options: .atomic) }
 	}
 }
 
-struct FaceEntry: Codable {
+nonisolated struct FaceEntry: Codable, Sendable {
 	let id: UUID
 	let sourcePath: String
 	let bbox: Rect
@@ -351,13 +351,13 @@ struct FaceEntry: Codable {
 	/// face detection (zero-area bounding box). Synthetic entries exist so
 	/// photos the user explicitly tagged are preserved even when Vision
 	/// cannot detect a face in them.
-	var isSynthetic: Bool { bbox.w == 0 && bbox.h == 0 }
+	nonisolated var isSynthetic: Bool { bbox.w == 0 && bbox.h == 0 }
 }
 
-struct Rect: Codable {
+nonisolated struct Rect: Codable, Sendable {
 	var x: CGFloat
 	var y: CGFloat
 	var w: CGFloat
 	var h: CGFloat
-	init(normalized: CGRect) { self.x = normalized.origin.x; self.y = normalized.origin.y; self.w = normalized.size.width; self.h = normalized.size.height }
+	nonisolated init(normalized: CGRect) { self.x = normalized.origin.x; self.y = normalized.origin.y; self.w = normalized.size.width; self.h = normalized.size.height }
 }

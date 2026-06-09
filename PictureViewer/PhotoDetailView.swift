@@ -11,6 +11,36 @@ import ImageIO
 import os
 import UniformTypeIdentifiers
 
+private enum PhotoEditPaths {
+	nonisolated static func nextEditedURL(for sourceURL: URL) -> URL {
+		let directoryURL = sourceURL.deletingLastPathComponent()
+		let fileExt = sourceURL.pathExtension
+		let baseName = sourceURL.deletingPathExtension().lastPathComponent
+		let rootName = baseName.replacingOccurrences(of: #"-edit-\d+$"#, with: "", options: .regularExpression)
+
+		let escapedRoot = NSRegularExpression.escapedPattern(for: rootName)
+		let versionRegex = try? NSRegularExpression(pattern: "^\(escapedRoot)-edit-(\\d+)$")
+
+		var maxVersion = 0
+		if let files = try? FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil) {
+			for file in files {
+				if !fileExt.isEmpty && file.pathExtension.lowercased() != fileExt.lowercased() { continue }
+				let stem = file.deletingPathExtension().lastPathComponent
+				guard let regex = versionRegex else { continue }
+				let range = NSRange(stem.startIndex..<stem.endIndex, in: stem)
+				guard let match = regex.firstMatch(in: stem, options: [], range: range), match.numberOfRanges == 2,
+					  let verRange = Range(match.range(at: 1), in: stem),
+					  let version = Int(stem[verRange]) else { continue }
+				maxVersion = max(maxVersion, version)
+			}
+		}
+
+		return directoryURL
+			.appendingPathComponent("\(rootName)-edit-\(maxVersion + 1)")
+			.appendingPathExtension(fileExt)
+	}
+}
+
 @MainActor
 final class PhotoNavigationContext {
 	static let shared = PhotoNavigationContext()
@@ -485,31 +515,7 @@ struct FullScreenPhotoView: View {
 	}
 
 	private func nextEditedURL(for sourceURL: URL) -> URL {
-		let directoryURL = sourceURL.deletingLastPathComponent()
-		let fileExt = sourceURL.pathExtension
-		let baseName = sourceURL.deletingPathExtension().lastPathComponent
-		let rootName = baseName.replacingOccurrences(of: #"-edit-\d+$"#, with: "", options: .regularExpression)
-
-		let escapedRoot = NSRegularExpression.escapedPattern(for: rootName)
-		let versionRegex = try? NSRegularExpression(pattern: "^\(escapedRoot)-edit-(\\d+)$")
-
-		var maxVersion = 0
-		if let files = try? FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil) {
-			for file in files {
-				if !fileExt.isEmpty && file.pathExtension.lowercased() != fileExt.lowercased() { continue }
-				let stem = file.deletingPathExtension().lastPathComponent
-				guard let regex = versionRegex else { continue }
-				let range = NSRange(stem.startIndex..<stem.endIndex, in: stem)
-				guard let match = regex.firstMatch(in: stem, options: [], range: range), match.numberOfRanges == 2,
-					  let verRange = Range(match.range(at: 1), in: stem),
-					  let version = Int(stem[verRange]) else { continue }
-				maxVersion = max(maxVersion, version)
-			}
-		}
-
-		return directoryURL
-			.appendingPathComponent("\(rootName)-edit-\(maxVersion + 1)")
-			.appendingPathExtension(fileExt)
+		PhotoEditPaths.nextEditedURL(for: sourceURL)
 	}
 
 	private func updateWindowMetadata(previousURL: URL, newURL: URL) {
@@ -620,7 +626,7 @@ struct FullScreenPhotoView: View {
 			// Ensure we have security-scoped access for the folder containing the file
 			_ = await ContentView.ensureSecurityScopedAccess(for: sourceURL)
 
-			let destinationURL = nextEditedURL(for: sourceURL)
+			let destinationURL = PhotoEditPaths.nextEditedURL(for: sourceURL)
 			guard let dest = CGImageDestinationCreateWithURL(destinationURL as CFURL, type, 1, nil) else {
 				let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 				logger.error("photo-detail: cannot create CGImageDestination for destinationURL=\(destinationURL.path, privacy: .public) type=\(String(describing: type), privacy: .public)")

@@ -5,7 +5,7 @@ import QuickLookThumbnailing
 import os
 import UniformTypeIdentifiers
 
-private let qlLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-generator")
+private nonisolated let qlLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-generator")
 
 /// Async limiter that allows up to `capacity` concurrent holders.
 actor AsyncLimiter {
@@ -92,7 +92,7 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		} catch {
 			guard Self.isVideo(url) else { throw error }
 			do {
-				let fallback = try Self.generateVideoFrameThumbnail(for: url)
+				let fallback = try await Self.generateVideoFrameThumbnail(for: url)
 				Task { await Telemetry.shared.recordThumbnail() }
 				return fallback
 			} catch {
@@ -117,16 +117,24 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		return PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
 	}
 
-	private static func generateVideoFrameThumbnail(for url: URL) throws -> NSImage {
+	private static func generateVideoFrameThumbnail(for url: URL) async throws -> NSImage {
 		let asset = AVURLAsset(url: url)
 		let generator = AVAssetImageGenerator(asset: asset)
 		generator.appliesPreferredTrackTransform = true
 		generator.maximumSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
-		let duration = asset.duration
+		let duration = try await asset.load(.duration)
 		let durationSeconds = duration.seconds.isFinite ? duration.seconds : 0
 		let requestedSeconds = durationSeconds > 31 ? 30 : max(0.1, durationSeconds * 0.5)
 		let time = CMTime(seconds: requestedSeconds, preferredTimescale: 600)
-		let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+		let cgImage = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CGImage, Error>) in
+			generator.generateCGImageAsynchronously(for: time) { image, _, error in
+				if let image {
+					continuation.resume(returning: image)
+				} else {
+					continuation.resume(throwing: error ?? NSError(domain: "ThumbnailGenerator", code: 1))
+				}
+			}
+		}
 		if AppLogLevel.current.allows(.debug) {
 			qlLogger.debug("generateThumbnail: generated video frame thumbnail url=\(url.path, privacy: .public) requestedSeconds=\(requestedSeconds, privacy: .public)")
 		}
