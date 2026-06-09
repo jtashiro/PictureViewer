@@ -375,6 +375,13 @@ struct VaultFileCommands: Commands {
 			}
 			.disabled(vaultActions?.canSyncSelectedToSQLiteStore != true)
 
+			Divider()
+
+			Button("Recognize Displayed Images with Ollama") {
+				vaultActions?.recognizeDisplayed()
+			}
+			.disabled(vaultActions?.canRecognize != true)
+
 		}
 
 		CommandGroup(replacing: .pasteboard) {

@@ -24,6 +24,7 @@ struct VaultCommandActions {
 	let copy: () -> Void
 	let paste: () -> Void
 	let selectAll: () -> Void
+	let recognizeDisplayed: () -> Void
 	let canCloseVault: Bool
 	let canRenameVault: Bool
 	let canImportSelected: Bool
@@ -35,6 +36,7 @@ struct VaultCommandActions {
 	let canCopy: Bool
 	let canPaste: Bool
 	let canSelectAll: Bool
+	let canRecognize: Bool
 }
 
 private struct VaultCommandActionsKey: FocusedValueKey {

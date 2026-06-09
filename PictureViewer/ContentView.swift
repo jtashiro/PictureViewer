@@ -715,6 +715,9 @@ struct ContentView: View {
 	@State private var vaultAlertMessage: String = ""
 	@State private var vaultStatus = PhotoVaultStatus(isConfigured: false, hasLocation: false, hasPassword: false, isUnlocked: false, locationPath: nil)
 	@State private var isShowingVaultUnlockPrompt: Bool = false
+	@State private var isShowingOllamaPromptSheet: Bool = false
+	@AppStorage("ollamaLastPrompt") private var ollamaPrompt: String = OllamaRecognizer.defaultPrompt
+	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
 	@State private var vaultUnlockPassword: String = ""
 	@State private var vaultUnlockConfirmation: String = ""
 	@State private var vaultUnlockMessage: String?
@@ -841,6 +844,7 @@ struct ContentView: View {
 				copy: { copySelectedFiles() },
 				paste: { pasteFilesToVault() },
 				selectAll: { selectAllDisplayedPhotos() },
+				recognizeDisplayed: { recognizeDisplayedImagesWithOllama() },
 				canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
 				canRenameVault: isActiveVaultView && library.folderURL != nil,
 				canImportSelected: hasSelectedPhotos,
@@ -851,7 +855,8 @@ struct ContentView: View {
 				canOpenSQLiteStore: true,
 				canCopy: hasSelectedPhotos,
 				canPaste: canPasteFilesToVault,
-				canSelectAll: !displayedPhotos.isEmpty
+				canSelectAll: !displayedPhotos.isEmpty,
+				canRecognize: !displayedPhotos.isEmpty
 			))
 		}
 		.frame(minWidth: 760, minHeight: 540)
@@ -1312,6 +1317,18 @@ struct ContentView: View {
 			Button("OK", role: .cancel) {}
 		} message: {
 			Text(vaultAlertMessage)
+		}
+		.sheet(isPresented: $isShowingOllamaPromptSheet) {
+			OllamaPromptSheet(
+				imageCount: ollamaRecognitionURLs().count,
+				modelName: ollamaSelectedModel,
+				prompt: $ollamaPrompt,
+				onCancel: { isShowingOllamaPromptSheet = false },
+				onRun: {
+					isShowingOllamaPromptSheet = false
+					runOllamaRecognition()
+				}
+			)
 		}
 		.sheet(isPresented: $isShowingVaultUnlockPrompt, onDismiss: clearVaultUnlockPrompt) {
 			VaultUnlockPromptView(
@@ -2271,6 +2288,30 @@ struct ContentView: View {
 		selectedItems.removeAll()
 		deselectedItemsFromAll.removeAll()
 		isAllDisplayedSelectionActive = true
+	}
+
+	private func recognizeDisplayedImagesWithOllama() {
+		guard !ollamaRecognitionURLs().isEmpty else { return }
+		isShowingOllamaPromptSheet = true
+	}
+
+	private func ollamaRecognitionURLs() -> [URL] {
+		displayedPhotos
+			.map(\.url)
+			.filter { url in
+				let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+				return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
+			}
+	}
+
+	private func runOllamaRecognition() {
+		let urls = ollamaRecognitionURLs()
+		guard !urls.isEmpty else { return }
+		let prompt = ollamaPrompt
+		let model = ollamaSelectedModel
+		Task.detached(priority: .utility) {
+			_ = await OllamaRecognizer.shared.recognizeAndLog(imageURLs: urls, prompt: prompt, model: model)
+		}
 	}
 
 	private func applyPersonAssignmentToSelection() {

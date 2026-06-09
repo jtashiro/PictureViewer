@@ -41,7 +41,11 @@ struct SettingsView: View {
 	@AppStorage("deferAtLaunchBackgroundWork") private var deferAtLaunchBackgroundWork: Bool = true
 	@AppStorage(AppLogLevel.userDefaultsKey) private var logLevelRaw: String = AppLogLevel.defaultLevel.rawValue
 	@AppStorage(AppWorkingDirectory.directoryPathKey) private var appWorkingDirectoryPath: String = ""
+	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
 	@State private var workingDirectoryMessage: String?
+	@State private var ollamaModels: [String] = []
+	@State private var ollamaLoading: Bool = false
+	@State private var ollamaStatus: String = "Click Reload to query Ollama for vision-capable models."
 
 	var body: some View {
 		TabView {
@@ -51,6 +55,8 @@ struct SettingsView: View {
 				.tabItem { Label("Performance", systemImage: "cpu") }
 			storageTab
 				.tabItem { Label("Storage", systemImage: "externaldrive") }
+			ollamaTab
+				.tabItem { Label("Ollama", systemImage: "eye") }
 		}
 		.frame(width: 620, height: 520)
 	}
@@ -170,6 +176,75 @@ struct SettingsView: View {
 			}
 		}
 		.formStyle(.grouped)
+	}
+
+	private var ollamaTab: some View {
+		Form {
+			Section {
+				HStack {
+					Picker("Vision model", selection: $ollamaSelectedModel) {
+						if !ollamaModels.contains(ollamaSelectedModel) {
+							Text(ollamaSelectedModel.isEmpty ? "(none)" : "\(ollamaSelectedModel) (not loaded)")
+								.tag(ollamaSelectedModel)
+						}
+						ForEach(ollamaModels, id: \.self) { name in
+							Text(name).tag(name)
+						}
+					}
+					.disabled(ollamaLoading)
+
+					Button {
+						Task { await reloadOllamaModels() }
+					} label: {
+						if ollamaLoading {
+							ProgressView().controlSize(.small)
+						} else {
+							Image(systemName: "arrow.clockwise")
+						}
+					}
+					.disabled(ollamaLoading)
+					.help("Query Ollama at localhost:11434 for installed vision models")
+				}
+
+				Text(ollamaStatus)
+					.font(.caption)
+					.foregroundStyle(.secondary)
+					.fixedSize(horizontal: false, vertical: true)
+			} header: {
+				Text("Image Recognition")
+			} footer: {
+				Text("Picture Viewer queries http://localhost:11434/api/tags then uses /api/show to filter to models whose capabilities include \"vision\". Falls back to known vision-model name prefixes when Ollama doesn't return a capabilities field.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+			}
+		}
+		.formStyle(.grouped)
+		.task {
+			if ollamaModels.isEmpty {
+				await reloadOllamaModels()
+			}
+		}
+	}
+
+	@MainActor
+	private func reloadOllamaModels() async {
+		ollamaLoading = true
+		ollamaStatus = "Querying Ollama…"
+		do {
+			let models = try await OllamaRecognizer.shared.availableVisionModels()
+			ollamaModels = models
+			if models.isEmpty {
+				ollamaStatus = "Ollama responded, but no vision-capable models are installed. Run `ollama pull llava` (or another vision model) in Terminal."
+			} else {
+				ollamaStatus = "Found \(models.count) vision-capable model\(models.count == 1 ? "" : "s")."
+				if !models.contains(ollamaSelectedModel), let first = models.first {
+					ollamaSelectedModel = first
+				}
+			}
+		} catch {
+			ollamaStatus = "Could not reach Ollama: \(error.localizedDescription). Make sure `ollama serve` is running and that Outgoing Connections (Client) is enabled in the App Sandbox capabilities."
+		}
+		ollamaLoading = false
 	}
 
 	private var currentWorkingDirectoryDisplayPath: String {
