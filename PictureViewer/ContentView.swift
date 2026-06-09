@@ -630,6 +630,7 @@ struct ContentView: View {
 	@State private var isTeachingPersonRecognition: Bool = false
 	@State private var teachPersonRecognitionName: String = ""
 	@State private var isPersonRecognitionWorking: Bool = false
+	@State private var personRecognitionTask: Task<Void, Never>? = nil
 	@State private var personRecognitionProgressMessage: String = ""
 	@State private var personRecognitionProgressCompleted: Int = 0
 	@State private var personRecognitionProgressTotal: Int = 0
@@ -1136,7 +1137,6 @@ struct ContentView: View {
 						Button("Clear Keywords") {
 							applyKeywordEdit(.clear)
 						}
-						.disabled(keywordEditTargets.isEmpty)
 						Button("Append") {
 							applyKeywordEdit(.append)
 						}
@@ -1318,6 +1318,11 @@ struct ContentView: View {
 					ProgressView()
 						.controlSize(.large)
 				}
+				Button("Cancel", role: .cancel) {
+					personRecognitionProgressMessage = "Cancelling..."
+					personRecognitionTask?.cancel()
+				}
+				.disabled(personRecognitionTask == nil || personRecognitionTask?.isCancelled == true)
 			}
 			.padding()
 			.frame(minWidth: 360, minHeight: 140)
@@ -2462,7 +2467,8 @@ struct ContentView: View {
 		personRecognitionProgressCompleted = 0
 		personRecognitionProgressTotal = urls.count
 		let model = ollamaSelectedModel
-		Task.detached(priority: .utility) {
+		personRecognitionTask?.cancel()
+		let task = Task.detached(priority: .utility) {
 			let training = await PersonRecognitionStore.shared.train(name: name, imageURLs: urls, model: model) { completed, total, status in
 				Task { @MainActor in
 					personRecognitionProgressCompleted = completed
@@ -2470,9 +2476,19 @@ struct ContentView: View {
 					personRecognitionProgressMessage = status
 				}
 			}
+			if Task.isCancelled {
+				await MainActor.run {
+					isPersonRecognitionWorking = false
+					personRecognitionTask = nil
+					personRecognitionResultMessage = "Person recognition training was cancelled."
+					showPersonRecognitionResult = true
+				}
+				return
+			}
 			let assignment = await FaceProcessor.shared.assignPerson(named: name, toFiles: urls)
 			await MainActor.run {
 				isPersonRecognitionWorking = false
+				personRecognitionTask = nil
 				if training.examplesAdded > 0 {
 					personRecognitionResultMessage = "Added \(training.examplesAdded) training example\(training.examplesAdded == 1 ? "" : "s") for \(name). \(assignment.photosWithFaces) photo\(assignment.photosWithFaces == 1 ? "" : "s") were also assigned in People."
 				} else {
@@ -2481,6 +2497,7 @@ struct ContentView: View {
 				showPersonRecognitionResult = true
 			}
 		}
+		personRecognitionTask = task
 	}
 
 	private func recognizePeopleWithOllama() {
@@ -2492,11 +2509,13 @@ struct ContentView: View {
 		personRecognitionProgressCompleted = 0
 		personRecognitionProgressTotal = urls.count
 
-		Task.detached(priority: .utility) {
+		personRecognitionTask?.cancel()
+		let task = Task.detached(priority: .utility) {
 			let profileCount = await PersonRecognitionStore.shared.profileCount()
 			guard profileCount > 0 else {
 				await MainActor.run {
 					isPersonRecognitionWorking = false
+					personRecognitionTask = nil
 					personRecognitionResultMessage = "Teach at least one person before running recognition."
 					showPersonRecognitionResult = true
 				}
@@ -2509,23 +2528,38 @@ struct ContentView: View {
 					personRecognitionProgressTotal = total
 					personRecognitionProgressMessage = status
 				}
-			} onRecognized: { url, names in
-				for name in names {
-					_ = await FaceProcessor.shared.assignPerson(named: name, toFiles: [url])
-					_ = await ContentView.writeKeywords(to: url, keywords: ["Person: \(name)"])
+				} onRecognized: { url, names in
+					for name in names {
+						_ = await FaceProcessor.shared.assignPerson(named: name, toFiles: [url])
+						let existingMetadata = await MetadataCache.shared.candidateString(for: url)
+						if !existingMetadata.localizedCaseInsensitiveContains(name) {
+							_ = await ContentView.writeKeywords(to: url, keywords: [name])
+						}
+					}
+					await MainActor.run {
+						queueMetadataRefresh(for: url)
 				}
+			}
+
+			if Task.isCancelled {
 				await MainActor.run {
-					queueMetadataRefresh(for: url)
+					isPersonRecognitionWorking = false
+					personRecognitionTask = nil
+					personRecognitionResultMessage = "Person recognition was cancelled."
+					showPersonRecognitionResult = true
 				}
+				return
 			}
 
 			await MainActor.run {
 				isPersonRecognitionWorking = false
+				personRecognitionTask = nil
 				personRecognitionResultMessage = "Processed \(result.photosProcessed) photo\(result.photosProcessed == 1 ? "" : "s"). Matched taught people in \(result.photosWithMatches) photo\(result.photosWithMatches == 1 ? "" : "s") and assigned \(result.namesAssigned) name\(result.namesAssigned == 1 ? "" : "s"). \(result.failed) failed."
 				showPersonRecognitionResult = true
 				scheduleSort()
 			}
 		}
+		personRecognitionTask = task
 	}
 
 	private func runOllamaRecognition() {
@@ -5247,11 +5281,7 @@ struct ContentView: View {
 		case .replace:
 			nextKeywords = Self.mergedKeywords([], keywords)
 		}
-		if nextKeywords.isEmpty {
-			iptc.removeValue(forKey: kCGImagePropertyIPTCKeywords)
-		} else {
-			iptc[kCGImagePropertyIPTCKeywords] = nextKeywords as CFArray
-		}
+		iptc[kCGImagePropertyIPTCKeywords] = nextKeywords as CFArray
 		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
 
 		// Create a temporary file next to the original so moves are atomic
