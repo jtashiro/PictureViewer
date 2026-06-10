@@ -39,6 +39,7 @@ struct VaultCommandActions {
 	let syncToTab: () -> Void
 	let syncToSQLiteStore: () -> Void
 	let syncSelectedToSQLiteStore: () -> Void
+	let backfillSQLiteThumbnails: () -> Void
 	let openSQLiteStore: () -> Void
 	let copy: () -> Void
 	let paste: () -> Void
@@ -51,6 +52,7 @@ struct VaultCommandActions {
 	let canSyncToTab: Bool
 	let canSyncToSQLiteStore: Bool
 	let canSyncSelectedToSQLiteStore: Bool
+	let canBackfillSQLiteThumbnails: Bool
 	let canOpenSQLiteStore: Bool
 	let canCopy: Bool
 	let canPaste: Bool

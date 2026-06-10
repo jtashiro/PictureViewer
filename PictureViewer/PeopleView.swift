@@ -52,6 +52,7 @@ struct PeopleView: View {
         .frame(minWidth: 420, minHeight: 360)
         .background(WindowAccessor { window in
             window?.title = "People"
+            window?.identifier = PeopleWindowPresenter.windowIdentifier
         })
         .onAppear {
             Task.detached {

@@ -54,24 +54,33 @@ struct ContentView: View {
 	}
 
 	@State private var initialFolderURL: URL?
-	@State private var initialSQLiteStoreName: String?
+	@State private var initialSQLiteOpenToken: String?
 	@State private var tabID = UUID()
 	@State private var registeredGalleryFolderURL: URL?
 	@State private var registeredSQLiteStoreName: String?
 	@State private var activeSQLiteStoreName: String?
 
-	init(initialFolder: URL? = nil, initialSQLiteStoreName: String? = nil) {
+	init(initialFolder: URL? = nil, initialSQLiteOpenToken: String? = nil) {
 		_initialFolderURL = State(initialValue: initialFolder)
-		_initialSQLiteStoreName = State(initialValue: initialSQLiteStoreName)
+		_initialSQLiteOpenToken = State(initialValue: initialSQLiteOpenToken)
+	}
+
+	private var resolvedInitialSQLiteStoreName: String? {
+		guard let token = initialSQLiteOpenToken else { return nil }
+		return SQLiteObjectStore.storeName(fromOpenToken: token)
 	}
 
 	/// Restore a persisted security-scoped bookmark (if present) and start
 	/// accessing the resource so the app can write into the folder while
 	/// sandboxed. This is safe to call at startup.
 	private func restoreFolderBookmarkIfNeeded(library: PhotoLibrary, logger: Logger) async -> Bool {
-		if saveOpenWindows {
-			let sessionItems = Self.uniqueGallerySessionItems(WindowStateStore.shared.openGallerySessionItems())
-			if !sessionItems.isEmpty {
+		guard saveOpenWindows else {
+			logger.log("launch folder restore: result=skipped reason=saveOpenWindows-disabled")
+			return false
+		}
+
+		let sessionItems = Self.uniqueGallerySessionItems(WindowStateStore.shared.openGallerySessionItems())
+		if !sessionItems.isEmpty {
 				logger.log("launch gallery restore: source=open-gallery-tabs itemCount=\(sessionItems.count, privacy: .public)")
 				await MainActor.run {
 					for (index, item) in sessionItems.enumerated() {
@@ -92,13 +101,16 @@ struct ContentView: View {
 								openSQLiteObjectStore(named: storeName)
 							} else {
 								logger.log("launch gallery restore: source=open-gallery-tabs action=open-sqlite-tab store=\(storeName, privacy: .public)")
-								openWindow(id: "sqlite-store", value: storeName)
+								let requestID = SQLiteStoreOpenRequestCoordinator.shared.requestOpen(storeName: storeName)
+								openWindow(
+									id: "sqlite-store",
+									value: SQLiteObjectStore.openToken(storeName: storeName, requestID: requestID)
+								)
 							}
 						}
 					}
 				}
 				return true
-			}
 		}
 
 		// Prefer multi-bookmark list if available.
@@ -752,6 +764,14 @@ struct ContentView: View {
 	@State private var vaultUnlockConfirmation: String = ""
 	@State private var vaultUnlockMessage: String?
 	@State private var vaultStoreTask: Task<Void, Never>?
+	@State private var folderScanTask: Task<Void, Never>?
+	@State private var refreshTask: Task<Void, Never>?
+	@State private var deleteTask: Task<Void, Never>?
+	@State private var keywordEditTask: Task<Void, Never>?
+	@State private var rotationApplyTask: Task<Void, Never>?
+	@State private var brightnessApplyTask: Task<Void, Never>?
+	@State private var ollamaRecognitionTask: Task<Void, Never>?
+	@State private var isOllamaRecognitionRunning = false
 	@State private var pendingVaultAutoOpen: Bool = false
 	@State private var isShowingVaultManager: Bool = false
 	@State private var knownVaults: [KnownVault] = []
@@ -864,6 +884,7 @@ struct ContentView: View {
 			syncToTab: { syncToAnotherTab() },
 			syncToSQLiteStore: { syncCurrentTabToSQLiteStore() },
 			syncSelectedToSQLiteStore: { syncSelectedMediaToSQLiteStore() },
+			backfillSQLiteThumbnails: { backfillSQLiteThumbnails() },
 			openSQLiteStore: { chooseAndOpenSQLiteObjectStore() },
 			copy: { copySelectedFiles() },
 			paste: { pasteFilesToVault() },
@@ -876,6 +897,7 @@ struct ContentView: View {
 			canSyncToTab: !library.photos.isEmpty,
 			canSyncToSQLiteStore: !library.photos.isEmpty,
 			canSyncSelectedToSQLiteStore: hasSelectedPhotos,
+			canBackfillSQLiteThumbnails: isSQLiteObjectStoreView && !isVaultWorking && !library.photos.isEmpty,
 			canOpenSQLiteStore: true,
 			canCopy: hasSelectedPhotos,
 			canPaste: canPasteFilesToVault,
@@ -905,7 +927,8 @@ struct ContentView: View {
 					sqliteLastThumbnailLoadDuration: sqliteLastThumbnailLoadDuration,
 					lastRefreshDate: lastRefreshDate,
 					lastRefreshDuration: lastRefreshDuration,
-					onRefreshThumbnails: { refreshThumbnails() }
+					onRefreshThumbnails: { refreshThumbnails() },
+					onBackfillSQLiteThumbnails: isSQLiteObjectStoreView ? { backfillSQLiteThumbnails() } : nil
 				)
 					.fixedSize(horizontal: false, vertical: true)
 				Divider()
@@ -920,6 +943,7 @@ struct ContentView: View {
 		.frame(minWidth: 760, minHeight: 540)
 		// Attach a WindowAccessor so we can set window-level defaults like
 		// preferring tabs for this app's windows.
+		.background(GalleryWindowCloseInstaller(onCloseRequest: handleTabCloseRequest))
 		.background(WindowAccessor { window in
 			// Force every gallery window to live in the same NSWindow tab
 			// group. macOS only honors tabbingMode/Identifier when the system
@@ -942,6 +966,10 @@ struct ContentView: View {
 				ContentView.mainGalleryWindow = window
 			}
 		})
+		.task(id: initialSQLiteOpenToken) {
+			guard let storeName = resolvedInitialSQLiteStoreName else { return }
+			await openInitialSQLiteStoreIfNeeded(storeName: storeName)
+		}
 		.onAppear {
 			updateTabRegistry()
 			// Initialize displayed photos immediately so the UI shows
@@ -964,11 +992,10 @@ struct ContentView: View {
 				library.scan(folder: seed)
 				return
 			}
-			if let storeName = initialSQLiteStoreName {
-				logger.log("launch sqlite restore: source=initial-sqlite-window store=\(storeName, privacy: .public)")
-				openSQLiteObjectStore(named: storeName)
+			if initialSQLiteOpenToken != nil {
 				return
 			}
+			let shouldRestoreAtLaunch = saveOpenWindows
 			// Defer work by a short amount; if responsiveness is still an
 			// issue we can increase the delay or gate more startup tasks.
 			Task.detached(priority: .utility) {
@@ -980,23 +1007,26 @@ struct ContentView: View {
 				// and start access so background writes are allowed when the
 				// app is sandboxed. Run this after a short delay so the UI
 				// can finish initial setup first.
-				Task {
-					// Only perform the automatic launch restore once. Subsequent
-					// ContentView instances (tabs/windows created after launch)
-					// should not re-load the cached snapshot; leave those
-					// instances blank instead.
-					let didRestore = await MainActor.run { Self.didPerformLaunchRestore }
-					if !didRestore {
-						let restoredBookmarks = await self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
-						await MainActor.run { Self.didPerformLaunchRestore = true }
-						await MainActor.run { restoreSavedWindowsIfNeeded(skipSavedFolder: restoredBookmarks) }
-					} else {
-						// No-op for subsequent ContentView instances.
+				if shouldRestoreAtLaunch {
+					Task {
+						// Only perform the automatic launch restore once. Subsequent
+						// ContentView instances (tabs/windows created after launch)
+						// should not re-load the cached snapshot; leave those
+						// instances blank instead.
+						let didRestore = await MainActor.run { Self.didPerformLaunchRestore }
+						if !didRestore {
+							let restoredBookmarks = await self.restoreFolderBookmarkIfNeeded(library: library, logger: self.logger)
+							await MainActor.run { Self.didPerformLaunchRestore = true }
+							await MainActor.run { restoreSavedWindowsIfNeeded(skipSavedFolder: restoredBookmarks) }
+						}
 					}
+				} else {
+					await MainActor.run { Self.didPerformLaunchRestore = true }
 				}
 			}
 		}
 		.onDisappear {
+			cancelAllBackgroundOperations()
 			Task { @MainActor in
 				GalleryTabRegistry.shared.remove(id: tabID)
 				if let folderURL = registeredGalleryFolderURL, !WindowStateStore.shared.isAppTerminating() {
@@ -1579,7 +1609,8 @@ struct ContentView: View {
 							rotProgressCount = 0
 							isApplyingRotations = true
 							let rotationsCopy = selectedRotations
-							Task.detached(priority: .utility) {
+							rotationApplyTask?.cancel()
+							rotationApplyTask = Task.detached(priority: .utility) {
 								for u in urls {
 									if Task.isCancelled { break }
 									let deg = rotationsCopy[u] ?? 0
@@ -1669,7 +1700,8 @@ struct ContentView: View {
 							brightnessProgressCount = 0
 							isApplyingBrightness = true
 							let delta = brightnessAdjustment
-							Task.detached(priority: .utility) {
+							brightnessApplyTask?.cancel()
+							brightnessApplyTask = Task.detached(priority: .utility) {
 								for u in urls {
 									if Task.isCancelled { break }
 									let ok = await Self.adjustBrightnessFile(at: u, delta: delta)
@@ -1931,47 +1963,6 @@ struct ContentView: View {
 
 	@ToolbarContentBuilder
 	private var toolbarItems: some ToolbarContent {
-		ToolbarItem(placement: .primaryAction) {
-			Button {
-				toggleVaultLock()
-			} label: {
-				Label(
-					vaultStatus.isUnlocked ? "Lock Vault" : "Unlock Vault",
-					systemImage: vaultStatus.isUnlocked ? "lock.open.fill" : "lock.fill"
-				)
-				.foregroundStyle(vaultStatus.isUnlocked ? Color.green : Color.secondary)
-			}
-			.help(vaultStatus.isUnlocked ? "Vault is unlocked — click to lock" : "Vault is locked — click to unlock")
-		}
-		ToolbarItem(placement: .primaryAction) {
-			Button {
-				chooseFolder()
-			} label: {
-				Label("Choose Folder", systemImage: "folder")
-			}
-			.help("Choose a folder to browse")
-		}
-		ToolbarItem(placement: .primaryAction) {
-			Menu {
-				Button("Import Folder to Vault…") {
-					importFolderToVault()
-				}
-				Button("Store Selected Images in Vault") {
-					importSelectedImagesToVault()
-				}
-				.disabled(!hasSelectedPhotos)
-				Button("Open Vault") {
-					openVault()
-				}
-				Button(hasSelectedPhotos ? "Export Selected…" : "Export All Displayed…") {
-					exportVaultSelection()
-				}
-				.disabled(library.photos.isEmpty)
-			} label: {
-				Label("Vault", systemImage: "lock.doc")
-			}
-			.help("Import, open, or export vault photos")
-		}
 		ToolbarItem(placement: .automatic) {
 			HStack(spacing: 6) {
 				Image(systemName: "photo")
@@ -1997,8 +1988,7 @@ struct ContentView: View {
 				}
 				.help(groupGridByDescription ? "Showing sections by Description — click to show a flat grid" : "Group thumbnails into sections by Description (person name)")
 				Button {
-					// Open the dedicated People window.
-					openWindow(id: "people")
+					PeopleWindowPresenter.show(using: openWindow)
 				} label: {
 					Image(systemName: "person.2.fill")
 				}
@@ -2041,16 +2031,16 @@ struct ContentView: View {
 					rescanFaceRecognitionForSelection()
 				}) {
 					Text("Rescan Faces")
-					}
-					.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
-					.help("Rescan selected photos, or all currently displayed photos when none are selected")
-					Button(action: {
-						recognizePeopleWithOllama()
-					}) {
-						Text("Recognize People")
-					}
-					.disabled(personRecognitionTargetURLs.isEmpty || isPersonRecognitionWorking)
-					.help("Recognize taught people in selected photos, or all displayed photos when none are selected")
+				}
+				.disabled(faceActionTargetURLs.isEmpty || isRescanningFaces || faceScanProgress.isActive)
+				.help("Rescan selected photos, or all currently displayed photos when none are selected")
+				Button(action: {
+					recognizePeopleWithOllama()
+				}) {
+					Text("Recognize People")
+				}
+				.disabled(personRecognitionTargetURLs.isEmpty || isPersonRecognitionWorking)
+				.help("Recognize taught people in selected photos, or all displayed photos when none are selected")
 					if selectionMode {
 					Button(action: {
 						beginKeywordEditing(for: selectedPhotoURLs)
@@ -2121,7 +2111,6 @@ struct ContentView: View {
 				// Runs filtering in the background via `scheduleSort()`.
 				if let galleryStatusText {
 					Text(galleryStatusText)
-						.font(.caption)
 						.foregroundStyle(.secondary)
 						.lineLimit(1)
 						.help(galleryStatusHelpText)
@@ -2141,6 +2130,7 @@ struct ContentView: View {
 					}
 				}
 			}
+			.font(.caption)
 			.help("Thumbnail size")
 		}
 	}
@@ -2374,7 +2364,8 @@ struct ContentView: View {
 		editProgressCount = 0
 		isApplyingKeywords = true
 
-		Task.detached(priority: .utility) {
+		keywordEditTask?.cancel()
+		keywordEditTask = Task.detached(priority: .utility) {
 			let workerCount = max(1, min(urls.count, PhotoLibrary.workerCount))
 			await withTaskGroup(of: (URL, Bool).self) { group in
 				var nextIndex = 0
@@ -2444,6 +2435,11 @@ struct ContentView: View {
 			return
 		}
 		PhotoNavigationContext.shared.update(urls: displayedPhotos.map(\.url))
+		if SQLiteObjectStore.needsMaterialization(url) {
+			Task.detached(priority: .userInitiated) {
+				_ = try? await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
+			}
+		}
 		openWindow(id: "photo-viewer", value: url)
 	}
 
@@ -2775,6 +2771,8 @@ struct ContentView: View {
 		let prompt = ollamaPrompt
 		let model = ollamaSelectedModel
 		let shouldUpdateMetadata = ollamaUpdateMetadata
+		isOllamaRecognitionRunning = true
+		ollamaRecognitionTask?.cancel()
 		let task = Task.detached(priority: .utility) {
 			_ = await OllamaRecognizer.shared.recognizeAndLog(
 				imageURLs: urls,
@@ -2790,8 +2788,13 @@ struct ContentView: View {
 					}
 				}
 			)
-			await MainActor.run { OllamaProgress.shared.end() }
+			await MainActor.run {
+				OllamaProgress.shared.end()
+				isOllamaRecognitionRunning = false
+				ollamaRecognitionTask = nil
+			}
 		}
+		ollamaRecognitionTask = task
 		OllamaProgress.shared.begin(total: urls.count, model: model, cancel: { task.cancel() })
 	}
 
@@ -3094,6 +3097,94 @@ struct ContentView: View {
 		performSQLiteSync(sourceURLs: selectedPhotoURLs, title: "Store Selected in SQLite Store")
 	}
 
+	private func backfillSQLiteThumbnails() {
+		guard isSQLiteObjectStoreView, !isVaultWorking else { return }
+		let storeName = activeSQLiteStoreName ?? SQLiteObjectStore.configuredStoreName
+		let databaseFilename = SQLiteObjectStore.databaseFilename(forStoreName: storeName)
+
+		Task {
+			do {
+				let missingCount = try await SQLiteObjectStore.shared.countObjectsMissingThumbnails(storeName: storeName)
+				guard missingCount > 0 else {
+					await MainActor.run {
+						vaultAlertMessage = "All objects in \(databaseFilename) already have stored thumbnails."
+						showVaultAlert = true
+					}
+					return
+				}
+
+				let confirmed = await MainActor.run { () -> Bool in
+					let alert = NSAlert()
+					alert.messageText = "Backfill Missing Thumbnails"
+					alert.informativeText = "Generate and store thumbnail images for \(missingCount) object\(missingCount == 1 ? "" : "s") in \(databaseFilename) that do not have thumbnail data yet. This may take a while for large stores."
+					alert.alertStyle = .informational
+					alert.addButton(withTitle: "Backfill")
+					alert.addButton(withTitle: "Cancel")
+					return alert.runModal() == .alertFirstButtonReturn
+				}
+				guard confirmed else { return }
+
+				await MainActor.run {
+					isVaultWorking = true
+					vaultProgressMessage = "Backfilling thumbnails in \(databaseFilename)..."
+					vaultProgressCompleted = 0
+					vaultProgressTotal = missingCount
+					sqliteLoadStartDate = Date()
+				}
+
+				let backfillStart = Date()
+				logger.log("sqlite thumbnail backfill ui: begin store=\(storeName, privacy: .public) missing=\(missingCount, privacy: .public)")
+				let progressUI = BackfillProgressUIThrottler()
+				let result = try await SQLiteObjectStore.shared.backfillMissingThumbnails(storeName: storeName) { completed, total, currentFilename in
+					let shouldUpdateUI = await MainActor.run {
+						progressUI.shouldUpdate(completed: completed, total: total)
+					}
+					guard shouldUpdateUI else { return }
+					await MainActor.run {
+						vaultProgressCompleted = completed
+						vaultProgressTotal = total
+						vaultProgressMessage = "Backfilling thumbnails in \(databaseFilename)..."
+						vaultProgressCurrentFile = currentFilename
+					}
+					if completed == total || completed.isMultiple(of: 8) {
+						logger.log("sqlite thumbnail backfill ui: progress completed=\(completed, privacy: .public) total=\(total, privacy: .public) file=\(currentFilename, privacy: .public)")
+					}
+				}
+
+				let hydratedCount = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects(
+					storeName: storeName
+				)
+				logger.log("sqlite thumbnail backfill ui: complete filled=\(result.filled, privacy: .public) failed=\(result.failed, privacy: .public) hydrated=\(hydratedCount, privacy: .public) duration=\(Date().timeIntervalSince(backfillStart), privacy: .public)")
+
+				await MainActor.run {
+					sqliteLastThumbnailLoadDuration = Date().timeIntervalSince(backfillStart)
+					refreshToken = UUID()
+					isVaultWorking = false
+					vaultProgressMessage = ""
+					vaultProgressCompleted = 0
+					vaultProgressTotal = 0
+					vaultProgressCurrentFile = ""
+					sqliteLoadStartDate = nil
+					if result.failed > 0 {
+						vaultAlertMessage = "Backfilled \(result.filled) of \(result.candidates) thumbnails. \(result.failed) object\(result.failed == 1 ? "" : "s") could not be processed."
+						showVaultAlert = true
+					}
+				}
+			} catch {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultProgressMessage = ""
+					vaultProgressCompleted = 0
+					vaultProgressTotal = 0
+					vaultProgressCurrentFile = ""
+					sqliteLoadStartDate = nil
+					vaultAlertMessage = "Thumbnail backfill failed: \(error.localizedDescription)"
+					showVaultAlert = true
+				}
+			}
+		}
+	}
+
 	private func performSQLiteSync(sourceURLs: [URL], title: String) {
 		guard SQLiteObjectStore.configuredDirectoryPath != nil else {
 			vaultAlertMessage = "Create or open a SQLite store before syncing."
@@ -3129,6 +3220,7 @@ struct ContentView: View {
 		vaultProgressCompleted = 0
 		vaultProgressTotal = sourceURLs.count
 		vaultStoreTask?.cancel()
+		let requestedFocusFilename = sourceURLs.count == 1 ? sourceURLs[0].lastPathComponent : nil
 		let task = Task.detached(priority: .userInitiated) {
 			struct PreparedSQLiteObject: Sendable {
 				let index: Int
@@ -3136,114 +3228,127 @@ struct ContentView: View {
 				let pendingObject: SQLiteObjectStore.PendingObject
 			}
 
-			var failedCount = 0
-			var completedCount = 0
-			var storedCount = 0
-			var firstStoredFilename: String?
-			var cancelledBeforeStartCount = 0
+			final class SyncAccumulator: @unchecked Sendable {
+				var failedCount = 0
+				var processedCount = 0
+				var storedCount = 0
+			}
+
+			let accumulator = SyncAccumulator()
 			let syncStart = Date()
-			let chunkSize = max(1, min(workers, 8))
-			logger.log("sqlite sync: begin database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) workers=\(workers, privacy: .public) chunkSize=\(chunkSize, privacy: .public)")
+			let writeBatchSize = min(32, max(8, sourceURLs.count))
+			let progressStride = max(1, min(16, sourceURLs.count / 32))
+			logger.log("sqlite sync: begin database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) workers=\(workers, privacy: .public) writeBatchSize=\(writeBatchSize, privacy: .public)")
 
-			for chunkStart in stride(from: 0, to: sourceURLs.count, by: chunkSize) {
-				if Task.isCancelled {
-					cancelledBeforeStartCount += sourceURLs.count - chunkStart
-					break
-				}
-				let chunkEnd = min(chunkStart + chunkSize, sourceURLs.count)
-				let chunk = Array(sourceURLs[chunkStart..<chunkEnd])
-				let chunkStartDate = Date()
-				logger.log("sqlite sync: chunk begin range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) of=\(sourceURLs.count, privacy: .public)")
+			await withTaskGroup(of: PreparedSQLiteObject?.self) { group in
+				var nextIndex = 0
+				var pendingWrite: [PreparedSQLiteObject] = []
 
-				let preparedObjects: [PreparedSQLiteObject] = await withTaskGroup(of: PreparedSQLiteObject?.self) { group in
-					for (offset, url) in chunk.enumerated() {
-						let index = chunkStart + offset
-						group.addTask {
-							if Task.isCancelled { return nil }
-							let itemStart = Date()
-							logger.log("sqlite sync: item read begin index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public)")
-							do {
-								let resourceValues = try? url.resourceValues(forKeys: [.contentTypeKey])
-								guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
-									logger.error("sqlite sync: unsupported media index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) url=\(url.path, privacy: .public)")
-									return nil
-								}
-								let started = url.startAccessingSecurityScopedResource()
-								defer { if started { url.stopAccessingSecurityScopedResource() } }
-								let data = try Data(contentsOf: url)
-								try Task.checkCancellation()
-								let contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-								let contentType = resourceValues?.contentType?.identifier
-									?? UTType(filenameExtension: url.pathExtension)?.identifier
-								let thumbnailData = await Self.sqliteThumbnailDataForSyncSource(url)
-								logger.log("sqlite sync: item read complete index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public) bytes=\(data.count, privacy: .public) duration=\(Date().timeIntervalSince(itemStart), privacy: .public)")
-								return PreparedSQLiteObject(
-									index: index,
-									filename: url.lastPathComponent,
-									pendingObject: SQLiteObjectStore.PendingObject(
-										objectData: data,
-										originalURL: url,
-										contentHash: contentHash,
-										contentTypeIdentifier: contentType,
-										thumbnailData: thumbnailData
-									)
-								)
-							} catch is CancellationError {
-								logger.log("sqlite sync: item cancelled index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) filename=\(url.lastPathComponent, privacy: .public)")
-								return nil
-							} catch {
-								logger.error("sqlite sync: item read failed index=\(index + 1, privacy: .public) of=\(sourceURLs.count, privacy: .public) url=\(url.path, privacy: .public) duration=\(Date().timeIntervalSince(itemStart), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				func enqueueNext() {
+					guard nextIndex < sourceURLs.count else { return }
+					let index = nextIndex
+					let url = sourceURLs[index]
+					nextIndex += 1
+					group.addTask {
+						if Task.isCancelled { return nil }
+						do {
+							let resourceValues = try? url.resourceValues(forKeys: [
+								.contentTypeKey,
+								.creationDateKey,
+								.contentModificationDateKey,
+								.fileSizeKey
+							])
+							guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
 								return nil
 							}
+							let started = url.startAccessingSecurityScopedResource()
+							defer { if started { url.stopAccessingSecurityScopedResource() } }
+							let data = try Data(contentsOf: url)
+							try Task.checkCancellation()
+							let contentType = resourceValues?.contentType?.identifier
+								?? UTType(filenameExtension: url.pathExtension)?.identifier
+							let extractedMetadata = SQLiteObjectStore.extractObjectMetadata(
+								from: data,
+								originalURL: url,
+								contentTypeIdentifier: contentType
+							)
+							let thumbnailData = await SQLiteObjectStore.shared.resolvedThumbnailData(for: url)
+							return PreparedSQLiteObject(
+								index: index,
+								filename: url.lastPathComponent,
+								pendingObject: SQLiteObjectStore.PendingObject(
+									objectData: data,
+									originalURL: url,
+									contentHash: SQLiteObjectStore.contentHash(of: data),
+									contentTypeIdentifier: contentType,
+									thumbnailData: thumbnailData,
+									extractedMetadata: extractedMetadata,
+									sourceFileSize: resourceValues?.fileSize,
+									sourceCreatedAt: resourceValues?.creationDate,
+									sourceModifiedAt: resourceValues?.contentModificationDate
+								)
+							)
+						} catch {
+							return nil
 						}
 					}
-
-					var prepared: [PreparedSQLiteObject] = []
-					for await object in group {
-						if let object {
-							prepared.append(object)
-						}
-					}
-					return prepared.sorted { $0.index < $1.index }
 				}
 
-				let chunkFailedCount = chunk.count - preparedObjects.count
-				failedCount += chunkFailedCount
-				if !preparedObjects.isEmpty {
+				func flushPendingWrite() async {
+					guard !pendingWrite.isEmpty else { return }
+					pendingWrite.sort { $0.index < $1.index }
+					let batch = pendingWrite
+					pendingWrite.removeAll(keepingCapacity: true)
+					let writeStart = Date()
 					do {
-						let writeStart = Date()
-						let pendingObjects = preparedObjects.map(\.pendingObject)
-						logger.log("sqlite sync: chunk write begin range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) prepared=\(pendingObjects.count, privacy: .public)")
-						let writtenCount = try await SQLiteObjectStore.shared.storeObjectBatchThrowing(pendingObjects, storeName: targetStoreName)
-						storedCount += writtenCount
-						completedCount += writtenCount
-						if firstStoredFilename == nil {
-							firstStoredFilename = preparedObjects.first?.filename
-						}
-						let writeFailedCount = max(0, preparedObjects.count - writtenCount)
-						failedCount += writeFailedCount
-						completedCount += writeFailedCount
-						logger.log("sqlite sync: chunk write complete range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) written=\(writtenCount, privacy: .public) writeFailed=\(writeFailedCount, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
+						let pendingObjects = batch.map(\.pendingObject)
+						let writtenCount = try await SQLiteObjectStore.shared.storeObjectBatchThrowing(
+							pendingObjects,
+							storeName: targetStoreName
+						)
+						accumulator.storedCount += writtenCount
+						let writeFailedCount = max(0, batch.count - writtenCount)
+						accumulator.failedCount += writeFailedCount
+						logger.log("sqlite sync: batch write complete prepared=\(batch.count, privacy: .public) written=\(writtenCount, privacy: .public) writeFailed=\(writeFailedCount, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
 					} catch {
-						failedCount += preparedObjects.count
-						completedCount += preparedObjects.count
-						logger.error("sqlite sync: chunk write failed range=\(chunkStart + 1, privacy: .public)-\(chunkEnd, privacy: .public) prepared=\(preparedObjects.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+						accumulator.failedCount += batch.count
+						logger.error("sqlite sync: batch write failed prepared=\(batch.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 					}
 				}
-				completedCount += chunkFailedCount
-				let processedCount = completedCount + cancelledBeforeStartCount
-				logger.log("sqlite sync: progress processed=\(processedCount, privacy: .public) of=\(sourceURLs.count, privacy: .public) stored=\(storedCount, privacy: .public) failed=\(failedCount, privacy: .public) skipped=\(cancelledBeforeStartCount, privacy: .public) chunkDuration=\(Date().timeIntervalSince(chunkStartDate), privacy: .public) elapsed=\(Date().timeIntervalSince(syncStart), privacy: .public)")
-				await MainActor.run {
-					vaultProgressCompleted = processedCount
-					vaultProgressTotal = sourceURLs.count
+
+				for _ in 0..<workers {
+					enqueueNext()
 				}
+
+				while let result = await group.next() {
+					if let result {
+						pendingWrite.append(result)
+						if pendingWrite.count >= writeBatchSize {
+							await flushPendingWrite()
+						}
+					} else {
+						accumulator.failedCount += 1
+					}
+					accumulator.processedCount += 1
+					enqueueNext()
+					if accumulator.processedCount % progressStride == 0 || accumulator.processedCount == sourceURLs.count {
+						let completed = accumulator.processedCount
+						await MainActor.run {
+							vaultProgressCompleted = completed
+							vaultProgressTotal = sourceURLs.count
+						}
+					}
+				}
+
+				await flushPendingWrite()
 			}
+
 			let wasCancelled = Task.isCancelled
-			let finalFailedCount = failedCount
-			let finalStoredCount = storedCount
-			let finalProcessedCount = completedCount
-			let finalSkippedCount = cancelledBeforeStartCount
-			let finalFocusFilename = finalStoredCount == 1 ? firstStoredFilename : nil
+			let finalFailedCount = accumulator.failedCount
+			let finalStoredCount = accumulator.storedCount
+			let finalProcessedCount = accumulator.processedCount
+			let finalSkippedCount = max(0, sourceURLs.count - finalProcessedCount)
+			let finalFocusFilename = (finalStoredCount > 0) ? requestedFocusFilename : nil
 			logger.log("sqlite sync: complete database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) processed=\(finalProcessedCount, privacy: .public) stored=\(finalStoredCount, privacy: .public) failed=\(finalFailedCount, privacy: .public) skipped=\(finalSkippedCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public) duration=\(Date().timeIntervalSince(syncStart), privacy: .public)")
 			await MainActor.run {
 				isVaultWorking = false
@@ -3262,10 +3367,14 @@ struct ContentView: View {
 					if isSQLiteObjectStoreView && activeSQLiteStoreName == targetStoreName {
 						refreshThumbnails(focusFilename: finalFocusFilename)
 					}
+					var changeUserInfo: [String: Any] = ["storeName": targetStoreName]
+					if let finalFocusFilename {
+						changeUserInfo["filename"] = finalFocusFilename
+					}
 					NotificationCenter.default.post(
 						name: .sqliteObjectStoreDidChange,
 						object: tabID,
-						userInfo: ["storeName": targetStoreName]
+						userInfo: changeUserInfo
 					)
 				}
 			}
@@ -3276,10 +3385,6 @@ struct ContentView: View {
 	private struct SQLiteSyncTarget {
 		let title: String
 		let storeName: String
-	}
-
-	private nonisolated static func sqliteThumbnailDataForSyncSource(_ url: URL) async -> Data? {
-		await SQLiteObjectStore.shared.resolvedThumbnailData(for: url)
 	}
 
 	private func visibleSQLiteSyncTargets() -> [SQLiteSyncTarget] {
@@ -3340,22 +3445,119 @@ struct ContentView: View {
 		openSQLiteObjectStore(fileURL: url)
 	}
 
-	private func openSQLiteObjectStore(fileURL: URL) {
-		Task {
-			do {
-				try await SQLiteObjectStore.shared.setDatabaseFile(fileURL)
-				await MainActor.run {
-					activeSQLiteStoreName = SQLiteObjectStore.configuredStoreName
+	private var canReuseCurrentGalleryTabForSQLiteOpen: Bool {
+		library.folderURL == nil && library.photos.isEmpty && !isVaultWorking
+	}
+
+	private var isGalleryTabActive: Bool {
+		guard let window = hostingWindow, window.isVisible else { return false }
+		if let tabGroup = window.tabGroup {
+			return tabGroup.selectedWindow === window
+		}
+		return window.isKeyWindow
+	}
+
+	private func waitUntilGalleryTabIsActive(maxAttempts: Int = 120) async {
+		for attempt in 0..<maxAttempts {
+			if isGalleryTabActive {
+				if attempt > 0 {
+					logger.log("sqlite ui: tab active after \(attempt, privacy: .public) waits store=\(self.resolvedInitialSQLiteStoreName ?? "none", privacy: .public)")
 				}
-				await MainActor.run {
-					openWindow(id: "sqlite-store", value: fileURL.lastPathComponent)
-				}
-			} catch {
-				await MainActor.run {
+				return
+			}
+			try? await Task.sleep(nanoseconds: 50_000_000)
+		}
+		logger.warning("sqlite ui: tab activation timed out visible=\(self.hostingWindow?.isVisible == true, privacy: .public) key=\(self.hostingWindow?.isKeyWindow == true, privacy: .public) store=\(self.resolvedInitialSQLiteStoreName ?? self.activeSQLiteStoreName ?? "none", privacy: .public)")
+	}
+
+	private func openInitialSQLiteStoreIfNeeded(storeName: String) async {
+		let openToken = initialSQLiteOpenToken
+		let requestID = openToken.flatMap { SQLiteObjectStore.requestID(fromOpenToken: $0) }
+		let hasPendingOpen = openToken.map { SQLiteStoreOpenRequestCoordinator.shared.matchesOpenToken($0) } == true
+		await waitUntilGalleryTabIsActive()
+		logger.log("sqlite ui: initial-open ready tabActive=\(self.isGalleryTabActive, privacy: .public) tabID=\(self.tabID.uuidString, privacy: .public) store=\(storeName, privacy: .public) pending=\(hasPendingOpen, privacy: .public) token=\(openToken ?? "none", privacy: .public)")
+
+		if hasPendingOpen, let requestID {
+			guard let pending = SQLiteStoreOpenRequestCoordinator.shared.consumePending(for: storeName, requestID: requestID) else {
+				logger.log("sqlite ui: initial-open skipped pending-already-consumed store=\(storeName, privacy: .public)")
+				return
+			}
+			if let fileURL = pending.fileURL {
+				do {
+					try await SQLiteObjectStore.shared.setDatabaseFile(fileURL)
+				} catch {
 					vaultAlertMessage = "Could not open SQLite store: \(error.localizedDescription)"
 					showVaultAlert = true
+					logger.error("sqlite ui: initial-open setDatabaseFile failed store=\(storeName, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+					return
 				}
 			}
+		}
+
+		guard !isSQLiteObjectStoreView
+			|| !SQLiteObjectStore.storeNamesMatch(activeSQLiteStoreName, storeName)
+			|| library.photos.isEmpty else {
+			logger.log("sqlite ui: initial-open skipped already-loaded store=\(storeName, privacy: .public)")
+			return
+		}
+
+		logger.log("launch sqlite restore: source=initial-sqlite-window store=\(storeName, privacy: .public)")
+		openSQLiteObjectStore(named: storeName)
+	}
+
+	private func scheduleSQLiteOpenFallback(requestID: UUID, storeName: String, fileURL: URL?) {
+		Task { @MainActor in
+			for _ in 0..<60 {
+				try? await Task.sleep(nanoseconds: 100_000_000)
+				if !SQLiteStoreOpenRequestCoordinator.shared.hasPending(requestID: requestID) {
+					return
+				}
+			}
+			guard let pending = SQLiteStoreOpenRequestCoordinator.shared.consumePending(matchingRequestID: requestID) else { return }
+			logger.warning("sqlite ui: pending open fallback on caller tab store=\(storeName, privacy: .public)")
+			if let fileURL = pending.fileURL ?? fileURL {
+				do {
+					try await SQLiteObjectStore.shared.setDatabaseFile(fileURL)
+				} catch {
+					vaultAlertMessage = "Could not open SQLite store: \(error.localizedDescription)"
+					showVaultAlert = true
+					return
+				}
+			}
+			await waitUntilGalleryTabIsActive()
+			openSQLiteObjectStore(named: pending.storeName)
+		}
+	}
+
+	private func openSQLiteObjectStore(fileURL: URL) {
+		Task { @MainActor in
+			let storeName = SQLiteObjectStore.normalizedStoreName(fileURL.deletingPathExtension().lastPathComponent)
+			if canReuseCurrentGalleryTabForSQLiteOpen {
+				do {
+					try await SQLiteObjectStore.shared.setDatabaseFile(fileURL)
+					logger.log("sqlite ui: open reuse-current-tab store=\(storeName, privacy: .public) path=\(fileURL.path, privacy: .public)")
+					await waitUntilGalleryTabIsActive()
+					openSQLiteObjectStore(named: storeName)
+				} catch {
+					vaultAlertMessage = "Could not open SQLite store: \(error.localizedDescription)"
+					showVaultAlert = true
+					logger.error("sqlite ui: open failed path=\(fileURL.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				}
+			} else {
+				logger.log("sqlite ui: open new-tab store=\(storeName, privacy: .public) path=\(fileURL.path, privacy: .public)")
+				let requestID = SQLiteStoreOpenRequestCoordinator.shared.requestOpen(storeName: storeName, fileURL: fileURL)
+				let openToken = SQLiteObjectStore.openToken(storeName: storeName, requestID: requestID)
+				openWindow(id: "sqlite-store", value: openToken)
+				scheduleSQLiteOpenFallback(requestID: requestID, storeName: storeName, fileURL: fileURL)
+			}
+		}
+	}
+
+	private func registerSQLiteThumbnailRefreshHandler(for storeName: String) {
+		SQLiteThumbnailRefreshCoordinator.shared.setHandler(for: storeName) {
+			guard isSQLiteObjectStoreView,
+			      SQLiteObjectStore.storeNamesMatch(activeSQLiteStoreName, storeName) else { return }
+			refreshToken = UUID()
 		}
 	}
 
@@ -3364,19 +3566,26 @@ struct ContentView: View {
 		if let storeName {
 			let trimmed = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
 			if !trimmed.isEmpty {
-				UserDefaults.standard.set(trimmed, forKey: SQLiteObjectStore.storeNameKey)
-				let requestedFilename = SQLiteObjectStore.databaseFilename(forStoreName: trimmed)
+				let normalized = SQLiteObjectStore.normalizedStoreName(trimmed)
+				UserDefaults.standard.set(normalized, forKey: SQLiteObjectStore.storeNameKey)
+				let requestedFilename = SQLiteObjectStore.databaseFilename(forStoreName: normalized)
 				if let savedPath = UserDefaults.standard.string(forKey: SQLiteObjectStore.databasePathKey),
 				   URL(fileURLWithPath: savedPath).lastPathComponent != requestedFilename {
 					UserDefaults.standard.removeObject(forKey: SQLiteObjectStore.databaseBookmarkKey)
 					UserDefaults.standard.removeObject(forKey: SQLiteObjectStore.databasePathKey)
 				}
-				storeNameForOpen = trimmed
+				storeNameForOpen = normalized
 			}
 		}
 		guard SQLiteObjectStore.configuredDirectoryPath != nil else {
 			vaultAlertMessage = "Choose a SQLite store file before opening it."
 			showVaultAlert = true
+			return
+		}
+		if isSQLiteObjectStoreView,
+		   SQLiteObjectStore.storeNamesMatch(activeSQLiteStoreName, storeNameForOpen),
+		   isVaultWorking || !library.photos.isEmpty {
+			logger.log("sqlite ui: open skipped alreadyActive store=\(storeNameForOpen, privacy: .public) working=\(self.isVaultWorking, privacy: .public) photos=\(self.library.photos.count, privacy: .public)")
 			return
 		}
 
@@ -3400,61 +3609,58 @@ struct ContentView: View {
 		vaultStoreTask?.cancel()
 
 		let openedStoreName = storeNameForOpen
+		registerSQLiteThumbnailRefreshHandler(for: openedStoreName)
+		let thumbnailProgress = SQLiteThumbnailRefreshSupport.progressHandler(for: openedStoreName)
+		logger.log("sqlite ui: open queued tabActive=\(self.isGalleryTabActive, privacy: .public) tabID=\(self.tabID.uuidString, privacy: .public) store=\(openedStoreName, privacy: .public)")
 		let task = Task.detached(priority: .userInitiated) {
 			do {
 				logger.log("sqlite ui: open begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public)")
-				let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(storeName: openedStoreName) { completed, total, batch in
-					await MainActor.run {
-						if !batch.isEmpty {
-							let batchPhotos = batch.map { PhotoItem(url: $0) }
-							library.photos.append(contentsOf: batchPhotos)
-							displayedPhotos.append(contentsOf: batchPhotos)
-							logger.log("sqlite ui: progress batch=\(batch.count, privacy: .public) completed=\(completed, privacy: .public) total=\(total, privacy: .public) displayed=\(displayedPhotos.count, privacy: .public)")
+				let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(
+					storeName: openedStoreName,
+					progress: { completed, total, batch in
+						guard !batch.isEmpty else { return }
+						await MainActor.run {
+							let photos = batch.map { PhotoItem(url: $0) }
+							library.photos = photos
+							displayedPhotos = photos
+							vaultProgressCompleted = completed
+							vaultProgressTotal = total
+							library.folderURL = nil
+							activeSQLiteStoreName = openedStoreName
+							activeFolderNames = ["\(openedStoreName) (SQLite)"]
+							isVaultWorking = false
+							vaultStoreTask = nil
+							sqliteLoadStartDate = nil
+							lastRefreshDate = Date()
+							forceThumbnailLoading = false
+							applyOpenedSQLiteStoreSort()
 						}
-						vaultProgressCompleted = completed
-						vaultProgressTotal = total
-						lastRefreshDate = Date()
-						forceThumbnailLoading = false
-					}
-				}
+					},
+					thumbnailProgress: thumbnailProgress
+				)
 				await MainActor.run {
 					let duration = Date().timeIntervalSince(sqliteOpenStart)
-					library.folderURL = nil
-					activeSQLiteStoreName = openedStoreName
-					activeFolderNames = ["\(openedStoreName) (SQLite)"]
-					isVaultWorking = false
-					vaultStoreTask = nil
-					sqliteLoadStartDate = nil
 					sqliteLastLoadDuration = duration
 					vaultProgressCompleted = urls.count
 					vaultProgressTotal = urls.count
-					lastRefreshDate = Date()
-					forceThumbnailLoading = false
-					scheduleSort()
 					logger.log("sqlite ui: open complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) objects=\(urls.count, privacy: .public) duration=\(duration, privacy: .public)")
 				}
-				Task.detached(priority: .utility) {
-					do {
-						let thumbnailStart = Date()
-						logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public)")
-						let count = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects { decoded, total in
-							await MainActor.run {
-								if isSQLiteObjectStoreView && activeSQLiteStoreName == openedStoreName && decoded > 0 {
-									refreshToken = UUID()
-									logger.log("sqlite ui: background thumbnail hydration progress filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) decoded=\(decoded, privacy: .public) total=\(total, privacy: .public)")
-								}
-							}
+				if await SQLiteObjectStore.shared.thumbnailsNeedHydration(storeName: openedStoreName) {
+					let thumbnailStart = Date()
+					logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) source=database-blob-batch")
+					let count = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects(
+						storeName: openedStoreName,
+						progress: thumbnailProgress
+					)
+					await MainActor.run {
+						let thumbnailDuration = Date().timeIntervalSince(thumbnailStart)
+						if isSQLiteObjectStoreView && SQLiteObjectStore.storeNamesMatch(activeSQLiteStoreName, openedStoreName) {
+							sqliteLastThumbnailLoadDuration = thumbnailDuration
 						}
-						await MainActor.run {
-							let thumbnailDuration = Date().timeIntervalSince(thumbnailStart)
-							if isSQLiteObjectStoreView && activeSQLiteStoreName == openedStoreName {
-								sqliteLastThumbnailLoadDuration = thumbnailDuration
-							}
-							logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
-						}
-					} catch {
-						logger.error("sqlite ui: background thumbnail hydration failed filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+						logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
 					}
+				} else {
+					logger.log("sqlite ui: background thumbnail hydration skipped filename=\(SQLiteObjectStore.databaseFilename(forStoreName: openedStoreName), privacy: .public)")
 				}
 			} catch {
 				await MainActor.run {
@@ -3750,8 +3956,14 @@ struct ContentView: View {
 		}
 
 		UserDefaults.standard.set(resolvedData, forKey: Self.kKnownFolderBookmarks)
-		bookmarkURLs = resolved
+		bookmarkURLs = Self.sortedBookmarkURLs(resolved)
 		FileNavigationMenuState.shared.reload()
+	}
+
+	private static func sortedBookmarkURLs(_ urls: [URL]) -> [URL] {
+		urls.sorted {
+			$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+		}
 	}
 
 	private func rememberKnownBookmarks(_ urls: [URL]) {
@@ -3787,7 +3999,11 @@ struct ContentView: View {
 			showVaultAlert = true
 			return
 		}
-		openWindow(id: "sqlite-store", value: trimmed)
+		let requestID = SQLiteStoreOpenRequestCoordinator.shared.requestOpen(storeName: trimmed)
+		openWindow(
+			id: "sqlite-store",
+			value: SQLiteObjectStore.openToken(storeName: trimmed, requestID: requestID)
+		)
 	}
 
 	private func restoreSavedGallerySession() {
@@ -4179,7 +4395,12 @@ struct ContentView: View {
 			do {
 				try await SQLiteObjectStore.shared.createDatabaseFile(url)
 				await MainActor.run {
-					openWindow(id: "sqlite-store", value: url.lastPathComponent)
+					let storeName = SQLiteObjectStore.configuredStoreName
+					let requestID = SQLiteStoreOpenRequestCoordinator.shared.requestOpen(storeName: storeName, fileURL: url)
+					openWindow(
+						id: "sqlite-store",
+						value: SQLiteObjectStore.openToken(storeName: storeName, requestID: requestID)
+					)
 				}
 			} catch {
 				await MainActor.run {
@@ -4206,10 +4427,124 @@ struct ContentView: View {
 	}
 
 	private func closeVault() {
+		handleTabCloseRequest()
+	}
+
+	private func handleTabCloseRequest() {
+		let operations = activeBackgroundOperationDescriptions()
+		if !operations.isEmpty {
+			let alert = NSAlert()
+			alert.messageText = "Background Operation in Progress"
+			alert.informativeText = """
+			This tab is still working on:
+
+			\(operations.map { "• \($0)" }.joined(separator: "\n"))
+
+			Close the tab and cancel these operations?
+			"""
+			alert.alertStyle = .warning
+			alert.addButton(withTitle: "Close Tab")
+			alert.addButton(withTitle: "Keep Working")
+			guard alert.runModal() == .alertFirstButtonReturn else { return }
+			cancelAllBackgroundOperations()
+		}
+		executeTabClose()
+	}
+
+	private func activeBackgroundOperationDescriptions() -> [String] {
+		var operations: [String] = []
+		if isVaultWorking {
+			let message = vaultProgressMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+			operations.append(message.isEmpty ? "Store operation" : message)
+		}
+		if library.isScanning {
+			operations.append("Scanning folder")
+		}
+		if isRefreshing {
+			operations.append("Refreshing thumbnails")
+		}
+		if isRescanningFaces {
+			operations.append("Rescanning faces")
+		}
+		if isPersonRecognitionWorking {
+			let message = personRecognitionProgressMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+			operations.append(message.isEmpty ? "Person recognition" : message)
+		}
+		if isOllamaRecognitionRunning {
+			operations.append("Ollama image recognition")
+		}
+		if isDeleting {
+			operations.append("Deleting files")
+		}
+		if isApplyingKeywords {
+			operations.append("Editing keywords")
+		}
+		if isApplyingRotations {
+			operations.append("Applying rotations")
+		}
+		if isApplyingBrightness {
+			operations.append("Adjusting brightness")
+		}
+		return operations
+	}
+
+	private func cancelAllBackgroundOperations() {
+		vaultStoreTask?.cancel()
+		vaultStoreTask = nil
+		folderScanTask?.cancel()
+		folderScanTask = nil
+		refreshTask?.cancel()
+		refreshTask = nil
+		isRefreshing = false
+		library.cancelScan()
+		personRecognitionTask?.cancel()
+		personRecognitionTask = nil
+		isPersonRecognitionWorking = false
+		isAssigningPerson = false
+		if isRescanningFaces {
+			FaceScanProgress.shared.cancel()
+		}
+		isRescanningFaces = false
+		ollamaRecognitionTask?.cancel()
+		ollamaRecognitionTask = nil
+		if isOllamaRecognitionRunning {
+			OllamaProgress.shared.cancel()
+		}
+		isOllamaRecognitionRunning = false
+		deleteTask?.cancel()
+		deleteTask = nil
+		isDeleting = false
+		deletingURLs = []
+		keywordEditTask?.cancel()
+		keywordEditTask = nil
+		isApplyingKeywords = false
+		rotationApplyTask?.cancel()
+		rotationApplyTask = nil
+		isApplyingRotations = false
+		brightnessApplyTask?.cancel()
+		brightnessApplyTask = nil
+		isApplyingBrightness = false
+		sortTask?.cancel()
+		sortTask = nil
+		metadataRefreshTask?.cancel()
+		metadataRefreshTask = nil
+		photoChangeTask?.cancel()
+		photoChangeTask = nil
+		pendingSQLiteFocusTask?.cancel()
+		pendingSQLiteFocusTask = nil
+		selectionAutoScrollTask?.cancel()
+		selectionAutoScrollTask = nil
+		isVaultWorking = false
+		vaultProgressMessage = ""
+		vaultProgressCompleted = 0
+		vaultProgressTotal = 0
+		vaultProgressCurrentFile = ""
+		sqliteLoadStartDate = nil
+	}
+
+	private func executeTabClose() {
 		if isSQLiteObjectStoreView {
 			let storeName = activeSQLiteStoreName ?? SQLiteObjectStore.configuredStoreName
-			vaultStoreTask?.cancel()
-			vaultStoreTask = nil
 			isVaultWorking = true
 			vaultProgressMessage = "Closing SQLite store \(SQLiteObjectStore.databaseFilename(forStoreName: storeName))..."
 			vaultProgressCompleted = 0
@@ -4225,6 +4560,7 @@ struct ContentView: View {
 				}
 
 				await MainActor.run {
+					SQLiteThumbnailRefreshCoordinator.shared.removeHandler(for: storeName)
 					WindowStateStore.shared.recordClosedSQLiteStore(named: storeName)
 					GalleryTabRegistry.shared.remove(id: tabID)
 					isVaultWorking = false
@@ -4246,9 +4582,12 @@ struct ContentView: View {
 			}
 			return
 		}
+
 		Task {
-			await PhotoVault.shared.lock()
-			await refreshVaultStatus()
+			if isActiveVaultView {
+				await PhotoVault.shared.lock()
+				await refreshVaultStatus()
+			}
 			await MainActor.run {
 				library.photos = []
 				displayedPhotos = []
@@ -4258,15 +4597,41 @@ struct ContentView: View {
 				forceThumbnailLoading = false
 				refreshToken = UUID()
 				isVaultWorking = false
+				closeCurrentGalleryTab()
 			}
 		}
 	}
 
 	private func closeCurrentGalleryTab() {
 		let window = hostingWindow ?? NSApp.keyWindow
+		if Self.shouldKeepGalleryWindowOpen(afterClosing: window) {
+			NSApp.activate(ignoringOtherApps: true)
+			window?.makeKeyAndOrderFront(nil)
+			if let window {
+				ContentView.mainGalleryWindow = window
+			}
+			return
+		}
+		GalleryTabCloseCoordinator.shared.isPerformingConfirmedClose = true
 		DispatchQueue.main.async {
 			window?.performClose(nil)
+			NSApp.activate(ignoringOtherApps: true)
 		}
+	}
+
+	@MainActor
+	private static func shouldKeepGalleryWindowOpen(afterClosing window: NSWindow?) -> Bool {
+		guard let window else { return false }
+		if let group = window.tabGroup {
+			let visibleTabs = group.windows.filter(\.isVisible)
+			if visibleTabs.count > 1 {
+				return false
+			}
+		}
+		let visibleGalleryWindows = NSApp.windows.filter {
+			$0.isVisible && $0.tabbingIdentifier == "PictureViewerGallery"
+		}
+		return visibleGalleryWindows.count <= 1
 	}
 
 	private func renameVault() {
@@ -4771,7 +5136,8 @@ struct ContentView: View {
 			// Multi-folder scan: clear existing photos and iteratively append
 			// batches discovered from each folder. Run as a background task
 			// and publish small batches to keep the UI responsive.
-			Task.detached(priority: .userInitiated) {
+			folderScanTask?.cancel()
+			folderScanTask = Task.detached(priority: .userInitiated) {
 				await MainActor.run {
 					library.photos = mediaFiles.map { PhotoItem(url: $0) }
 					library.folderURL = scanTargets.first
@@ -4842,7 +5208,8 @@ struct ContentView: View {
 		guard refreshFolderURL != nil || isSQLiteObjectStoreView || isActiveVaultView else { return }
 		isRefreshing = true
 		let start = Date()
-		Task {
+		refreshTask?.cancel()
+		refreshTask = Task {
 			let clear = Task.detached(priority: .userInitiated) {
 				ThumbnailCache.shared.clear()
 			}
@@ -4918,34 +5285,36 @@ struct ContentView: View {
 		}
 		do {
 			logger.log("sqlite ui: refresh begin filename=\(databaseFilename, privacy: .public) forceThumbnailReload=\(forceThumbnailReload, privacy: .public)")
-			let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(storeName: storeName) { completed, total, batch in
-				await MainActor.run {
-					if !batch.isEmpty {
-						let batchPhotos = batch.map { PhotoItem(url: $0) }
-						library.photos.append(contentsOf: batchPhotos)
-						displayedPhotos.append(contentsOf: batchPhotos)
-						logger.log("sqlite ui: refresh progress batch=\(batch.count, privacy: .public) completed=\(completed, privacy: .public) total=\(total, privacy: .public) displayed=\(displayedPhotos.count, privacy: .public)")
-					}
-					vaultProgressCompleted = completed
-					vaultProgressTotal = total
-					lastRefreshDate = Date()
-					forceThumbnailLoading = forceThumbnailReload
-				}
+			await MainActor.run {
+				registerSQLiteThumbnailRefreshHandler(for: storeName)
 			}
+			let thumbnailProgress = SQLiteThumbnailRefreshSupport.progressHandler(for: storeName)
+			let urls = try await SQLiteObjectStore.shared.loadObjectWorkingFiles(
+				storeName: storeName,
+				progress: { completed, total, batch in
+					guard !batch.isEmpty else { return }
+					await MainActor.run {
+						let photos = batch.map { PhotoItem(url: $0) }
+						library.photos = photos
+						displayedPhotos = photos
+						vaultProgressCompleted = completed
+						vaultProgressTotal = total
+						isVaultWorking = false
+						vaultStoreTask = nil
+						sqliteLoadStartDate = nil
+						lastRefreshDate = Date()
+						forceThumbnailLoading = forceThumbnailReload
+						applyOpenedSQLiteStoreSort()
+					}
+				},
+				thumbnailProgress: thumbnailProgress
+			)
 			await MainActor.run {
 				let duration = Date().timeIntervalSince(start)
-				library.folderURL = nil
-				activeSQLiteStoreName = storeName
-				activeFolderNames = ["\(storeName) (SQLite)"]
-				isVaultWorking = false
-				vaultStoreTask = nil
-				sqliteLoadStartDate = nil
 				sqliteLastLoadDuration = duration
+				lastRefreshDuration = duration
 				vaultProgressCompleted = urls.count
 				vaultProgressTotal = urls.count
-				lastRefreshDate = Date()
-				lastRefreshDuration = duration
-				forceThumbnailLoading = forceThumbnailReload
 				if forceThumbnailReload {
 					refreshToken = UUID()
 				}
@@ -4954,33 +5323,22 @@ struct ContentView: View {
 				} else {
 					clearSelection()
 				}
-				scheduleSort()
 				focusPendingSQLiteObjectIfPossible()
 				logger.log("sqlite ui: refresh complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public) objects=\(urls.count, privacy: .public) duration=\(duration, privacy: .public)")
 			}
-			if !forceThumbnailReload {
-				Task.detached(priority: .utility) {
-					do {
-						let thumbnailStart = Date()
-						logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public)")
-						let count = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects { decoded, total in
-							await MainActor.run {
-								if isSQLiteObjectStoreView && activeSQLiteStoreName == storeName && decoded > 0 {
-									refreshToken = UUID()
-									logger.log("sqlite ui: background thumbnail hydration progress filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public) decoded=\(decoded, privacy: .public) total=\(total, privacy: .public)")
-								}
-							}
-						}
-						await MainActor.run {
-							let thumbnailDuration = Date().timeIntervalSince(thumbnailStart)
-							if isSQLiteObjectStoreView && activeSQLiteStoreName == storeName {
-								sqliteLastThumbnailLoadDuration = thumbnailDuration
-							}
-							logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
-						}
-					} catch {
-						logger.error("sqlite ui: background thumbnail hydration failed filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			if !forceThumbnailReload, await SQLiteObjectStore.shared.thumbnailsNeedHydration(storeName: storeName) {
+				let thumbnailStart = Date()
+				logger.log("sqlite ui: background thumbnail hydration begin filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public)")
+				let count = try await SQLiteObjectStore.shared.hydrateStoredThumbnailsForLoadedObjects(
+					storeName: storeName,
+					progress: thumbnailProgress
+				)
+				await MainActor.run {
+					let thumbnailDuration = Date().timeIntervalSince(thumbnailStart)
+					if isSQLiteObjectStoreView && activeSQLiteStoreName == storeName {
+						sqliteLastThumbnailLoadDuration = thumbnailDuration
 					}
+					logger.log("sqlite ui: background thumbnail hydration complete filename=\(SQLiteObjectStore.databaseFilename(forStoreName: storeName), privacy: .public) thumbnails=\(count, privacy: .public) duration=\(thumbnailDuration, privacy: .public)")
 				}
 			}
 		} catch {
@@ -5021,7 +5379,8 @@ struct ContentView: View {
 		isDeleting = true
 		deletingURLs = urls
 		logger.log("performDelete: attempting permanent delete of \(urls.count) items")
-		Task.detached(priority: .utility) {
+		deleteTask?.cancel()
+		deleteTask = Task.detached(priority: .utility) {
 			let fm = FileManager.default
 			for u in urls {
 				if Task.isCancelled { break }
@@ -5104,7 +5463,8 @@ struct ContentView: View {
 		isDeleting = true
 		deletingURLs = urls
 		logger.log("performSQLiteDelete: removing \(urls.count) records from SQLite store")
-		Task.detached(priority: .utility) {
+		deleteTask?.cancel()
+		deleteTask = Task.detached(priority: .utility) {
 			var deletedURLs: Set<URL> = []
 			var failureMessage: String? = nil
 			do {
@@ -5179,6 +5539,18 @@ struct ContentView: View {
 				scheduleSort()
 			}
 		}
+	}
+
+	private func applyOpenedSQLiteStoreSort() {
+		let filter = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+		if filter.isEmpty, activeSortMode == .alphaAsc {
+			displayedPhotos = library.photos
+			displayedPhotoSections = shouldGroupGridByDescription
+				? buildQuickPhotoSections(from: library.photos, sortMode: activeSortMode)
+				: []
+			return
+		}
+		scheduleSort()
 	}
 
 	private func scheduleSort() {

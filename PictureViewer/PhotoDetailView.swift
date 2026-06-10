@@ -168,9 +168,7 @@ struct FullScreenPhotoView: View {
 								.foregroundStyle(.secondary)
 						}
 					} else {
-						ProgressView()
-							.controlSize(.large)
-							.tint(.white)
+						mediaLoadingPlaceholder
 					}
 				} else if let player {
 					NativeVideoPlayerView(player: player)
@@ -186,9 +184,7 @@ struct FullScreenPhotoView: View {
 							.foregroundStyle(.secondary)
 					}
 				} else {
-					ProgressView()
-						.controlSize(.large)
-						.tint(.white)
+					mediaLoadingPlaceholder
 				}
 			} else if let image {
 				Image(nsImage: image)
@@ -208,9 +204,7 @@ struct FullScreenPhotoView: View {
 						.foregroundStyle(.secondary)
 				}
 			} else {
-				ProgressView()
-					.controlSize(.large)
-					.tint(.white)
+				mediaLoadingPlaceholder
 			}
 		}
 		.background(WindowAccessor { window in
@@ -302,6 +296,21 @@ struct FullScreenPhotoView: View {
 
 	private var hasPendingEdits: Bool {
 		rotationDegrees % 360 != 0 || abs(brightnessAdjustment) >= 0.001 || abs(contrastAdjustment - 1) >= 0.001
+	}
+
+	@ViewBuilder
+	private var mediaLoadingPlaceholder: some View {
+		ZStack {
+			if let image {
+				Image(nsImage: image)
+					.resizable()
+					.scaledToFit()
+					.opacity(0.9)
+			}
+			ProgressView()
+				.controlSize(.large)
+				.tint(.white)
+		}
 	}
 
 	private var embeddedVLCControlBar: some View {
@@ -433,19 +442,30 @@ struct FullScreenPhotoView: View {
 	}
 
 	private func loadMedia() async {
+		stopPlayback()
 		image = nil
-		player?.pause()
-		player = nil
 		materializedURL = nil
 		loadFailed = false
 		let target = currentURL
+
+		// Show a cached thumbnail immediately so the viewer feels responsive
+		// while the full-resolution image or video is prepared.
+		if let placeholder = await cachedPlaceholder(for: target) {
+			image = placeholder
+		}
+
 		_ = SecurityScopedResourceAccess.ensureAccess(for: target)
+
 		let readableURL: URL
-		do {
-			readableURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(target)
-		} catch {
-			loadFailed = true
-			return
+		if SQLiteObjectStore.needsMaterialization(target) {
+			do {
+				readableURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(target)
+			} catch {
+				loadFailed = image == nil
+				return
+			}
+		} else {
+			readableURL = target
 		}
 		if Task.isCancelled { return }
 		materializedURL = readableURL
@@ -454,7 +474,7 @@ struct FullScreenPhotoView: View {
 				return
 			}
 			if PhotoLibrary.requiresExternalVideoPlayer(readableURL) {
-				loadFailed = true
+				loadFailed = image == nil
 				return
 			}
 			let nextPlayer = AVPlayer(url: readableURL)
@@ -468,9 +488,25 @@ struct FullScreenPhotoView: View {
 		if Task.isCancelled { return }
 		if let loaded {
 			image = loaded
-		} else {
+		} else if image == nil {
 			loadFailed = true
 		}
+	}
+
+	private func cachedPlaceholder(for url: URL) async -> NSImage? {
+		if let memory = ThumbnailCache.shared.memoryImage(for: url) {
+			return memory
+		}
+		let disk = await Task.detached(priority: .userInitiated) {
+			ThumbnailCache.shared.image(for: url)
+		}.value
+		if let disk {
+			return disk
+		}
+		if let jpegData = SQLiteObjectStore.shared.cachedThumbnailJPEGData(for: url) {
+			return NSImage(data: jpegData)
+		}
+		return nil
 	}
 
 	private func rotateLeft() {

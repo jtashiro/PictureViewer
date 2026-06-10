@@ -162,19 +162,19 @@ struct PictureViewerApp: App {
 		.windowStyle(.automatic)
 		.windowResizability(.contentSize)
 
-		WindowGroup(id: "sqlite-store", for: String.self) { $storeName in
+		WindowGroup(id: "sqlite-store", for: String.self) { $openToken in
 			if requirePasswordAtLaunch {
 				if authManager.isAuthenticated {
-					if let storeName {
-						ContentView(initialSQLiteStoreName: storeName)
+					if let openToken {
+						ContentView(initialSQLiteOpenToken: openToken)
 							.environmentObject(authManager)
 					}
 				} else {
 					EmptyView()
 				}
 			} else {
-				if let storeName {
-					ContentView(initialSQLiteStoreName: storeName)
+				if let openToken {
+					ContentView(initialSQLiteOpenToken: openToken)
 						.environmentObject(authManager)
 				}
 			}
@@ -182,11 +182,8 @@ struct PictureViewerApp: App {
 		.windowStyle(.automatic)
 		.windowResizability(.contentSize)
 
-		// Dedicated People window so users can open the People browser in a
-		// separate window rather than a sheet. Use Bool as the value type so
-		// it conforms to the required protocols; callers can pass `true` when
-		// opening the window.
-		WindowGroup(id: "people", for: Bool.self) { _ in
+		// Single People window — repeated open requests focus the existing one.
+		Window("People", id: "people") {
 			PeopleView()
 		}
 		.windowResizability(.contentSize)
@@ -205,6 +202,30 @@ struct PictureViewerApp: App {
 				SettingsView()
 			}
 		}
+	}
+}
+
+@MainActor
+enum PeopleWindowPresenter {
+	static let windowIdentifier = NSUserInterfaceItemIdentifier("people-window")
+
+	static func show(using openWindow: OpenWindowAction) {
+		if focusExistingWindow() { return }
+		openWindow(id: "people")
+	}
+
+	@discardableResult
+	static func focusExistingWindow() -> Bool {
+		let peopleWindows = NSApp.windows.filter {
+			$0.identifier == windowIdentifier || $0.title == "People"
+		}
+		guard let window = peopleWindows.first else { return false }
+		if window.isMiniaturized {
+			window.deminiaturize(nil)
+		}
+		window.makeKeyAndOrderFront(nil)
+		NSApp.activate(ignoringOtherApps: true)
+		return true
 	}
 }
 
@@ -337,28 +358,28 @@ struct VaultFileCommands: Commands {
 			.disabled(vaultActions == nil)
 
 			Menu("Open Recent") {
-				if fileNavigation.recentFolders.isEmpty {
-					Text("No Recent Folders")
-				} else {
-					ForEach(fileNavigation.recentFolders) { entry in
-						Button(entry.title) {
-							openFolderEntry(entry)
-						}
+				ForEach(fileNavigation.recentFolders) { entry in
+					Button(entry.title) {
+						openFolderEntry(entry)
 					}
+				}
+				if fileNavigation.recentFolders.isEmpty {
+					Button("No Recent Folders") {}
+						.disabled(true)
 				}
 			}
 
 			Menu("Bookmarks") {
-				if fileNavigation.bookmarks.isEmpty {
-					Text("No Bookmarks")
-				} else {
-					ForEach(fileNavigation.bookmarks) { entry in
-						Button(entry.title) {
-							openFolderEntry(entry)
-						}
+				ForEach(fileNavigation.bookmarks) { entry in
+					Button(entry.title) {
+						openFolderEntry(entry)
 					}
-					Divider()
 				}
+				if fileNavigation.bookmarks.isEmpty {
+					Button("No Bookmarks") {}
+						.disabled(true)
+				}
+				Divider()
 				Button("Manage Bookmarks…") {
 					fileNavigationActions?.showBookmarkManager()
 				}
@@ -366,20 +387,20 @@ struct VaultFileCommands: Commands {
 			}
 
 			Menu("Open Session") {
-				if fileNavigation.sessionEntries.isEmpty {
-					Text("No Saved Session")
-				} else {
-					ForEach(fileNavigation.sessionEntries) { entry in
-						Button(entry.title) {
-							openSessionEntry(entry)
-						}
+				ForEach(fileNavigation.sessionEntries) { entry in
+					Button(entry.title) {
+						openSessionEntry(entry)
 					}
-					Divider()
-					Button("Restore Gallery Session") {
-						fileNavigationActions?.restoreSavedGallerySession()
-					}
-					.disabled(fileNavigationActions == nil)
 				}
+				if fileNavigation.sessionEntries.isEmpty {
+					Button("No Saved Session") {}
+						.disabled(true)
+				}
+				Divider()
+				Button("Restore Gallery Session") {
+					fileNavigationActions?.restoreSavedGallerySession()
+				}
+				.disabled(fileNavigation.sessionEntries.isEmpty || fileNavigationActions == nil)
 			}
 
 			Divider()
@@ -412,7 +433,7 @@ struct VaultFileCommands: Commands {
 			}
 			.disabled(vaultActions?.canImportSelected != true)
 
-			Button(vaultActions?.canImportSelected == true ? "Export Selected Photos…" : "Export Displayed Photos…") {
+			Button("Export Photos…") {
 				vaultActions?.exportPhotos()
 			}
 			.disabled(vaultActions?.canExport != true)
@@ -433,6 +454,11 @@ struct VaultFileCommands: Commands {
 				vaultActions?.syncSelectedToSQLiteStore()
 			}
 			.disabled(vaultActions?.canSyncSelectedToSQLiteStore != true)
+
+			Button("Backfill Missing SQLite Thumbnails…") {
+				vaultActions?.backfillSQLiteThumbnails()
+			}
+			.disabled(vaultActions?.canBackfillSQLiteThumbnails != true)
 
 			Divider()
 
@@ -486,7 +512,11 @@ struct VaultFileCommands: Commands {
 			if let actions = fileNavigationActions {
 				actions.openSQLiteStore(storeName)
 			} else {
-				openWindow(id: "sqlite-store", value: storeName)
+				let requestID = SQLiteStoreOpenRequestCoordinator.shared.requestOpen(storeName: storeName)
+				openWindow(
+					id: "sqlite-store",
+					value: SQLiteObjectStore.openToken(storeName: storeName, requestID: requestID)
+				)
 			}
 		case .photo(let url):
 			if let actions = fileNavigationActions {

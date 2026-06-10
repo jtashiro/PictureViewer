@@ -27,7 +27,29 @@ enum SecurityScopedResourceAccess {
 			return true
 		}
 
-		return false
+		return isWritableWithoutSecurityScope(standardizedURL)
+	}
+
+	nonisolated private static func isWritableWithoutSecurityScope(_ url: URL) -> Bool {
+		let fm = FileManager.default
+		let directory = writableDirectory(containing: url)
+		do {
+			try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+			return fm.isWritableFile(atPath: directory.path)
+		} catch {
+			logger.error("security scope: path is not writable path=\(directory.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			return false
+		}
+	}
+
+	nonisolated private static func writableDirectory(containing url: URL) -> URL {
+		let fm = FileManager.default
+		var isDirectory: ObjCBool = false
+		let path = url.standardizedFileURL.path
+		if fm.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+			return url.standardizedFileURL
+		}
+		return url.deletingLastPathComponent().standardizedFileURL
 	}
 
 	nonisolated private static func startAccessing(_ url: URL) -> Bool {
@@ -43,6 +65,8 @@ enum SecurityScopedResourceAccess {
 	nonisolated private static func resolvePersistedBookmark(for url: URL) -> Bool {
 		let bookmarkLists = [
 			UserDefaults.standard.data(forKey: AppWorkingDirectory.directoryBookmarkKey).map { [$0] },
+			UserDefaults.standard.data(forKey: SQLiteObjectStore.databaseBookmarkKey).map { [$0] },
+			UserDefaults.standard.data(forKey: SQLiteObjectStore.directoryBookmarkKey).map { [$0] },
 			UserDefaults.standard.array(forKey: "lastFolderBookmarks") as? [Data],
 			UserDefaults.standard.data(forKey: "lastFolderBookmark").map { [$0] }
 		]

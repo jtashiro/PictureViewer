@@ -21,6 +21,7 @@ struct StatusBarView: View {
 	let lastRefreshDate: Date?
 	let lastRefreshDuration: TimeInterval?
 	let onRefreshThumbnails: () -> Void
+	let onBackfillSQLiteThumbnails: (() -> Void)?
 
 	var body: some View {
 		VStack(spacing: 0) {
@@ -42,6 +43,14 @@ struct StatusBarView: View {
 					.disabled(ollamaProgress.isCancelling)
 					.help(ollamaProgress.isCancelling ? "Cancelling…" : "Cancel Ollama recognition")
 				} else {
+					if let onBackfillSQLiteThumbnails, isSQLiteObjectStoreView {
+						Button(action: onBackfillSQLiteThumbnails) {
+							Label("Backfill Thumbnails", systemImage: "photo.badge.plus")
+						}
+						.controlSize(.small)
+						.help("Generate and store missing thumbnail images in the SQLite database")
+						.disabled(library.photos.isEmpty || isRefreshing || isVaultWorking)
+					}
 					Button(action: onRefreshThumbnails) {
 						Label("Refresh Thumbnails", systemImage: "arrow.clockwise")
 					}

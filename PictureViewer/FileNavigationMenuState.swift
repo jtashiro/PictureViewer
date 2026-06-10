@@ -105,6 +105,9 @@ final class FileNavigationMenuState: ObservableObject {
 				logger.error("file navigation: failed to resolve bookmark error=\(error.localizedDescription, privacy: .public)")
 			}
 		}
+		entries.sort {
+			$0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+		}
 		return entries
 	}
 

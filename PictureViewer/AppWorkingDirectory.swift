@@ -67,7 +67,17 @@ enum AppWorkingDirectory {
     /// including user-chosen folders on external volumes.
     @discardableResult
     nonisolated static func ensureAccess() -> Bool {
-        SecurityScopedResourceAccess.ensureAccess(for: baseURL)
+        let directory = baseURL
+        if SecurityScopedResourceAccess.ensureAccess(for: directory) {
+            return true
+        }
+        do {
+            try ensureDirectory(directory)
+            return FileManager.default.isWritableFile(atPath: directory.path)
+        } catch {
+            logger.error("working directory: ensureAccess failed path=\(directory.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return false
+        }
     }
 
     nonisolated static func sqliteObjectStoreURL() -> URL {

@@ -118,10 +118,32 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 		}
 	}
 
+	/// Stores pre-encoded JPEG bytes without re-encoding. Used when loading
+	/// thumbnails from the SQLite object store.
+	func storeJPEGData(_ data: Data, for url: URL, namespace: String? = nil) {
+		guard !data.isEmpty else { return }
+		let key = self.key(for: url, namespace: namespace)
+		if let image = NSImage(data: data) {
+			memCache.setObject(image, forKey: key as NSString, cost: cost(of: image))
+			pin(image, forKey: key, source: url)
+		}
+		let file = cacheFile(forKey: key)
+		writeQueue.async {
+			try? data.write(to: file, options: .atomic)
+		}
+	}
+
 	func jpegData(for url: URL, namespace: String? = nil) -> Data? {
 		guard let image = image(for: url, namespace: namespace) ?? memoryImage(for: url, namespace: namespace) else {
 			return nil
 		}
+		return Self.jpegData(from: image)
+	}
+
+	/// Fast memory-only JPEG lookup for background sync paths. Never decodes
+	/// thumbnails from disk or generates new previews.
+	func cachedJPEGData(for url: URL, namespace: String? = nil) -> Data? {
+		guard let image = memoryImage(for: url, namespace: namespace) else { return nil }
 		return Self.jpegData(from: image)
 	}
 
@@ -243,6 +265,11 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 	}
 
 	private func isFresh(cache: URL, source: URL) -> Bool {
+		// SQLite lazy working copies (and other virtual URLs) have no on-disk
+		// source file. Trust a cached JPEG when one exists.
+		if !FileManager.default.fileExists(atPath: source.path) {
+			return true
+		}
 		guard
 			let cv = try? cache.resourceValues(forKeys: [.contentModificationDateKey]),
 			let sv = try? source.resourceValues(forKeys: [.contentModificationDateKey]),

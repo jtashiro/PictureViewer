@@ -103,6 +103,22 @@ nonisolated final class MetadataCache: @unchecked Sendable {
 		return d
 	}
 
+	func seedDescription(_ description: String?, for url: URL) {
+		let key = url.path
+		cacheQueue.async(flags: .barrier) { [weak self] in
+			self?.descriptionCache[key] = description
+		}
+	}
+
+	func seedDescriptions(_ entries: [(URL, String?)]) {
+		cacheQueue.async(flags: .barrier) { [weak self] in
+			guard let self else { return }
+			for (url, description) in entries {
+				self.descriptionCache[url.path] = description
+			}
+		}
+	}
+
 	/// Returns a cached DESCRIPTION / person name when available.
 	func cachedDescription(for url: URL) -> String? {
 		let key = url.path

@@ -94,6 +94,13 @@ final class PhotoLibrary: ObservableObject {
 		return "\(info.activeProcessorCount) of \(info.processorCount) cores active · \(workerCount) scanner threads"
 	}
 
+	func cancelScan() {
+		currentScan?.cancel()
+		currentScan = nil
+		isScanning = false
+		scanStartDate = nil
+	}
+
 	func scan(folder: URL) {
 		Self.logger.log("scan:start folder=\(folder.path, privacy: .public)")
 		// Ensure we have a security-scoped access to the folder while

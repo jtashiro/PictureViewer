@@ -10,7 +10,7 @@ import ImageIO
 import os
 import UniformTypeIdentifiers
 
-private let thumbViewLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-view")
+private nonisolated let thumbViewLogger = Logger(subsystem: "com.example.PictureViewer", category: "thumbnail-view")
 
 struct ThumbnailView: View {
 	let url: URL
@@ -158,7 +158,26 @@ struct ThumbnailView: View {
 		}
 		if let cached = await cacheLookup.value {
 			if Task.isCancelled { return }
+			thumbViewLogger.log("ThumbnailView: source=thumbnail-cache filename=\(target.lastPathComponent, privacy: .public)")
 			image = cached
+			return
+		}
+
+		// SQLite lazy working copies may not exist on disk yet. Prefer the
+		// thumbnail BLOB stored in the object database over on-the-fly generation.
+		if SQLiteObjectStore.isWorkingCopyURL(target),
+		   !FileManager.default.fileExists(atPath: target.path) {
+			if await SQLiteObjectStore.shared.shouldDeferIndividualThumbnailLookup(for: target) {
+				return
+			}
+			guard let storedData = await SQLiteObjectStore.shared.thumbnailJPEGData(forWorkingFile: target),
+			      let storedImage = ThumbnailCache.image(fromJPEGData: storedData) else {
+				return
+			}
+			if Task.isCancelled { return }
+			thumbViewLogger.log("ThumbnailView: source=database-blob filename=\(target.lastPathComponent, privacy: .public) bytes=\(storedData.count, privacy: .public)")
+			ThumbnailCache.shared.storeJPEGData(storedData, for: target, namespace: namespace)
+			image = storedImage
 			return
 		}
 
@@ -207,6 +226,7 @@ struct ThumbnailView: View {
 					thumbnailSource = target
 				}
 				let nsImage = try await ThumbnailGenerator.shared.generateThumbnail(for: thumbnailSource)
+				thumbViewLogger.log("ThumbnailView: source=generated filename=\(target.lastPathComponent, privacy: .public) materialized=\(thumbnailSource != target, privacy: .public)")
 				// Store to cache (mem+disk) off the main actor.
 				ThumbnailCache.shared.store(nsImage, for: target, namespace: namespace)
 				if SQLiteObjectStore.isWorkingCopyURL(target),
