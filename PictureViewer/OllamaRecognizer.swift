@@ -144,16 +144,12 @@ actor OllamaRecognizer {
 			await MainActor.run {
 				OllamaProgress.shared.update(completed: index, currentFilename: filename)
 			}
-			// Materialize lazy SQLite working copies once per item, around the full
-			// recognize + onRecognized lifecycle. onRecognized typically writes
-			// keywords back to the file, which itself needs the file on disk, so
-			// the cleanup has to wait for the callback to finish.
-			let materializedForScan: Bool
+			// Materialize lazy SQLite working copies on demand so Ollama (and any
+			// `onRecognized` callback like writeKeywords) can read them from disk.
 			let readableURL: URL
 			if SQLiteObjectStore.needsMaterialization(url) {
 				do {
 					readableURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
-					materializedForScan = true
 				} catch {
 					logger.error("ollama:materialize-failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 					await MainActor.run {
@@ -163,7 +159,6 @@ actor OllamaRecognizer {
 				}
 			} else {
 				readableURL = url
-				materializedForScan = false
 			}
 			var cancelled = false
 			do {
@@ -179,7 +174,11 @@ actor OllamaRecognizer {
 			} catch {
 				logger.error("ollama:failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 			}
-			if materializedForScan, FileManager.default.fileExists(atPath: readableURL.path) {
+			// Always clean up lazy SQLite working copies after recognition —
+			// canonical bytes live in the .sqlite database and can be re-materialized
+			// on demand, so the working dir doesn't need to accumulate them.
+			if SQLiteObjectStore.isWorkingCopyURL(url),
+			   FileManager.default.fileExists(atPath: readableURL.path) {
 				try? FileManager.default.removeItem(at: readableURL)
 			}
 			if cancelled {

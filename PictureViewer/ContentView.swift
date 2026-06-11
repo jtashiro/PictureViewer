@@ -6220,6 +6220,9 @@ struct ContentView: View {
 			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
 			if SQLiteObjectStore.isWorkingCopyURL(url) {
 				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
+				// Bytes are safely re-stored in the .sqlite database, so the
+				// materialized working copy doesn't need to persist on disk.
+				try? fm.removeItem(at: targetURL)
 			}
 			return true
 		} catch {
@@ -6339,6 +6342,9 @@ struct ContentView: View {
 			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
 			if SQLiteObjectStore.isWorkingCopyURL(url) {
 				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
+				// Bytes are safely re-stored in the .sqlite database, so the
+				// materialized working copy doesn't need to persist on disk.
+				try? fm.removeItem(at: targetURL)
 			}
 			return true
 		} catch {
