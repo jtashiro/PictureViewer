@@ -75,7 +75,10 @@ actor OllamaRecognizer {
 
 	/// Sends `url` to Ollama and returns the recognition text, or throws.
 	/// The caller is responsible for skipping non-image files; this method
-	/// will throw if the URL can't be decoded as an image.
+	/// will throw if the URL can't be decoded as an image. The URL must point
+	/// to an on-disk file — batch callers should use `recognizeAndLog`, which
+	/// materializes lazy SQLite working copies on demand and removes them
+	/// after the post-recognition callback completes.
 	func recognize(imageURL url: URL, prompt: String, model: String) async throws -> String {
 		try Task.checkCancellation()
 		guard let base64 = Self.encodedImageData(for: url) else {
@@ -141,8 +144,30 @@ actor OllamaRecognizer {
 			await MainActor.run {
 				OllamaProgress.shared.update(completed: index, currentFilename: filename)
 			}
+			// Materialize lazy SQLite working copies once per item, around the full
+			// recognize + onRecognized lifecycle. onRecognized typically writes
+			// keywords back to the file, which itself needs the file on disk, so
+			// the cleanup has to wait for the callback to finish.
+			let materializedForScan: Bool
+			let readableURL: URL
+			if SQLiteObjectStore.needsMaterialization(url) {
+				do {
+					readableURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
+					materializedForScan = true
+				} catch {
+					logger.error("ollama:materialize-failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+					await MainActor.run {
+						OllamaProgress.shared.update(completed: index + 1, currentFilename: filename)
+					}
+					continue
+				}
+			} else {
+				readableURL = url
+				materializedForScan = false
+			}
+			var cancelled = false
 			do {
-				let text = try await recognize(imageURL: url, prompt: effectivePrompt, model: effectiveModel)
+				let text = try await recognize(imageURL: readableURL, prompt: effectivePrompt, model: effectiveModel)
 				logger.log("ollama:recognized \(position, privacy: .public) \(filename, privacy: .public) — \(text, privacy: .public)")
 				success += 1
 				if let onRecognized {
@@ -150,9 +175,15 @@ actor OllamaRecognizer {
 				}
 			} catch is CancellationError {
 				logger.log("ollama:batch cancelled at=\(position, privacy: .public) \(filename, privacy: .public)")
-				break
+				cancelled = true
 			} catch {
 				logger.error("ollama:failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
+			if materializedForScan, FileManager.default.fileExists(atPath: readableURL.path) {
+				try? FileManager.default.removeItem(at: readableURL)
+			}
+			if cancelled {
+				break
 			}
 			await MainActor.run {
 				OllamaProgress.shared.update(completed: index + 1, currentFilename: filename)

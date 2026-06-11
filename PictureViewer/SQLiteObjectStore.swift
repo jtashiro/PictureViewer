@@ -2686,18 +2686,12 @@ actor SQLiteObjectStore {
         databaseURL: URL
     ) throws {
         _ = databaseURL
-        let pragmaLogger = Logger(subsystem: "com.example.PictureViewer", category: "sqlite-object-store")
         // Always WAL: toggling journal_mode (especially MEMORY ↔ WAL) on a connection
         // that inherits a stale -wal sidecar forces a full WAL checkpoint, which is
         // catastrophically slow on external/USB volumes. Sticking with WAL means the
         // pragma is a no-op once the DB is established.
-        let walStart = Date()
-        pragmaLogger.log("sqlite object store: pragma begin command=\"PRAGMA journal_mode=WAL;\"")
         try exec("PRAGMA journal_mode=WAL;", in: db)
-        pragmaLogger.log("sqlite object store: pragma complete command=\"PRAGMA journal_mode=WAL;\" elapsed=\(Date().timeIntervalSince(walStart), privacy: .public)")
-        pragmaLogger.log("sqlite object store: pragma begin command=\"PRAGMA synchronous=NORMAL;\"")
         try exec("PRAGMA synchronous=NORMAL;", in: db)
-        pragmaLogger.log("sqlite object store: pragma complete command=\"PRAGMA synchronous=NORMAL;\"")
     }
 
     private func persistDirectoryReference(for directory: URL) throws {
