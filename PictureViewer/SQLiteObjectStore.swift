@@ -934,6 +934,104 @@ actor SQLiteObjectStore {
         }
     }
 
+    /// Ingests legacy `ExternalBlobs/{hash}.bin` sidecar files into the new chunked
+    /// storage table so the .sqlite database is fully self-contained for backup.
+    /// Safe to run more than once; rows already chunked are skipped.
+    @discardableResult
+    func migrateExternalBlobsToChunks(
+        storeName: String? = nil,
+        progress: (@Sendable (_ completed: Int, _ total: Int) async -> Void)? = nil
+    ) async throws -> (migrated: Int, skipped: Int) {
+        guard Self.isEnabled else { return (0, 0) }
+        let dbURL = try resolvedDatabaseURL(storeName: storeName)
+        try ensureWritableDatabaseAccess(for: dbURL)
+        let migrationStart = Date()
+        var migrated = 0
+        var skipped = 0
+        var deletedFiles: [URL] = []
+
+        try await withDatabase(at: dbURL, flags: SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX) { db in
+            try Self.createSchema(in: db)
+
+            // Rows whose payload lives in the legacy ExternalBlobs sidecar are
+            // identified by an empty inline blob, a non-empty content hash, and
+            // no rows already in object_blob_chunks.
+            let sql = """
+            SELECT id, content_hash FROM objects
+            WHERE LENGTH(blob_data) = 0
+              AND content_hash IS NOT NULL
+              AND content_hash != ''
+              AND NOT EXISTS (
+                SELECT 1 FROM object_blob_chunks WHERE object_id = objects.id
+              );
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                throw SQLiteObjectStoreError.databaseReadFailed
+            }
+            var rows: [(id: Int64, contentHash: String)] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = sqlite3_column_int64(stmt, 0)
+                let hash = Self.columnText(stmt, 1) ?? ""
+                if !hash.isEmpty {
+                    rows.append((id, hash))
+                }
+            }
+            sqlite3_finalize(stmt)
+
+            self.logger.log("sqlite object store: external blob migration begin total=\(rows.count, privacy: .public)")
+            let total = rows.count
+            for (idx, row) in rows.enumerated() {
+                try Task.checkCancellation()
+                let relativePath = Self.externalBlobRelativePath(contentHash: row.contentHash)
+                let externalURL = Self.externalBlobFileURL(relativePath: relativePath, databaseURL: dbURL)
+                guard FileManager.default.fileExists(atPath: externalURL.path) else {
+                    skipped += 1
+                    self.logger.log("sqlite object store: external blob migration skipped missing file objectID=\(row.id, privacy: .public) path=\(relativePath, privacy: .public)")
+                    continue
+                }
+                let filename = externalURL.lastPathComponent
+                try Self.exec("BEGIN IMMEDIATE TRANSACTION;", in: db)
+                do {
+                    try Self.writeChunkedBlobFromFile(
+                        sourceURL: externalURL,
+                        objectID: row.id,
+                        db: db,
+                        filename: filename,
+                        shouldEncrypt: false,
+                        keyData: nil
+                    )
+                    try Self.exec("COMMIT;", in: db)
+                } catch {
+                    try? Self.exec("ROLLBACK;", in: db)
+                    self.logger.error("sqlite object store: external blob migration failed objectID=\(row.id, privacy: .public) path=\(relativePath, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                    throw error
+                }
+                deletedFiles.append(externalURL)
+                migrated += 1
+                if let progress {
+                    await progress(idx + 1, total)
+                }
+            }
+        }
+
+        // Only remove sidecar files after the chunked write transactions committed.
+        for url in deletedFiles {
+            try? FileManager.default.removeItem(at: url)
+        }
+        // If ExternalBlobs/ is now empty, clear the directory itself.
+        if let firstFile = deletedFiles.first {
+            let dir = firstFile.deletingLastPathComponent()
+            if let contents = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
+               contents.isEmpty {
+                try? FileManager.default.removeItem(at: dir)
+            }
+        }
+
+        logger.log("sqlite object store: external blob migration complete migrated=\(migrated, privacy: .public) skipped=\(skipped, privacy: .public) duration=\(Date().timeIntervalSince(migrationStart), privacy: .public)")
+        return (migrated, skipped)
+    }
+
     func loadObjectWorkingFiles(
         storeName: String? = nil,
         progress: (@Sendable (_ completed: Int, _ total: Int, _ urls: [URL]) async -> Void)? = nil,
@@ -1480,6 +1578,19 @@ actor SQLiteObjectStore {
         defer { if started { databaseURL.stopAccessingSecurityScopedResource() } }
         let db = try openReadOnlyDatabaseConnection(at: databaseURL)
         defer { sqlite3_close(db) }
+
+        // Chunked storage (preferred for files > SQLITE_LIMIT_LENGTH) is checked before
+        // ExternalBlobs sidecar files. Both code paths coexist during migration.
+        if objectHasChunks(objectID: objectID, in: db) {
+            return try streamChunksToFile(
+                objectID: objectID,
+                db: db,
+                destinationURL: destinationURL,
+                keyData: nil,
+                playbackThresholdBytes: playbackThresholdBytes,
+                onPlaybackReady: onPlaybackReady
+            )
+        }
 
         if let contentHash = try contentHash(forObjectID: objectID, in: db),
            let sourceURL = resolvedExternalBlobFileURL(contentHash: contentHash, databaseURL: databaseURL),
@@ -2661,6 +2772,19 @@ actor SQLiteObjectStore {
         if !columnExists("description", inTable: "objects", db: db) {
             try exec("ALTER TABLE objects ADD COLUMN description TEXT;", in: db)
         }
+        // Chunked storage for blobs larger than SQLITE_LIMIT_LENGTH. Keeps the
+        // database self-contained instead of spilling into sidecar files that
+        // can be lost during backup/copy.
+        if !schemaObjectExists(in: db, name: "object_blob_chunks", type: "table") {
+            try exec("""
+        CREATE TABLE IF NOT EXISTS object_blob_chunks (
+            object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            bytes BLOB NOT NULL,
+            PRIMARY KEY (object_id, ordinal)
+        );
+        """, in: db)
+        }
         if ensureFilenameIndex,
            !schemaObjectExists(in: db, name: "idx_objects_original_filename", type: "index") {
             Self.ensureOriginalFilenameIndex(in: db)
@@ -2742,8 +2866,15 @@ actor SQLiteObjectStore {
         keyData: Data?
     ) throws -> Int64 {
         let payloadByteCount = object.sourceFileSize ?? object.objectData.count
+        let useChunkedStorage = requiresExternalBlobStorage(byteCount: payloadByteCount, in: db)
+
         let storedData: Data
-        if shouldEncrypt {
+        if useChunkedStorage {
+            // Chunked path encrypts per chunk during streaming; the inline blob_data column
+            // is bound to zeroblob(0) and `object.objectData` is typically empty for files
+            // routed through the streaming sync path.
+            storedData = Data()
+        } else if shouldEncrypt {
             guard let keyData,
                   let combined = try AES.GCM.seal(object.objectData, using: SymmetricKey(data: keyData)).combined
             else {
@@ -2783,20 +2914,8 @@ actor SQLiteObjectStore {
             createdAt = fileValues?.creationDate
             modifiedAt = fileValues?.contentModificationDate
         }
-        let databaseURL = databaseURL(for: db) ?? object.originalURL.deletingLastPathComponent()
-        if requiresExternalBlobStorage(byteCount: payloadByteCount, in: db) {
-            if shouldEncrypt {
-                throw SQLiteObjectStoreError.databaseWriteFailed(
-                    reason: "Objects larger than \(maxSQLiteBlobBytes(in: db)) bytes cannot be encrypted in the SQLite store."
-                )
-            }
-            try writeExternalBlobFile(
-                from: object.originalURL,
-                contentHash: object.contentHash,
-                databaseURL: databaseURL,
-                filename: object.originalURL.lastPathComponent
-            )
-            return try stepUpsertObject(
+        if useChunkedStorage {
+            let objectID = try stepUpsertObject(
                 in: db,
                 statement: statement,
                 filename: object.originalURL.lastPathComponent,
@@ -2816,6 +2935,15 @@ actor SQLiteObjectStore {
                 thumbnailData: object.thumbnailData,
                 storesBlobExternally: true
             )
+            try writeChunkedBlobFromFile(
+                sourceURL: object.originalURL,
+                objectID: objectID,
+                db: db,
+                filename: object.originalURL.lastPathComponent,
+                shouldEncrypt: shouldEncrypt,
+                keyData: keyData
+            )
+            return objectID
         }
         return try stepUpsertObject(
             in: db,
@@ -3066,6 +3194,234 @@ actor SQLiteObjectStore {
         let size = Int64(byteCount)
         let limit = maxSQLiteBlobBytes(in: db)
         return size > incrementalBlobBindThresholdBytes && size <= limit
+    }
+
+    // MARK: Chunked blob storage
+    //
+    // Files larger than SQLite's per-row BLOB limit are stored as N chunk rows in
+    // object_blob_chunks instead of an ExternalBlobs/{hash}.bin sidecar file. This
+    // keeps the database file self-contained so backups can't lose the payload.
+
+    private nonisolated static let chunkedBlobChunkBytes = 64 * 1024 * 1024
+
+    private nonisolated static func objectHasChunks(objectID: Int64, in db: OpaquePointer) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM object_blob_chunks WHERE object_id = ? LIMIT 1;", -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, objectID)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    private nonisolated static func deleteChunks(forObjectID objectID: Int64, in db: OpaquePointer) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "DELETE FROM object_blob_chunks WHERE object_id = ?;", -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw SQLiteObjectStoreError.databaseWriteFailed(reason: sqliteErrorMessage(from: db))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, objectID)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw SQLiteObjectStoreError.databaseWriteFailed(reason: sqliteErrorMessage(from: db))
+        }
+    }
+
+    private nonisolated static func insertChunk(
+        objectID: Int64,
+        ordinal: Int,
+        bytes: Data,
+        in db: OpaquePointer
+    ) throws {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT INTO object_blob_chunks (object_id, ordinal, bytes) VALUES (?, ?, ?);", -1, &stmt, nil) == SQLITE_OK,
+              let stmt else {
+            throw SQLiteObjectStoreError.databaseWriteFailed(reason: sqliteErrorMessage(from: db))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, objectID)
+        sqlite3_bind_int64(stmt, 2, Int64(ordinal))
+        var storage = SQLiteBindStorage()
+        try storage.bindBlob(bytes, at: 3, in: stmt)
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw SQLiteObjectStoreError.databaseWriteFailed(reason: sqliteErrorMessage(from: db))
+        }
+    }
+
+    private nonisolated static func sealChunkIfNeeded(
+        _ chunk: Data,
+        shouldEncrypt: Bool,
+        keyData: Data?
+    ) throws -> Data {
+        guard shouldEncrypt else { return chunk }
+        guard let keyData,
+              let combined = try AES.GCM.seal(chunk, using: SymmetricKey(data: keyData)).combined else {
+            throw SQLiteObjectStoreError.databaseWriteFailed(reason: "chunk encryption failed")
+        }
+        return combined
+    }
+
+    @discardableResult
+    private nonisolated static func writeChunkedBlobFromFile(
+        sourceURL: URL,
+        objectID: Int64,
+        db: OpaquePointer,
+        filename: String,
+        shouldEncrypt: Bool,
+        keyData: Data?
+    ) throws -> Int {
+        if objectHasChunks(objectID: objectID, in: db) {
+            Logger(subsystem: "com.example.PictureViewer", category: "sqlite-object-store")
+                .log("sqlite object store: chunked blob write skipped existing chunks present filename=\(filename, privacy: .public) objectID=\(objectID, privacy: .public)")
+            return 0
+        }
+        let started = sourceURL.startAccessingSecurityScopedResource()
+        defer { if started { sourceURL.stopAccessingSecurityScopedResource() } }
+        let readHandle = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? readHandle.close() }
+
+        let logger = Logger(subsystem: "com.example.PictureViewer", category: "sqlite-object-store")
+        let writeStart = Date()
+        var ordinal = 0
+        var totalWritten = 0
+        var lastLoggedBytes = 0
+        while true {
+            try Task.checkCancellation()
+            guard let chunk = try readHandle.read(upToCount: chunkedBlobChunkBytes), !chunk.isEmpty else {
+                break
+            }
+            let payload = try sealChunkIfNeeded(chunk, shouldEncrypt: shouldEncrypt, keyData: keyData)
+            try insertChunk(objectID: objectID, ordinal: ordinal, bytes: payload, in: db)
+            ordinal += 1
+            totalWritten += chunk.count
+            if totalWritten - lastLoggedBytes >= externalBlobProgressLogIntervalBytes {
+                lastLoggedBytes = totalWritten
+                logger.log("sqlite object store: chunked blob write progress filename=\(filename, privacy: .public) bytes=\(totalWritten, privacy: .public) chunks=\(ordinal, privacy: .public)")
+            }
+        }
+        logger.log("sqlite object store: chunked blob write complete filename=\(filename, privacy: .public) bytes=\(totalWritten, privacy: .public) chunks=\(ordinal, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
+        return totalWritten
+    }
+
+    @discardableResult
+    private nonisolated static func writeChunkedBlobFromData(
+        _ data: Data,
+        objectID: Int64,
+        db: OpaquePointer,
+        filename: String,
+        shouldEncrypt: Bool,
+        keyData: Data?
+    ) throws -> Int {
+        try deleteChunks(forObjectID: objectID, in: db)
+        let logger = Logger(subsystem: "com.example.PictureViewer", category: "sqlite-object-store")
+        let writeStart = Date()
+        var ordinal = 0
+        var offset = 0
+        var lastLoggedBytes = 0
+        while offset < data.count {
+            try Task.checkCancellation()
+            let end = min(offset + chunkedBlobChunkBytes, data.count)
+            let chunk = data.subdata(in: offset..<end)
+            let payload = try sealChunkIfNeeded(chunk, shouldEncrypt: shouldEncrypt, keyData: keyData)
+            try insertChunk(objectID: objectID, ordinal: ordinal, bytes: payload, in: db)
+            ordinal += 1
+            offset = end
+            if offset - lastLoggedBytes >= externalBlobProgressLogIntervalBytes {
+                lastLoggedBytes = offset
+                logger.log("sqlite object store: chunked blob write progress filename=\(filename, privacy: .public) bytes=\(offset, privacy: .public) chunks=\(ordinal, privacy: .public)")
+            }
+        }
+        logger.log("sqlite object store: chunked blob write complete filename=\(filename, privacy: .public) bytes=\(data.count, privacy: .public) chunks=\(ordinal, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
+        return data.count
+    }
+
+    /// Streams chunked bytes for `objectID` to a destination file. Returns total bytes
+    /// written. Decrypts each chunk if `keyData` is supplied. Returns 0 if no chunks.
+    private nonisolated static func streamChunksToFile(
+        objectID: Int64,
+        db: OpaquePointer,
+        destinationURL: URL,
+        keyData: Data?,
+        playbackThresholdBytes: Int? = nil,
+        onPlaybackReady: @escaping @Sendable () -> Void = {}
+    ) throws -> Int {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "SELECT bytes FROM object_blob_chunks WHERE object_id = ? ORDER BY ordinal;",
+            -1,
+            &stmt,
+            nil
+        ) == SQLITE_OK, let stmt else {
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, objectID)
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+        let writeHandle = try FileHandle(forWritingTo: destinationURL)
+        defer { try? writeHandle.close() }
+
+        var bytesWritten = 0
+        var signaledPlaybackReady = false
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            try Task.checkCancellation()
+            let chunk = columnData(stmt, 0)
+            guard !chunk.isEmpty else { continue }
+            let payload: Data
+            if let keyData {
+                let sealedBox = try AES.GCM.SealedBox(combined: chunk)
+                payload = try AES.GCM.open(sealedBox, using: SymmetricKey(data: keyData))
+            } else {
+                payload = chunk
+            }
+            try writeHandle.write(contentsOf: payload)
+            bytesWritten += payload.count
+            if let playbackThresholdBytes, !signaledPlaybackReady, bytesWritten >= playbackThresholdBytes {
+                signaledPlaybackReady = true
+                onPlaybackReady()
+            }
+        }
+        return bytesWritten
+    }
+
+    /// Reads all chunked bytes for `objectID` into a single Data. Used by code paths
+    /// that need the full payload in memory (small/medium chunked objects).
+    private nonisolated static func readChunkedBlobAsData(
+        objectID: Int64,
+        db: OpaquePointer,
+        keyData: Data?
+    ) throws -> Data {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "SELECT bytes FROM object_blob_chunks WHERE object_id = ? ORDER BY ordinal;",
+            -1,
+            &stmt,
+            nil
+        ) == SQLITE_OK, let stmt else {
+            throw SQLiteObjectStoreError.databaseReadFailed
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, objectID)
+
+        var accumulated = Data()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let chunk = columnData(stmt, 0)
+            guard !chunk.isEmpty else { continue }
+            if let keyData {
+                let sealedBox = try AES.GCM.SealedBox(combined: chunk)
+                let plain = try AES.GCM.open(sealedBox, using: SymmetricKey(data: keyData))
+                accumulated.append(plain)
+            } else {
+                accumulated.append(chunk)
+            }
+        }
+        return accumulated
     }
 
     private nonisolated static func databaseURL(for db: OpaquePointer) -> URL? {
@@ -3359,6 +3715,16 @@ actor SQLiteObjectStore {
         let inlineData = columnData(statement, 0)
         let contentHash = columnText(statement, 1) ?? ""
         let recordedFileSize = Int(sqlite3_column_int64(statement, 2))
+        if inlineData.isEmpty, objectHasChunks(objectID: id, in: db) {
+            // Chunked path: per-chunk decryption is applied inside the reader. We
+            // do not run the outer AES.GCM.open below because each chunk was sealed
+            // independently with its own nonce.
+            return try readChunkedBlobAsData(
+                objectID: id,
+                db: db,
+                keyData: isEncrypted ? keyData : nil
+            )
+        }
         if inlineData.isEmpty,
            !contentHash.isEmpty,
            let databaseURL = databaseURL(for: db),
