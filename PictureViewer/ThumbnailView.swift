@@ -143,15 +143,11 @@ struct ThumbnailView: View {
 
 		image = nil
 
-		if disableThumbnailLoadingAtLaunch && !forceLoad {
-			thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")
-			return
-		}
-
 		let target = url
 		_ = SecurityScopedResourceAccess.ensureAccess(for: target)
 
-		// 1) Try the persistent cache off the main thread.
+		// 1) Try the persistent cache off the main thread. Cache reads always run,
+		// even when launch-time generation is deferred.
 		let ns = namespace
 		let cacheLookup = Task.detached(priority: .userInitiated) {
 			ThumbnailCache.shared.image(for: target, namespace: ns)
@@ -163,10 +159,26 @@ struct ThumbnailView: View {
 			return
 		}
 
+		if disableThumbnailLoadingAtLaunch && !forceLoad {
+			if await hydrateCachedVideoThumbnailIfAvailable(for: target, namespace: ns, requireFresh: false) {
+				return
+			}
+			thumbViewLogger.log("ThumbnailView: skipping thumbnail load for \(url.lastPathComponent, privacy: .public) because disableThumbnailLoadingAtLaunch=true")
+			return
+		}
+
 		// SQLite lazy working copies may not exist on disk yet. Prefer the
 		// thumbnail BLOB stored in the object database over on-the-fly generation.
 		if SQLiteObjectStore.isWorkingCopyURL(target),
 		   !FileManager.default.fileExists(atPath: target.path) {
+			if let storedData = SQLiteObjectStore.peekHydratedThumbnailJPEGData(for: target, namespace: namespace),
+			   let storedImage = ThumbnailCache.image(fromJPEGData: storedData) {
+				if Task.isCancelled { return }
+				thumbViewLogger.log("ThumbnailView: source=hydrated-registry filename=\(target.lastPathComponent, privacy: .public) bytes=\(storedData.count, privacy: .public)")
+				ThumbnailCache.shared.storeJPEGData(storedData, for: target, namespace: namespace)
+				image = storedImage
+				return
+			}
 			if await SQLiteObjectStore.shared.shouldDeferIndividualThumbnailLookup(for: target) {
 				return
 			}
@@ -209,9 +221,8 @@ struct ThumbnailView: View {
 			}
 		}
 
-		// 3) Generate the high-quality thumbnail (QuickLook) in a child
-		// task so the UI remains responsive; when complete it replaces the
-		// low-res preview.
+		// 3) Generate the high-quality thumbnail in a child task so the UI
+		// remains responsive; when complete it replaces the low-res preview.
 		Task.detached(priority: .utility) {
 			do {
 				let thumbnailSource: URL
@@ -247,6 +258,22 @@ struct ThumbnailView: View {
 				}
 			}
 		}
+	}
+
+	private func hydrateCachedVideoThumbnailIfAvailable(
+		for target: URL,
+		namespace: String?,
+		requireFresh: Bool
+	) async -> Bool {
+		guard isVideo else { return false }
+		let hydrated = await Task.detached(priority: .userInitiated) {
+			ThumbnailCache.shared.hydrateFromDiskIfAvailable(for: target, namespace: namespace, requireFresh: requireFresh)
+		}.value
+		guard let hydrated else { return false }
+		if Task.isCancelled { return false }
+		thumbViewLogger.log("ThumbnailView: source=thumbnail-cache-stale filename=\(target.lastPathComponent, privacy: .public) requireFresh=\(requireFresh, privacy: .public)")
+		image = hydrated
+		return true
 	}
 
 	private enum MetadataState {

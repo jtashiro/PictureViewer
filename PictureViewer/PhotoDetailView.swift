@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AppKit
+import AVFoundation
 import AVKit
 import CoreImage
 import ImageIO
@@ -223,10 +224,18 @@ struct FullScreenPhotoView: View {
 			return .handled
 		}
 		.onKeyPress(.leftArrow) {
+			if isCurrentVideo {
+				skipCurrentVideo(by: -10)
+				return .handled
+			}
 			navigateToAdjacentPhoto(offset: -1)
 			return .handled
 		}
 		.onKeyPress(.rightArrow) {
+			if isCurrentVideo {
+				skipCurrentVideo(by: 10)
+				return .handled
+			}
 			navigateToAdjacentPhoto(offset: 1)
 			return .handled
 		}
@@ -564,6 +573,20 @@ struct FullScreenPhotoView: View {
 	private func stopPlayback() {
 		player?.pause()
 		embeddedVLCController.stop()
+	}
+
+	private func skipCurrentVideo(by seconds: TimeInterval) {
+		if usesEmbeddedVLC {
+			embeddedVLCController.skip(by: seconds)
+			return
+		}
+		guard let player else { return }
+		let current = player.currentTime().seconds
+		guard current.isFinite else { return }
+		let itemDuration = player.currentItem?.duration.seconds ?? 0
+		let upperBound = itemDuration.isFinite && itemDuration > 0 ? itemDuration : current + abs(seconds)
+		let target = max(0, min(upperBound, current + seconds))
+		player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
 	}
 
 	private func formatPlaybackTime(_ seconds: TimeInterval) -> String {

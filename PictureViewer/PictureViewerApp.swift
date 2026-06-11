@@ -17,6 +17,7 @@ struct PictureViewerApp: App {
 	@State private var isShowingAboutSheet = false
 
 	init() {
+		_ = AppWorkingDirectory.ensureAccess()
 		// Touch the lazy CPU detection so the worker count is computed at launch.
 		_ = PhotoLibrary.workerCount
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")

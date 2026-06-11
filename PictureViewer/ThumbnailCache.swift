@@ -35,6 +35,7 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 	nonisolated(unsafe) private var pinnedImages: [String: PinnedImage] = [:]
 	nonisolated private let pinnedImagesLock = NSLock()
 	nonisolated let cacheDirectory: URL
+	nonisolated private let legacyCacheDirectory: URL?
 	nonisolated private let writeQueue = DispatchQueue(
 		label: "ThumbnailCache.write",
 		qos: .utility,
@@ -42,10 +43,10 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 	)
 
 	nonisolated private init() {
-		let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-			?? URL(fileURLWithPath: NSTemporaryDirectory())
-		cacheDirectory = caches.appendingPathComponent("PictureViewer/Thumbnails", isDirectory: true)
+		_ = AppWorkingDirectory.ensureAppDataDirectories()
+		cacheDirectory = AppWorkingDirectory.thumbnailsCacheURL()
 		try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+		legacyCacheDirectory = AppWorkingDirectory.legacyCachesThumbnailsURL()
 		memCache.countLimit = 1024
 		// Size the in-memory cache relative to system memory (up to a sensible cap).
 		let physical = ProcessInfo.processInfo.physicalMemory
@@ -75,16 +76,15 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 			pin(mem, forKey: key, source: url)
 			return mem
 		}
-		let file = cacheFile(forKey: key)
-		guard FileManager.default.fileExists(atPath: file.path) else { return nil }
-		guard isFresh(cache: file, source: url) else {
-			try? FileManager.default.removeItem(at: file)
-			return nil
+		for file in cacheFiles(forKey: key) {
+			guard FileManager.default.fileExists(atPath: file.path) else { continue }
+			guard isFresh(cache: file, source: url) else { continue }
+			guard let image = NSImage(contentsOf: file) else { continue }
+			memCache.setObject(image, forKey: key as NSString, cost: cost(of: image))
+			pin(image, forKey: key, source: url)
+			return image
 		}
-		guard let image = NSImage(contentsOf: file) else { return nil }
-		memCache.setObject(image, forKey: key as NSString, cost: cost(of: image))
-		pin(image, forKey: key, source: url)
-		return image
+		return nil
 	}
 
 	/// Fast memory-only lookup used while creating recycled grid cells. This
@@ -147,6 +147,43 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 		return Self.jpegData(from: image)
 	}
 
+	/// Reads a cached JPEG from disk without generating a new thumbnail.
+	func cachedJPEGBytesFromDisk(for url: URL, namespace: String? = nil, requireFresh: Bool = true) -> Data? {
+		let key = self.key(for: url, namespace: namespace)
+		for file in cacheFiles(forKey: key) {
+			guard FileManager.default.fileExists(atPath: file.path) else { continue }
+			if requireFresh, !isFresh(cache: file, source: url) { continue }
+			return try? Data(contentsOf: file)
+		}
+		return nil
+	}
+
+	/// Loads a cached preview into memory without generating a new thumbnail.
+	func hydrateFromDiskIfAvailable(for url: URL, namespace: String? = nil, requireFresh: Bool = true) -> NSImage? {
+		guard let data = cachedJPEGBytesFromDisk(for: url, namespace: namespace, requireFresh: requireFresh),
+		      !data.isEmpty,
+		      let image = Self.image(fromJPEGData: data) else {
+			return nil
+		}
+		storeJPEGData(data, for: url, namespace: namespace)
+		return image
+	}
+
+	/// Returns JPEG bytes already cached for a source file. Never generates a
+	/// new thumbnail. Used by SQLite sync to copy previews shown in the tab.
+	func existingJPEGData(for url: URL, namespace: String? = nil) -> Data? {
+		if let disk = cachedJPEGBytesFromDisk(for: url, namespace: namespace), !disk.isEmpty {
+			return disk
+		}
+		if let image = memoryImage(for: url, namespace: namespace) {
+			return Self.jpegData(from: image)
+		}
+		if let image = image(for: url, namespace: namespace) {
+			return Self.jpegData(from: image)
+		}
+		return nil
+	}
+
 	nonisolated static func jpegData(from image: NSImage, compressionFactor: CGFloat = 0.85) -> Data? {
 		guard
 			let tiff = image.tiffRepresentation,
@@ -165,10 +202,12 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 		pinnedImagesLock.lock()
 		pinnedImages.removeAll()
 		pinnedImagesLock.unlock()
-		let dir = cacheDirectory
+		let directories = [cacheDirectory, legacyCacheDirectory].compactMap { $0 }
 		writeQueue.sync(flags: .barrier) {
-			try? FileManager.default.removeItem(at: dir)
-			try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+			for dir in directories {
+				try? FileManager.default.removeItem(at: dir)
+				try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+			}
 		}
 	}
 
@@ -182,14 +221,12 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 			for url in urls {
 				let oldKey = self.key(for: url, namespace: oldNamespace)
 				let newKey = self.key(for: url, namespace: newNamespace)
-				let oldFile = self.cacheFile(forKey: oldKey)
-				let newFile = self.cacheFile(forKey: newKey)
-				// Move on-disk file if present and destination missing
-				if FileManager.default.fileExists(atPath: oldFile.path) {
+				for oldFile in self.cacheFiles(forKey: oldKey) {
+					let newFile = self.cacheFile(forKey: newKey)
+					guard FileManager.default.fileExists(atPath: oldFile.path) else { continue }
 					if !FileManager.default.fileExists(atPath: newFile.path) {
 						try? FileManager.default.moveItem(at: oldFile, to: newFile)
 					} else {
-						// Destination exists; remove the old file to avoid duplicates
 						try? FileManager.default.removeItem(at: oldFile)
 					}
 				}
@@ -214,34 +251,38 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 	func sweepStale(olderThanDays days: Int = 30) {
 		let cutoff = Date().addingTimeInterval(-Double(days) * 86400)
 		let keys: [URLResourceKey] = [.contentAccessDateKey, .contentModificationDateKey]
-		guard let entries = try? FileManager.default.contentsOfDirectory(
-			at: cacheDirectory,
-			includingPropertiesForKeys: keys,
-			options: [.skipsHiddenFiles]
-		) else { return }
+		for directory in [cacheDirectory, legacyCacheDirectory].compactMap({ $0 }) {
+			guard let entries = try? FileManager.default.contentsOfDirectory(
+				at: directory,
+				includingPropertiesForKeys: keys,
+				options: [.skipsHiddenFiles]
+			) else { continue }
 
-		for entry in entries {
-			guard let values = try? entry.resourceValues(forKeys: Set(keys)) else { continue }
-			let when = values.contentAccessDate
-				?? values.contentModificationDate
-				?? .distantPast
-			if when < cutoff {
-				try? FileManager.default.removeItem(at: entry)
+			for entry in entries {
+				guard let values = try? entry.resourceValues(forKeys: Set(keys)) else { continue }
+				let when = values.contentAccessDate
+					?? values.contentModificationDate
+					?? .distantPast
+				if when < cutoff {
+					try? FileManager.default.removeItem(at: entry)
+				}
 			}
 		}
 	}
 
 	/// Approximate on-disk cache size in bytes.
 	func diskUsage() -> Int64 {
-		guard let entries = try? FileManager.default.contentsOfDirectory(
-			at: cacheDirectory,
-			includingPropertiesForKeys: [.fileSizeKey],
-			options: []
-		) else { return 0 }
 		var total: Int64 = 0
-		for entry in entries {
-			if let size = try? entry.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-				total += Int64(size)
+		for directory in [cacheDirectory, legacyCacheDirectory].compactMap({ $0 }) {
+			guard let entries = try? FileManager.default.contentsOfDirectory(
+				at: directory,
+				includingPropertiesForKeys: [.fileSizeKey],
+				options: []
+			) else { continue }
+			for entry in entries {
+				if let size = try? entry.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+					total += Int64(size)
+				}
 			}
 		}
 		return total
@@ -264,6 +305,14 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 		cacheDirectory.appendingPathComponent(key).appendingPathExtension("jpg")
 	}
 
+	private func cacheFiles(forKey key: String) -> [URL] {
+		var files = [cacheFile(forKey: key)]
+		if let legacyCacheDirectory {
+			files.append(legacyCacheDirectory.appendingPathComponent(key).appendingPathExtension("jpg"))
+		}
+		return files
+	}
+
 	private func isFresh(cache: URL, source: URL) -> Bool {
 		// SQLite lazy working copies (and other virtual URLs) have no on-disk
 		// source file. Trust a cached JPEG when one exists.
@@ -272,11 +321,16 @@ nonisolated final class ThumbnailCache: @unchecked Sendable {
 		}
 		guard
 			let cv = try? cache.resourceValues(forKeys: [.contentModificationDateKey]),
+			let cacheDate = cv.contentModificationDate
+		else {
+			return true
+		}
+		guard
 			let sv = try? source.resourceValues(forKeys: [.contentModificationDateKey]),
-			let cacheDate = cv.contentModificationDate,
 			let srcDate = sv.contentModificationDate
 		else {
-			return false
+			// USB and network volumes may not expose stable modification dates.
+			return true
 		}
 		return cacheDate >= srcDate
 	}

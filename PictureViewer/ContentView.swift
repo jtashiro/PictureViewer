@@ -221,19 +221,7 @@ struct ContentView: View {
 								library.photos.append(contentsOf: slice)
 								library.lastScanDate = Date()
 							}
-							// Warm thumbnails for the restored batch in background so
-							// the UI can display images quickly without waiting for
-							// on-demand generation. The ThumbnailGenerator itself
-							// limits concurrency so this is safe to run per-batch.
-							Task.detached(priority: .utility) {
-								for item in slice {
-									if Task.isCancelled { break }
-									do {
-										let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-										ThumbnailCache.shared.store(img, for: item.url)
-									} catch { }
-								}
-							}
+							warmFilesystemThumbnails(for: slice)
 
 							idx = end
 							try? await Task.sleep(nanoseconds: 10_000_000) // 10ms gap between batches
@@ -920,6 +908,7 @@ struct ContentView: View {
 					isSQLiteObjectStoreView: isSQLiteObjectStoreView,
 					isVaultWorking: isVaultWorking,
 					vaultProgressMessage: vaultProgressMessage,
+					vaultProgressCurrentFile: vaultProgressCurrentFile,
 					vaultProgressTotal: vaultProgressTotal,
 					vaultProgressCompleted: vaultProgressCompleted,
 					sqliteLoadStartDate: sqliteLoadStartDate,
@@ -1038,7 +1027,15 @@ struct ContentView: View {
 			}
 		}
 		.onChange(of: library.photos) {
+			if library.isScanning {
+				syncDisplayedPhotosDuringScan()
+			}
 			queuePhotoChangeRefresh()
+		}
+		.onChange(of: library.isScanning) {
+			if !library.isScanning {
+				scheduleSort()
+			}
 		}
 		.onChange(of: activeFolderNames) {
 			updateTabRegistry()
@@ -1453,6 +1450,13 @@ struct ContentView: View {
 		.onReceive(NotificationCenter.default.publisher(for: .galleryTabSyncImported)) { notification in
 			receiveSyncedFiles(notification)
 		}
+		.onReceive(NotificationCenter.default.publisher(for: .sqliteSyncWillBegin)) { notification in
+			guard let storeName = notification.userInfo?["storeName"] as? String else { return }
+			guard isSQLiteObjectStoreView,
+			      SQLiteObjectStore.storeNamesMatch(activeSQLiteStoreName, storeName) else { return }
+			vaultStoreTask?.cancel()
+			vaultStoreTask = nil
+		}
 		.onReceive(NotificationCenter.default.publisher(for: .sqliteObjectStoreDidChange)) { notification in
 			guard isSQLiteObjectStoreView, !isVaultWorking else { return }
 			if let changedStoreName = notification.userInfo?["storeName"] as? String,
@@ -1474,10 +1478,17 @@ struct ContentView: View {
 					.font(.headline)
 				if vaultProgressTotal > 0 {
 					ProgressView(value: Double(vaultProgressCompleted), total: Double(vaultProgressTotal))
-					Text("\(vaultProgressCompleted) of \(vaultProgressTotal)")
+					Text("\(vaultProgressCompleted) of \(vaultProgressTotal) synced")
 						.font(.caption)
 						.foregroundStyle(.secondary)
 						.monospacedDigit()
+					if !vaultProgressCurrentFile.isEmpty {
+						Text(vaultProgressCurrentFile)
+							.font(.caption2)
+							.foregroundStyle(.secondary)
+							.lineLimit(1)
+							.truncationMode(.middle)
+					}
 				} else {
 					ProgressView()
 						.controlSize(.large)
@@ -1790,7 +1801,7 @@ struct ContentView: View {
 				let urls = await Self.collectFileURLs(from: providers)
 				await MainActor.run {
 					guard !urls.isEmpty else { return }
-					performSQLiteSync(sourceURLs: urls, title: "Store Dropped Items in SQLite Store")
+					performSQLiteSync(sourceURLs: urls)
 				}
 			}
 			return true
@@ -3090,11 +3101,11 @@ struct ContentView: View {
 	}
 
 	private func syncCurrentTabToSQLiteStore() {
-		performSQLiteSync(sourceURLs: library.photos.map(\.url), title: "Sync Tab to SQLite Store")
+		performSQLiteSync(sourceURLs: library.photos.map(\.url))
 	}
 
 	private func syncSelectedMediaToSQLiteStore() {
-		performSQLiteSync(sourceURLs: selectedPhotoURLs, title: "Store Selected in SQLite Store")
+		performSQLiteSync(sourceURLs: selectedPhotoURLs)
 	}
 
 	private func backfillSQLiteThumbnails() {
@@ -3185,7 +3196,25 @@ struct ContentView: View {
 		}
 	}
 
-	private func performSQLiteSync(sourceURLs: [URL], title: String) {
+	private func warmFilesystemThumbnails(for items: [PhotoItem]) {
+		Task.detached(priority: .utility) {
+			for item in items {
+				if Task.isCancelled { break }
+				if ThumbnailCache.shared.memoryImage(for: item.url) != nil { continue }
+				if ThumbnailCache.shared.hydrateFromDiskIfAvailable(for: item.url) != nil { continue }
+				guard PhotoLibrary.shouldGenerateFilesystemThumbnail(for: item.url, forceLoad: false) else {
+					_ = ThumbnailCache.shared.hydrateFromDiskIfAvailable(for: item.url, requireFresh: false)
+					continue
+				}
+				do {
+					let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
+					ThumbnailCache.shared.store(img, for: item.url)
+				} catch { }
+			}
+		}
+	}
+
+	private func performSQLiteSync(sourceURLs: [URL]) {
 		guard SQLiteObjectStore.configuredDirectoryPath != nil else {
 			vaultAlertMessage = "Create or open a SQLite store before syncing."
 			showVaultAlert = true
@@ -3201,8 +3230,8 @@ struct ContentView: View {
 		let workers = max(1, min(sourceURLs.count, PhotoLibrary.workerCount))
 
 		let alert = NSAlert()
-		alert.messageText = title
-		alert.informativeText = "Sync \(sourceURLs.count) object\(sourceURLs.count == 1 ? "" : "s") to the selected SQLite store using up to \(workers) worker\(workers == 1 ? "" : "s")."
+		alert.messageText = "Sync to SQLite Store"
+		alert.informativeText = "Sync \(sourceURLs.count) object\(sourceURLs.count == 1 ? "" : "s") to the selected store using up to \(workers) worker\(workers == 1 ? "" : "s")."
 		alert.addButton(withTitle: "Sync")
 		alert.addButton(withTitle: "Cancel")
 		let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26), pullsDown: false)
@@ -3216,7 +3245,7 @@ struct ContentView: View {
 		let databaseFilename = SQLiteObjectStore.databaseFilename(forStoreName: targetStoreName)
 
 		isVaultWorking = true
-		vaultProgressMessage = "Syncing to \(databaseFilename)..."
+		vaultProgressMessage = "Checking \(databaseFilename) for existing objects..."
 		vaultProgressCompleted = 0
 		vaultProgressTotal = sourceURLs.count
 		vaultStoreTask?.cancel()
@@ -3234,23 +3263,115 @@ struct ContentView: View {
 				var storedCount = 0
 			}
 
+			await SQLiteObjectStore.shared.cancelThumbnailHydrationForSync()
+			await MainActor.run {
+				NotificationCenter.default.post(
+					name: .sqliteSyncWillBegin,
+					object: nil,
+					userInfo: ["storeName": targetStoreName]
+				)
+			}
+
+			let sortedSourceURLs = sourceURLs.sorted {
+				$0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending
+			}
+			let duplicateCheckStart = Date()
+			let tabFilenames = Set(sortedSourceURLs.map { $0.lastPathComponent.lowercased() })
+			logger.log("sqlite sync: duplicate check begin database=\(databaseFilename, privacy: .public) tabObjects=\(sortedSourceURLs.count, privacy: .public) uniqueFilenames=\(tabFilenames.count, privacy: .public)")
+			let existingFilenames: Set<String>
+			do {
+				existingFilenames = try await SQLiteObjectStore.shared.existingFilenamesAmongTabFilenames(
+					tabFilenames,
+					storeName: targetStoreName,
+					requestedAt: duplicateCheckStart
+				)
+			} catch {
+				let message = "Could not read existing objects from \(databaseFilename): \(error.localizedDescription)"
+				logger.error("sqlite sync: duplicate check failed database=\(databaseFilename, privacy: .public) duration=\(Date().timeIntervalSince(duplicateCheckStart), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = message
+					showVaultAlert = true
+				}
+				return
+			}
+
+			let syncURLs = sortedSourceURLs.filter { url in
+				!existingFilenames.contains(url.lastPathComponent.lowercased())
+			}
+			let duplicateCount = sortedSourceURLs.count - syncURLs.count
+			logger.log("sqlite sync: duplicate check complete database=\(databaseFilename, privacy: .public) tabObjects=\(sortedSourceURLs.count, privacy: .public) matchedInStore=\(existingFilenames.count, privacy: .public) duplicatesSkipped=\(duplicateCount, privacy: .public) toSync=\(syncURLs.count, privacy: .public) duration=\(Date().timeIntervalSince(duplicateCheckStart), privacy: .public)")
+
+			await MainActor.run {
+				vaultProgressMessage = "Opening \(databaseFilename) for writing..."
+				vaultProgressCompleted = 0
+				vaultProgressTotal = syncURLs.count
+			}
+
+			guard !syncURLs.isEmpty else {
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = "All \(sortedSourceURLs.count) object\(sortedSourceURLs.count == 1 ? "" : "s") already exist in \(databaseFilename)."
+					showVaultAlert = true
+				}
+				return
+			}
+
+			let writeSessionStart = Date()
+			do {
+				try await SQLiteObjectStore.shared.prepareForSyncWrite(storeName: targetStoreName)
+				try await SQLiteObjectStore.shared.beginSyncWriteSession(storeName: targetStoreName)
+			} catch {
+				let message = "Could not open \(databaseFilename) for writing: \(error.localizedDescription)"
+				logger.error("sqlite sync: write session open failed database=\(databaseFilename, privacy: .public) duration=\(Date().timeIntervalSince(writeSessionStart), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+				await MainActor.run {
+					isVaultWorking = false
+					vaultStoreTask = nil
+					vaultAlertMessage = message
+					showVaultAlert = true
+				}
+				return
+			}
+			logger.log("sqlite sync: write session open complete database=\(databaseFilename, privacy: .public) duration=\(Date().timeIntervalSince(writeSessionStart), privacy: .public)")
+
+			var syncWriteSessionOpened = true
+			defer {
+				if syncWriteSessionOpened {
+					Task {
+						try? await SQLiteObjectStore.shared.endSyncWriteSession(commit: false)
+					}
+				}
+			}
+
 			let accumulator = SyncAccumulator()
 			let syncStart = Date()
-			let writeBatchSize = min(32, max(8, sourceURLs.count))
-			let progressStride = max(1, min(16, sourceURLs.count / 32))
-			logger.log("sqlite sync: begin database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) workers=\(workers, privacy: .public) writeBatchSize=\(writeBatchSize, privacy: .public)")
+			let syncWorkers = max(1, min(syncURLs.count, PhotoLibrary.workerCount))
+			// Write one object at a time so the progress bar advances per stored file.
+			let writeBatchSize = 1
+			await MainActor.run {
+				vaultProgressMessage = "Syncing to \(databaseFilename)..."
+				vaultProgressCompleted = 0
+				vaultProgressTotal = syncURLs.count
+				vaultProgressCurrentFile = ""
+			}
+			logger.log("sqlite sync: begin database=\(databaseFilename, privacy: .public) tabObjects=\(sortedSourceURLs.count, privacy: .public) toSync=\(syncURLs.count, privacy: .public) duplicatesSkipped=\(duplicateCount, privacy: .public) workers=\(syncWorkers, privacy: .public) writeBatchSize=\(writeBatchSize, privacy: .public)")
 
 			await withTaskGroup(of: PreparedSQLiteObject?.self) { group in
 				var nextIndex = 0
 				var pendingWrite: [PreparedSQLiteObject] = []
 
 				func enqueueNext() {
-					guard nextIndex < sourceURLs.count else { return }
+					guard nextIndex < syncURLs.count else { return }
 					let index = nextIndex
-					let url = sourceURLs[index]
+					let url = syncURLs[index]
 					nextIndex += 1
 					group.addTask {
 						if Task.isCancelled { return nil }
+						let prepareStart = Date()
+						let filename = url.lastPathComponent
+						logger.log("sqlite sync: prepare begin index=\(index, privacy: .public) filename=\(filename, privacy: .public)")
 						do {
 							let resourceValues = try? url.resourceValues(forKeys: [
 								.contentTypeKey,
@@ -3259,27 +3380,46 @@ struct ContentView: View {
 								.fileSizeKey
 							])
 							guard PhotoLibrary.isSupportedMediaFile(url, contentType: resourceValues?.contentType) else {
+								logger.log("sqlite sync: prepare skipped unsupported index=\(index, privacy: .public) filename=\(filename, privacy: .public)")
 								return nil
 							}
 							let started = url.startAccessingSecurityScopedResource()
 							defer { if started { url.stopAccessingSecurityScopedResource() } }
-							let data = try Data(contentsOf: url)
-							try Task.checkCancellation()
 							let contentType = resourceValues?.contentType?.identifier
 								?? UTType(filenameExtension: url.pathExtension)?.identifier
+							let thumbnailStart = Date()
+							let thumbnailData = await SQLiteObjectStore.shared.resolvedThumbnailDataForSync(for: url)
+							logger.log("sqlite sync: prepare thumbnail resolved index=\(index, privacy: .public) filename=\(filename, privacy: .public) bytes=\(thumbnailData?.count ?? 0, privacy: .public) duration=\(Date().timeIntervalSince(thumbnailStart), privacy: .public)")
+							let fileSize = resourceValues?.fileSize ?? 0
+							let streamLargeObject = fileSize > SQLiteObjectStore.largeObjectStreamThresholdBytes
+							let readStart = Date()
+							let data: Data
+							let contentHash: String
+							if streamLargeObject {
+								logger.log("sqlite sync: prepare stream-hash begin index=\(index, privacy: .public) filename=\(filename, privacy: .public) expectedBytes=\(fileSize, privacy: .public)")
+								contentHash = try SQLiteObjectStore.contentHash(ofFile: url)
+								data = Data()
+								logger.log("sqlite sync: prepare stream-hash complete index=\(index, privacy: .public) filename=\(filename, privacy: .public) expectedBytes=\(fileSize, privacy: .public) duration=\(Date().timeIntervalSince(readStart), privacy: .public)")
+							} else {
+								logger.log("sqlite sync: prepare read begin index=\(index, privacy: .public) filename=\(filename, privacy: .public) expectedBytes=\(fileSize, privacy: .public)")
+								data = try Data(contentsOf: url)
+								try Task.checkCancellation()
+								contentHash = SQLiteObjectStore.contentHash(of: data)
+								logger.log("sqlite sync: prepare read complete index=\(index, privacy: .public) filename=\(filename, privacy: .public) bytes=\(data.count, privacy: .public) duration=\(Date().timeIntervalSince(readStart), privacy: .public)")
+							}
 							let extractedMetadata = SQLiteObjectStore.extractObjectMetadata(
 								from: data,
 								originalURL: url,
 								contentTypeIdentifier: contentType
 							)
-							let thumbnailData = await SQLiteObjectStore.shared.resolvedThumbnailData(for: url)
+							logger.log("sqlite sync: prepare complete index=\(index, privacy: .public) filename=\(filename, privacy: .public) duration=\(Date().timeIntervalSince(prepareStart), privacy: .public)")
 							return PreparedSQLiteObject(
 								index: index,
 								filename: url.lastPathComponent,
 								pendingObject: SQLiteObjectStore.PendingObject(
 									objectData: data,
 									originalURL: url,
-									contentHash: SQLiteObjectStore.contentHash(of: data),
+									contentHash: contentHash,
 									contentTypeIdentifier: contentType,
 									thumbnailData: thumbnailData,
 									extractedMetadata: extractedMetadata,
@@ -3289,6 +3429,7 @@ struct ContentView: View {
 								)
 							)
 						} catch {
+							logger.error("sqlite sync: prepare failed index=\(index, privacy: .public) filename=\(filename, privacy: .public) duration=\(Date().timeIntervalSince(prepareStart), privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 							return nil
 						}
 					}
@@ -3300,6 +3441,12 @@ struct ContentView: View {
 					let batch = pendingWrite
 					pendingWrite.removeAll(keepingCapacity: true)
 					let writeStart = Date()
+					let writingFilename = batch.last?.filename ?? ""
+					await MainActor.run {
+						vaultProgressMessage = "Syncing to \(databaseFilename)..."
+						vaultProgressCurrentFile = writingFilename
+					}
+					logger.log("sqlite sync: batch write begin prepared=\(batch.count, privacy: .public) firstIndex=\(batch.first?.index ?? -1, privacy: .public) lastIndex=\(batch.last?.index ?? -1, privacy: .public)")
 					do {
 						let pendingObjects = batch.map(\.pendingObject)
 						let writtenCount = try await SQLiteObjectStore.shared.storeObjectBatchThrowing(
@@ -3309,16 +3456,27 @@ struct ContentView: View {
 						accumulator.storedCount += writtenCount
 						let writeFailedCount = max(0, batch.count - writtenCount)
 						accumulator.failedCount += writeFailedCount
+						let syncedFilename = batch.last?.filename ?? ""
+						await MainActor.run {
+							vaultProgressCompleted = accumulator.storedCount
+							vaultProgressTotal = syncURLs.count
+							vaultProgressMessage = "Syncing to \(databaseFilename)..."
+							vaultProgressCurrentFile = syncedFilename
+						}
 						logger.log("sqlite sync: batch write complete prepared=\(batch.count, privacy: .public) written=\(writtenCount, privacy: .public) writeFailed=\(writeFailedCount, privacy: .public) duration=\(Date().timeIntervalSince(writeStart), privacy: .public)")
 					} catch {
 						accumulator.failedCount += batch.count
-						logger.error("sqlite sync: batch write failed prepared=\(batch.count, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+						logger.error("sqlite sync: batch write failed prepared=\(batch.count, privacy: .public) filename=\(writingFilename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+						await MainActor.run {
+							vaultProgressMessage = "Sync failed for \(writingFilename)"
+						}
 					}
 				}
 
-				for _ in 0..<workers {
+				for _ in 0..<syncWorkers {
 					enqueueNext()
 				}
+				logger.log("sqlite sync: prepare workers started count=\(syncWorkers, privacy: .public)")
 
 				while let result = await group.next() {
 					if let result {
@@ -3330,35 +3488,41 @@ struct ContentView: View {
 						accumulator.failedCount += 1
 					}
 					accumulator.processedCount += 1
-					enqueueNext()
-					if accumulator.processedCount % progressStride == 0 || accumulator.processedCount == sourceURLs.count {
-						let completed = accumulator.processedCount
-						await MainActor.run {
-							vaultProgressCompleted = completed
-							vaultProgressTotal = sourceURLs.count
-						}
+					if !Task.isCancelled {
+						enqueueNext()
 					}
 				}
 
 				await flushPendingWrite()
 			}
 
+			syncWriteSessionOpened = false
 			let wasCancelled = Task.isCancelled
+			let syncWriteCommitted = accumulator.storedCount > 0
+			do {
+				try await SQLiteObjectStore.shared.endSyncWriteSession(commit: syncWriteCommitted)
+				if wasCancelled, syncWriteCommitted {
+					logger.log("sqlite sync: partial commit on cancel database=\(databaseFilename, privacy: .public) stored=\(accumulator.storedCount, privacy: .public)")
+				}
+			} catch {
+				logger.error("sqlite sync: write session close failed database=\(databaseFilename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
 			let finalFailedCount = accumulator.failedCount
 			let finalStoredCount = accumulator.storedCount
 			let finalProcessedCount = accumulator.processedCount
-			let finalSkippedCount = max(0, sourceURLs.count - finalProcessedCount)
+			let finalSkippedCount = max(0, syncURLs.count - finalProcessedCount)
 			let finalFocusFilename = (finalStoredCount > 0) ? requestedFocusFilename : nil
-			logger.log("sqlite sync: complete database=\(databaseFilename, privacy: .public) requested=\(sourceURLs.count, privacy: .public) processed=\(finalProcessedCount, privacy: .public) stored=\(finalStoredCount, privacy: .public) failed=\(finalFailedCount, privacy: .public) skipped=\(finalSkippedCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public) duration=\(Date().timeIntervalSince(syncStart), privacy: .public)")
+			logger.log("sqlite sync: complete database=\(databaseFilename, privacy: .public) tabObjects=\(sortedSourceURLs.count, privacy: .public) toSync=\(syncURLs.count, privacy: .public) processed=\(finalProcessedCount, privacy: .public) stored=\(finalStoredCount, privacy: .public) failed=\(finalFailedCount, privacy: .public) skipped=\(finalSkippedCount, privacy: .public) duplicatesSkipped=\(duplicateCount, privacy: .public) cancelled=\(wasCancelled, privacy: .public) duration=\(Date().timeIntervalSince(syncStart), privacy: .public)")
 			await MainActor.run {
 				isVaultWorking = false
 				vaultStoreTask = nil
 				vaultAlertMessage = sqliteSyncSummary(
 					stored: finalStoredCount,
 					processed: finalProcessedCount,
-					requested: sourceURLs.count,
+					requested: syncURLs.count,
 					failed: finalFailedCount,
 					skipped: finalSkippedCount,
+					duplicates: duplicateCount,
 					cancelled: wasCancelled,
 					databaseFilename: databaseFilename
 				)
@@ -3412,20 +3576,29 @@ struct ContentView: View {
 		requested: Int,
 		failed: Int,
 		skipped: Int,
+		duplicates: Int,
 		cancelled: Bool,
 		databaseFilename: String
 	) -> String {
 		var pieces: [String] = []
 		let objectSuffix = requested == 1 ? "" : "s"
 		if cancelled {
-			pieces.append("Cancelled.")
+			if stored > 0 {
+				pieces.append("Cancelled; kept \(stored) of \(requested) new object\(objectSuffix) in \(databaseFilename).")
+			} else {
+				pieces.append("Cancelled.")
+			}
+		} else {
+			pieces.append("Synced \(stored) of \(requested) new object\(objectSuffix) to \(databaseFilename).")
 		}
-		pieces.append("Synced \(stored) of \(requested) object\(objectSuffix) to \(databaseFilename).")
-		if processed != requested {
+		if duplicates > 0 {
+			pieces.append("\(duplicates) duplicate\(duplicates == 1 ? "" : "s") skipped.")
+		}
+		if cancelled, stored > 0, processed != stored {
 			pieces.append("Processed \(processed) before cancellation.")
 		}
 		if skipped > 0 {
-			pieces.append("\(skipped) object\(skipped == 1 ? " was" : "s were") not started.")
+			pieces.append("\(skipped) object\(skipped == 1 ? " was" : "s were") not completed.")
 		}
 		if failed > 0 {
 			pieces.append("\(failed) object\(failed == 1 ? " failed" : "s failed").")
@@ -5174,17 +5347,7 @@ struct ContentView: View {
 												await MainActor.run { self.logger.log("scan:batch yielded=\(batchCopy.count, privacy: .public) total=\(library.photos.count, privacy: .public)") }
 												Task.detached { await Telemetry.shared.recordFound(batchCopy.count) }
 
-							// Warm thumbnails for this batch.
-												let warm = batchCopy
-												Task.detached(priority: .utility) {
-													for item in warm {
-														if Task.isCancelled { break }
-														do {
-															let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-															ThumbnailCache.shared.store(img, for: item.url)
-														} catch { }
-													}
-												}
+							warmFilesystemThumbnails(for: batchCopy)
 											}
 										}
 									}
@@ -5259,12 +5422,11 @@ struct ContentView: View {
 				isRefreshing = false
 				return
 			}
-			forceThumbnailLoading = false
+			refreshToken = UUID()
 			library.scan(folder: refreshFolderURL)
 			lastRefreshDuration = Date().timeIntervalSince(start)
 			lastRefreshDate = Date()
 			isRefreshing = false
-			refreshToken = UUID()
 		}
 	}
 
@@ -5553,6 +5715,15 @@ struct ContentView: View {
 		scheduleSort()
 	}
 
+	private func syncDisplayedPhotosDuringScan() {
+		if let paths = personFilterPaths {
+			displayedPhotos = library.photos.filter { paths.contains($0.url.path) }
+		} else {
+			displayedPhotos = library.photos
+		}
+		displayedPhotoSections = []
+	}
+
 	private func scheduleSort() {
 		// Cancel any in-flight sort work and start a new background task.
 		// Provide an immediate, cheap filename-only filter so the UI feels
@@ -5570,6 +5741,11 @@ struct ContentView: View {
 		let mode = activeSortMode
 		let filter = searchText
 		let groupByDescription = shouldGroupGridByDescription
+
+		if library.isScanning {
+			syncDisplayedPhotosDuringScan()
+			return
+		}
 
 		// Quick-pass: update displayedPhotos with a filename-only match
 		// performed on the main actor so typing feels snappy.
@@ -6240,22 +6416,7 @@ struct ContentView: View {
 							library.photos.append(contentsOf: slice)
 							library.lastScanDate = Date()
 						}
-						// Warm thumbnails for the restored batch in background so
-						// the UI can display images quickly without waiting for
-						// on-demand generation. The ThumbnailGenerator itself
-						// limits concurrency so this is safe to run per-batch.
-						Task.detached(priority: .utility) {
-							for item in slice {
-								if Task.isCancelled { break }
-								do {
-									let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-									ThumbnailCache.shared.store(img, for: item.url)
-								} catch {
-									// Ignore individual thumbnail failures — it's
-									// acceptable for some items to fail to generate.
-								}
-							}
-						}
+						warmFilesystemThumbnails(for: slice)
 						idx = end
 						try? await Task.sleep(nanoseconds: 10_000_000) // 10ms gap between batches
 					}

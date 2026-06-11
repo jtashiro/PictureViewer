@@ -8,8 +8,8 @@
 import Foundation
 
 struct BuildInfo {
-    static let buildTimestamp = "2026-06-09 20:32:05 EDT"
-    static let buildIdentifier = "20260609-203205-EDT"
+    static let buildTimestamp = "2026-06-10 19:17:05 EDT"
+    static let buildIdentifier = "20260610-191705-EDT"
 
     static var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"

@@ -40,6 +40,9 @@ final class ThumbnailGenerator: @unchecked Sendable {
 	static let shared = ThumbnailGenerator()
 
 	private let limiter: AsyncLimiter
+	/// VLC snapshot thumbnails require a hidden window on the main actor and
+	/// are much heavier than QuickLook; cap concurrency during bulk sync.
+	private let vlcLimiter: AsyncLimiter
 	private let screenScale: CGFloat
 
 	private init() {
@@ -49,6 +52,7 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		// device you can clamp it back down.
 		let cap = max(1, PhotoLibrary.workerCount)
 		self.limiter = AsyncLimiter(capacity: cap)
+		self.vlcLimiter = AsyncLimiter(capacity: 2)
 		// Cache the main screen backing scale once at init to avoid
 		// hopping to the MainActor on every thumbnail generation call.
 		// Fall back to 2.0 if unavailable.
@@ -67,6 +71,13 @@ final class ThumbnailGenerator: @unchecked Sendable {
 			qlLogger.debug("generateThumbnail:start url=\(url.path, privacy: .public) main=\(Thread.isMainThread, privacy: .public)")
 		}
 		_ = SecurityScopedResourceAccess.ensureAccess(for: url)
+
+		// .flv and .wmv cannot be opened by QuickLook or AVFoundation on macOS.
+		// Skip those failing paths and go straight to VLC (or a generic icon).
+		if PhotoLibrary.requiresExternalVideoPlayer(url) {
+			return try await generateExternalVideoThumbnail(for: url)
+		}
+
 		// Determine scale on main actor if needed.
 		let actualScale: CGFloat
 		if let s = scale {
@@ -91,25 +102,39 @@ final class ThumbnailGenerator: @unchecked Sendable {
 			return rep.nsImage
 		} catch {
 			guard Self.isVideo(url) else { throw error }
+			return try await generateStandardVideoThumbnail(for: url, quickLookError: error)
+		}
+	}
+
+	private func generateStandardVideoThumbnail(for url: URL, quickLookError: Error) async throws -> NSImage {
+		do {
+			let fallback = try await Self.generateVideoFrameThumbnail(for: url)
+			Task { await Telemetry.shared.recordThumbnail() }
+			return fallback
+		} catch {
+			if AppLogLevel.current.allows(.debug) {
+				qlLogger.debug("generateThumbnail: video frame fallback failed url=\(url.path, privacy: .public) quickLookError=\(quickLookError.localizedDescription, privacy: .public) avError=\(error.localizedDescription, privacy: .public)")
+			}
+			return try await generateExternalVideoThumbnail(for: url)
+		}
+	}
+
+	private func generateExternalVideoThumbnail(for url: URL) async throws -> NSImage {
+		if EmbeddedVLCPlayerView.isAvailable {
+			await vlcLimiter.acquire()
+			defer { Task { await self.vlcLimiter.release() } }
 			do {
-				let fallback = try await Self.generateVideoFrameThumbnail(for: url)
+				let vlcThumbnail = try await EmbeddedVLCPlayerView.generateThumbnail(for: url)
+				qlLogger.log("generateThumbnail: generated VLC snapshot thumbnail url=\(url.path, privacy: .public)")
 				Task { await Telemetry.shared.recordThumbnail() }
-				return fallback
+				return vlcThumbnail
 			} catch {
-				qlLogger.error("generateThumbnail: video frame fallback failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-				do {
-					let vlcThumbnail = try await EmbeddedVLCPlayerView.generateThumbnail(for: url)
-					qlLogger.log("generateThumbnail: generated VLC snapshot thumbnail url=\(url.path, privacy: .public)")
-					Task { await Telemetry.shared.recordThumbnail() }
-					return vlcThumbnail
-				} catch {
-					qlLogger.error("generateThumbnail: VLC snapshot fallback failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-				}
-				let fallback = Self.genericVideoThumbnail(for: url)
-				Task { await Telemetry.shared.recordThumbnail() }
-				return fallback
+				qlLogger.error("generateThumbnail: VLC snapshot failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 			}
 		}
+		let fallback = Self.genericVideoThumbnail(for: url)
+		Task { await Telemetry.shared.recordThumbnail() }
+		return fallback
 	}
 
 	private static func isVideo(_ url: URL) -> Bool {
@@ -141,7 +166,7 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
 	}
 
-	private static func genericVideoThumbnail(for url: URL) -> NSImage {
+	static func genericVideoThumbnail(for url: URL) -> NSImage {
 		let icon = NSWorkspace.shared.icon(forFile: url.path)
 		icon.size = NSSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
 		return icon

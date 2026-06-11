@@ -89,6 +89,15 @@ final class PhotoLibrary: ObservableObject {
 		supportedVideoExtensions.contains(url.pathExtension.lowercased())
 	}
 
+	/// Whether a filesystem thumbnail should be generated during folder scan warming.
+	/// Visible grid cells still generate on demand; this only suppresses bulk work while
+	/// batches are appended during a scan.
+	nonisolated static func shouldGenerateFilesystemThumbnail(for url: URL, forceLoad: Bool) -> Bool {
+		if forceLoad { return true }
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		return !isVideoMediaFile(url, contentType: contentType)
+	}
+
 	nonisolated static var cpuSummary: String {
 		let info = ProcessInfo.processInfo
 		return "\(info.activeProcessorCount) of \(info.processorCount) cores active · \(workerCount) scanner threads"

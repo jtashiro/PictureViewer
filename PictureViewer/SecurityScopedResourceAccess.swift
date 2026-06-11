@@ -6,6 +6,37 @@ enum SecurityScopedResourceAccess {
 	nonisolated private static let lock = NSLock()
 	nonisolated(unsafe) private static var activeURLs: [URL] = []
 
+	/// Returns whether a directory can be created and written without starting
+	/// security-scoped access. Used to validate the app working directory.
+	nonisolated static func probesWritableDirectory(_ directory: URL) -> Bool {
+		let fm = FileManager.default
+		do {
+			try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+		} catch {
+			logger.error("security scope: probe createDirectory failed path=\(directory.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			return false
+		}
+		let probe = directory.appendingPathComponent(".write-probe-\(UUID().uuidString)", isDirectory: false)
+		defer { try? fm.removeItem(at: probe) }
+		guard fm.createFile(atPath: probe.path, contents: Data("ok".utf8)) else {
+			logger.error("security scope: probe createFile failed path=\(directory.path, privacy: .public)")
+			return false
+		}
+		return fm.isWritableFile(atPath: directory.path)
+	}
+
+	/// Keeps security-scoped access active for a bookmarked directory for the
+	/// remainder of the process lifetime.
+	nonisolated static func registerSecurityScopedURL(_ url: URL) {
+		let standardizedURL = url.standardizedFileURL
+		lock.lock()
+		if !activeURLs.contains(where: { standardizedURL.path.hasPrefix($0.standardizedFileURL.path) || $0.standardizedFileURL.path.hasPrefix(standardizedURL.path) }) {
+			activeURLs.append(standardizedURL)
+		}
+		lock.unlock()
+		_ = startAccessing(standardizedURL)
+	}
+
 	nonisolated static func ensureAccess(for url: URL) -> Bool {
 		let standardizedURL = url.standardizedFileURL
 		lock.lock()

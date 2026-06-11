@@ -13,6 +13,7 @@ struct StatusBarView: View {
 	let isSQLiteObjectStoreView: Bool
 	let isVaultWorking: Bool
 	let vaultProgressMessage: String
+	let vaultProgressCurrentFile: String
 	let vaultProgressTotal: Int
 	let vaultProgressCompleted: Int
 	let sqliteLoadStartDate: Date?
@@ -64,6 +65,11 @@ struct StatusBarView: View {
 			.padding(.vertical, 4)
 			if ollamaProgress.isActive {
 				ProgressView(value: ollamaProgress.fraction)
+					.progressViewStyle(.linear)
+					.padding(.horizontal, 10)
+					.padding(.bottom, 4)
+			} else if isVaultWorking, vaultProgressTotal > 0 {
+				ProgressView(value: Double(vaultProgressCompleted), total: Double(vaultProgressTotal))
 					.progressViewStyle(.linear)
 					.padding(.horizontal, 10)
 					.padding(.bottom, 4)
@@ -122,6 +128,24 @@ struct StatusBarView: View {
 			}
 		} else if isRefreshing {
 			Text("Refreshing thumbnails…").foregroundStyle(.secondary)
+		} else if isVaultWorking, vaultProgressTotal > 0 {
+			HStack(spacing: 6) {
+				Text(vaultProgressMessage.isEmpty ? "Syncing…" : vaultProgressMessage)
+					.foregroundStyle(.secondary)
+					.lineLimit(1)
+					.truncationMode(.middle)
+				StatusBarBullet()
+				Text("\(vaultProgressCompleted) of \(vaultProgressTotal) synced")
+					.foregroundStyle(.secondary)
+					.monospacedDigit()
+				if !vaultProgressCurrentFile.isEmpty {
+					StatusBarBullet()
+					Text(vaultProgressCurrentFile)
+						.foregroundStyle(.secondary)
+						.lineLimit(1)
+						.truncationMode(.middle)
+				}
+			}
 		} else if isSQLiteObjectStoreView {
 			HStack(spacing: 6) {
 				Text("\(Self.mediaStatusSummary(for: library.photos)) in SQLite store")
