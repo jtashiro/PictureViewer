@@ -468,6 +468,11 @@ struct VaultFileCommands: Commands {
 			}
 			.disabled(vaultActions?.canRecognize != true)
 
+			Button("Recognize Selected Images with Ollama") {
+				vaultActions?.recognizeSelected()
+			}
+			.disabled(vaultActions?.canRecognizeSelected != true)
+
 		}
 
 		CommandGroup(replacing: .pasteboard) {

@@ -42,6 +42,8 @@ struct SettingsView: View {
 	@AppStorage(AppLogLevel.userDefaultsKey) private var logLevelRaw: String = AppLogLevel.defaultLevel.rawValue
 	@AppStorage(AppWorkingDirectory.directoryPathKey) private var appWorkingDirectoryPath: String = ""
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
+@AppStorage("ollamaServerHost") private var ollamaServerHost: String = "localhost"
+@AppStorage("ollamaNumCtx") private var ollamaNumCtx: Int = 4096
 	@State private var workingDirectoryMessage: String?
 	@State private var ollamaModels: [String] = []
 	@State private var ollamaLoading: Bool = false
@@ -203,7 +205,7 @@ struct SettingsView: View {
 						}
 					}
 					.disabled(ollamaLoading)
-					.help("Query Ollama at localhost:11434 for installed vision models")
+					.help("Query Ollama for installed vision models")
 				}
 
 				Text(ollamaStatus)
@@ -212,10 +214,28 @@ struct SettingsView: View {
 					.fixedSize(horizontal: false, vertical: true)
 			} header: {
 				Text("Image Recognition")
-			} footer: {
-				Text("Picture Viewer queries http://localhost:11434/api/tags then uses /api/show to filter to models whose capabilities include \"vision\". Falls back to known vision-model name prefixes when Ollama doesn't return a capabilities field.")
+			}
+			
+			Section {
+				TextField("Ollama Server Host", text: $ollamaServerHost)
+					.help("Enter the hostname or IP address of your Ollama server (default: localhost)")
+				
+				Text("The app will connect to http://[host]:11434/api/tags and /api/generate")
 					.font(.caption)
 					.foregroundStyle(.secondary)
+			} header: {
+				Text("Ollama Server Configuration")
+			}
+			
+			Section {
+				TextField("Context Length (num_ctx)", value: $ollamaNumCtx, format: .number)
+					.help("Set the context length for Ollama requests. Default is 65535.")
+				
+				Text("The num_ctx parameter controls how much context Ollama uses for responses. Higher values allow more context but use more memory.")
+					.font(.caption)
+					.foregroundStyle(.secondary)
+			} header: {
+				Text("Advanced Ollama Settings")
 			}
 		}
 		.formStyle(.grouped)

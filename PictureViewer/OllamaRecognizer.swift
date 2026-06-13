@@ -16,7 +16,50 @@ import os
 actor OllamaRecognizer {
 	static let shared = OllamaRecognizer()
 
-	private static let baseURL = URL(string: "http://localhost:11434")!
+	private static var baseURL: URL {
+		get {
+			let host = UserDefaults.standard.string(forKey: "ollamaServerHost") ?? "localhost"
+			return URL(string: "http://\(host):11434")!
+		}
+		set {
+			// When setting, we store the full URL to maintain backward compatibility
+			if let absoluteString = newValue.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+				UserDefaults.standard.set(absoluteString, forKey: "ollamaServerURL")
+			}
+			// Also store just the host for our new setting
+			let components = URLComponents(url: newValue, resolvingAgainstBaseURL: false)
+			if let host = components?.host {
+				UserDefaults.standard.set(host, forKey: "ollamaServerHost")
+			}
+		}
+	}
+	
+	/// Default context size used when the user hasn't opened Settings yet.
+	/// Vision models OOM on the server-config maximum (e.g. 131070) on Macs
+	/// with limited unified memory — a conservative 4096 fits a typical
+	/// image+prompt+short response without thrashing.
+	static let defaultNumCtx = 4096
+
+	/// On truncation, the batch recognizer retries with num_ctx × 1.5, up to
+	/// `maxTruncationRetries` extra attempts. Hard-capped at `maxRetryNumCtx`
+	/// so growth can't blow past the OOM threshold the user already hit.
+	private static let truncationRetryGrowthFactor: Double = 1.5
+	private static let maxTruncationRetries = 3
+	private static let maxRetryNumCtx = 32768
+
+	private static var numCtx: Int {
+		get {
+			// `integer(forKey:)` returns 0 when the key is missing — fall back to
+			// the same default the SettingsView @AppStorage uses so first-launch
+			// requests don't silently send num_ctx=0 (which Ollama would treat
+			// as "use server default", typically the model's full context).
+			let stored = UserDefaults.standard.object(forKey: "ollamaNumCtx") as? Int
+			return stored.map { $0 > 0 ? $0 : defaultNumCtx } ?? defaultNumCtx
+		}
+		set {
+			UserDefaults.standard.set(newValue, forKey: "ollamaNumCtx")
+		}
+	}
 	static let defaultModel = "llava"
 	static let defaultPrompt = "Describe this image in one sentence."
 	private static let maxEdgePixels: CGFloat = 1024
@@ -53,11 +96,36 @@ actor OllamaRecognizer {
 		let prompt: String
 		let images: [String]
 		let stream: Bool
+		let options: Options?
+
+		struct Options: Encodable {
+			let num_ctx: Int
+		}
+
+		init(model: String, prompt: String, images: [String], stream: Bool = false, num_ctx: Int? = nil) {
+			self.model = model
+			self.prompt = prompt
+			self.images = images
+			self.stream = stream
+			// Ollama requires generation parameters (num_ctx, temperature, top_p, …)
+			// inside an `options` object on /api/generate. Top-level fields are
+			// silently ignored and the server falls back to its config default
+			// (e.g. 131070), which OOMs on machines with limited unified memory.
+			self.options = num_ctx.map { Options(num_ctx: $0) }
+		}
 	}
 
 	private struct GenerateResponse: Decodable {
 		let response: String?
 		let error: String?
+		/// "stop" on a clean finish; "length" when the model hit num_predict or
+		/// the context window; "load" when the server bailed before generating.
+		let done_reason: String?
+		/// Older Ollama versions populate this when the prompt itself was
+		/// truncated to fit `num_ctx`.
+		let truncated: Bool?
+		let prompt_eval_count: Int?
+		let eval_count: Int?
 	}
 
 	private struct TagsResponse: Decodable {
@@ -79,14 +147,17 @@ actor OllamaRecognizer {
 	/// to an on-disk file — batch callers should use `recognizeAndLog`, which
 	/// materializes lazy SQLite working copies on demand and removes them
 	/// after the post-recognition callback completes.
-	func recognize(imageURL url: URL, prompt: String, model: String) async throws -> String {
+	/// `numCtx` overrides the Settings-stored value (used by retry logic on
+	/// truncation); pass nil to use the configured default.
+	func recognize(imageURL url: URL, prompt: String, model: String, numCtx: Int? = nil) async throws -> String {
 		try Task.checkCancellation()
 		guard let base64 = Self.encodedImageData(for: url) else {
 			throw RecognizerError.imageEncodingFailed
 		}
 		try Task.checkCancellation()
 
-		let body = GenerateRequest(model: model, prompt: prompt, images: [base64], stream: false)
+		let effectiveNumCtx = numCtx ?? Self.numCtx
+		let body = GenerateRequest(model: model, prompt: prompt, images: [base64], stream: false, num_ctx: effectiveNumCtx)
 		var request = URLRequest(url: Self.baseURL.appendingPathComponent("api/generate"))
 		request.httpMethod = "POST"
 		request.timeoutInterval = Self.requestTimeout
@@ -105,13 +176,43 @@ actor OllamaRecognizer {
 
 		let decoded = try JSONDecoder().decode(GenerateResponse.self, from: data)
 		if let error = decoded.error, !error.isEmpty {
+			// Some Ollama builds surface context overflow as a plain-text error
+			// (e.g. "input length exceeds context length") rather than a flag,
+			// so route those into the truncated case for actionable messaging.
+			if Self.isTruncationError(error) {
+				throw RecognizerError.responseTruncated(partial: "", reason: error)
+			}
 			throw RecognizerError.ollamaError(error)
 		}
 		let text = (decoded.response ?? "")
 			.trimmingCharacters(in: .whitespacesAndNewlines)
 			.replacingOccurrences(of: "\n", with: " ")
 			.replacingOccurrences(of: "\r", with: " ")
+		if let reason = Self.truncationReason(from: decoded) {
+			throw RecognizerError.responseTruncated(partial: text, reason: reason)
+		}
 		return text
+	}
+
+	/// Returns a short reason string when the response shows signs of being
+	/// cut off, or nil if the generation completed cleanly.
+	private static func truncationReason(from response: GenerateResponse) -> String? {
+		if response.truncated == true {
+			return "prompt truncated to fit num_ctx"
+		}
+		if let reason = response.done_reason?.lowercased(), reason == "length" {
+			return "done_reason=length (context window or num_predict hit)"
+		}
+		return nil
+	}
+
+	private static func isTruncationError(_ message: String) -> Bool {
+		let lowered = message.lowercased()
+		return lowered.contains("context length")
+			|| lowered.contains("context window")
+			|| lowered.contains("exceeds context")
+			|| lowered.contains("input length")
+			|| lowered.contains("truncat")
 	}
 
 	/// Recognizes a sequence of image URLs sequentially, logging one line per
@@ -161,18 +262,57 @@ actor OllamaRecognizer {
 				readableURL = url
 			}
 			var cancelled = false
-			do {
-				let text = try await recognize(imageURL: readableURL, prompt: effectivePrompt, model: effectiveModel)
-				logger.log("ollama:recognized \(position, privacy: .public) \(filename, privacy: .public) — \(text, privacy: .public)")
+			// Retry-on-truncation loop. Each retry grows num_ctx by
+			// `truncationRetryGrowthFactor` (capped at `maxRetryNumCtx`) so a
+			// transient truncation from a too-small context doesn't kill the
+			// recognition. If we still truncate after `maxTruncationRetries`
+			// extra attempts, fall back to whatever partial text we have.
+			var currentNumCtx = Self.numCtx
+			var attempt = 0
+			var producedText: String?
+			truncationRetryLoop: while attempt <= Self.maxTruncationRetries {
+				do {
+					let text = try await recognize(
+						imageURL: readableURL,
+						prompt: effectivePrompt,
+						model: effectiveModel,
+						numCtx: currentNumCtx
+					)
+					if attempt > 0 {
+						logger.log("ollama:retry-success \(position, privacy: .public) \(filename, privacy: .public) attempt=\(attempt, privacy: .public) numCtx=\(currentNumCtx, privacy: .public)")
+					}
+					producedText = text
+					break truncationRetryLoop
+				} catch is CancellationError {
+					logger.log("ollama:batch cancelled at=\(position, privacy: .public) \(filename, privacy: .public)")
+					cancelled = true
+					break truncationRetryLoop
+				} catch let RecognizerError.responseTruncated(partial, reason) {
+					let nextNumCtx = min(
+						Int((Double(currentNumCtx) * Self.truncationRetryGrowthFactor).rounded()),
+						Self.maxRetryNumCtx
+					)
+					if attempt < Self.maxTruncationRetries, nextNumCtx > currentNumCtx {
+						logger.error("ollama:truncated \(position, privacy: .public) \(filename, privacy: .public) reason=\(reason, privacy: .public) numCtx=\(currentNumCtx, privacy: .public) retryWithNumCtx=\(nextNumCtx, privacy: .public) attempt=\(attempt + 1, privacy: .public)")
+						currentNumCtx = nextNumCtx
+						attempt += 1
+						continue truncationRetryLoop
+					}
+					// Out of retries or already at the cap — accept partial.
+					logger.error("ollama:truncated-final \(position, privacy: .public) \(filename, privacy: .public) reason=\(reason, privacy: .public) numCtx=\(currentNumCtx, privacy: .public) attempts=\(attempt + 1, privacy: .public) partialBytes=\(partial.utf8.count, privacy: .public)")
+					producedText = partial.isEmpty ? nil : partial
+					break truncationRetryLoop
+				} catch {
+					logger.error("ollama:failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+					break truncationRetryLoop
+				}
+			}
+			if let producedText {
+				logger.log("ollama:recognized \(position, privacy: .public) \(filename, privacy: .public) — \(producedText, privacy: .public)")
 				success += 1
 				if let onRecognized {
-					await onRecognized(url, text)
+					await onRecognized(url, producedText)
 				}
-			} catch is CancellationError {
-				logger.log("ollama:batch cancelled at=\(position, privacy: .public) \(filename, privacy: .public)")
-				cancelled = true
-			} catch {
-				logger.error("ollama:failed \(position, privacy: .public) \(filename, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
 			}
 			// Always clean up lazy SQLite working copies after recognition —
 			// canonical bytes live in the .sqlite database and can be re-materialized
@@ -281,6 +421,11 @@ actor OllamaRecognizer {
 		case invalidResponse
 		case httpError(status: Int, body: String)
 		case ollamaError(String)
+		/// The server returned an output that was cut off (response hit
+		/// num_predict / context window, or the prompt itself was truncated to
+		/// fit num_ctx). `partial` carries whatever text we did receive so the
+		/// caller can decide whether to use it.
+		case responseTruncated(partial: String, reason: String)
 
 		var errorDescription: String? {
 			switch self {
@@ -292,6 +437,8 @@ actor OllamaRecognizer {
 				return "Ollama HTTP \(status): \(body)"
 			case .ollamaError(let message):
 				return "Ollama error: \(message)"
+			case .responseTruncated(_, let reason):
+				return "Ollama response truncated (\(reason)) — raise num_ctx or shorten the prompt"
 			}
 		}
 	}

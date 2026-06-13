@@ -20,6 +20,7 @@ struct PhotoGridCell: View {
 	let onCopyFiles: ([URL]) -> Void
 	let onEditKeywords: () -> Void
 	let onRepairMetadata: () -> Void
+	let onRecognizeWithOllama: () -> Void
 
 	var body: some View {
 		ZStack(alignment: .topTrailing) {
@@ -74,6 +75,8 @@ struct PhotoGridCell: View {
 			Divider()
 			Button(contextURLs.count > 1 ? "Edit Keywords for Selected" : "Edit Keywords", action: onEditKeywords)
 			Button("Repair metadata", action: onRepairMetadata)
+			Divider()
+			Button(contextURLs.count > 1 ? "Recognize Selected with Ollama" : "Recognize with Ollama", action: onRecognizeWithOllama)
 		}
 	}
 }

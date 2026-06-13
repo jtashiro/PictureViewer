@@ -745,6 +745,12 @@ struct ContentView: View {
 	@State private var vaultStatus = PhotoVaultStatus(isConfigured: false, hasLocation: false, hasPassword: false, isUnlocked: false, locationPath: nil)
 	@State private var isShowingVaultUnlockPrompt: Bool = false
 	@State private var isShowingOllamaPromptSheet: Bool = false
+	/// When true, the active Ollama prompt sheet targets the current selection
+	/// rather than all displayed photos.
+	@State private var ollamaSheetUsesSelection: Bool = false
+	/// When non-nil, the active Ollama prompt sheet targets exactly these URLs
+	/// (used by context-menu invocations). Overrides `ollamaSheetUsesSelection`.
+	@State private var ollamaSheetExplicitURLs: [URL]? = nil
 	@AppStorage("ollamaLastPrompt") private var ollamaPrompt: String = OllamaRecognizer.defaultPrompt
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
 	@AppStorage("ollamaUpdateMetadata") private var ollamaUpdateMetadata: Bool = true
@@ -878,6 +884,7 @@ struct ContentView: View {
 			paste: { pasteFilesToVault() },
 			selectAll: { selectAllDisplayedPhotos() },
 			recognizeDisplayed: { recognizeDisplayedImagesWithOllama() },
+			recognizeSelected: { recognizeSelectedImagesWithOllama() },
 			canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
 			canRenameVault: isActiveVaultView && library.folderURL != nil,
 			canImportSelected: hasSelectedPhotos,
@@ -890,7 +897,8 @@ struct ContentView: View {
 			canCopy: hasSelectedPhotos,
 			canPaste: canPasteFilesToVault,
 			canSelectAll: !displayedPhotos.isEmpty,
-			canRecognize: !displayedPhotos.isEmpty
+			canRecognize: !displayedPhotos.isEmpty,
+			canRecognizeSelected: hasSelectedPhotos
 		)
 	}
 
@@ -1411,14 +1419,23 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isShowingOllamaPromptSheet) {
 			OllamaPromptSheet(
-				imageCount: ollamaRecognitionURLs().count,
+				imageCount: ollamaRecognitionURLs(
+					selectedOnly: ollamaSheetUsesSelection,
+					explicit: ollamaSheetExplicitURLs
+				).count,
 				modelName: ollamaSelectedModel,
 				prompt: $ollamaPrompt,
 				updateMetadata: $ollamaUpdateMetadata,
-				onCancel: { isShowingOllamaPromptSheet = false },
-				onRun: {
+				onCancel: {
 					isShowingOllamaPromptSheet = false
-					runOllamaRecognition()
+					ollamaSheetExplicitURLs = nil
+				},
+				onRun: {
+					let selectedOnly = ollamaSheetUsesSelection
+					let explicit = ollamaSheetExplicitURLs
+					isShowingOllamaPromptSheet = false
+					ollamaSheetExplicitURLs = nil
+					runOllamaRecognition(selectedOnly: selectedOnly, explicit: explicit)
 				}
 			)
 		}
@@ -2242,7 +2259,10 @@ struct ContentView: View {
 					onDoubleClick: { openPhotoViewer(photo.url) },
 					onCopyFiles: copyFilesToPasteboard,
 					onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: photo.url)) },
-					onRepairMetadata: { triggerRepairMetadata(for: photo.url) }
+					onRepairMetadata: { triggerRepairMetadata(for: photo.url) },
+					onRecognizeWithOllama: {
+						recognizeContextImagesWithOllama(contextActionURLs(for: photo.url))
+					}
 				)
 			}
 		}
@@ -2569,17 +2589,43 @@ struct ContentView: View {
 	}
 
 	private func recognizeDisplayedImagesWithOllama() {
-		guard !ollamaRecognitionURLs().isEmpty else { return }
+		guard !ollamaRecognitionURLs(selectedOnly: false).isEmpty else { return }
+		ollamaSheetUsesSelection = false
+		ollamaSheetExplicitURLs = nil
 		isShowingOllamaPromptSheet = true
 	}
 
-	private func ollamaRecognitionURLs() -> [URL] {
-		displayedPhotos
-			.map(\.url)
-			.filter { url in
-				let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
-				return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
-			}
+	private func recognizeSelectedImagesWithOllama() {
+		guard !ollamaRecognitionURLs(selectedOnly: true).isEmpty else { return }
+		ollamaSheetUsesSelection = true
+		ollamaSheetExplicitURLs = nil
+		isShowingOllamaPromptSheet = true
+	}
+
+	private func ollamaRecognitionURLs(selectedOnly: Bool, explicit: [URL]? = nil) -> [URL] {
+		let candidates: [URL]
+		if let explicit {
+			candidates = explicit
+		} else if selectedOnly {
+			candidates = selectedPhotoURLsInDisplayOrder()
+		} else {
+			candidates = displayedPhotos.map(\.url)
+		}
+		return candidates.filter { url in
+			let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+			return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
+		}
+	}
+
+	/// Invoked from a thumbnail's right-click context menu. `urls` is the set
+	/// returned by `contextActionURLs(for:)` — either the single right-clicked
+	/// photo or the current selection if the click happened on a selected cell.
+	private func recognizeContextImagesWithOllama(_ urls: [URL]) {
+		let filtered = ollamaRecognitionURLs(selectedOnly: false, explicit: urls)
+		guard !filtered.isEmpty else { return }
+		ollamaSheetUsesSelection = false
+		ollamaSheetExplicitURLs = filtered
+		isShowingOllamaPromptSheet = true
 	}
 
 	private var personRecognitionTargetURLs: [URL] {
@@ -2776,8 +2822,8 @@ struct ContentView: View {
 		personRecognitionTask = task
 	}
 
-	private func runOllamaRecognition() {
-		let urls = ollamaRecognitionURLs()
+	private func runOllamaRecognition(selectedOnly: Bool, explicit: [URL]? = nil) {
+		let urls = ollamaRecognitionURLs(selectedOnly: selectedOnly, explicit: explicit)
 		guard !urls.isEmpty else { return }
 		let prompt = ollamaPrompt
 		let model = ollamaSelectedModel
