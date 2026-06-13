@@ -33,6 +33,8 @@ struct ThumbnailView: View {
 	// Default to false so thumbnails load by default. Setting this to true
 	// defers thumbnail loading at app launch (can help avoid startup spikes).
 	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
+	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
+	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
 
 	init(url: URL, size: CGFloat, refreshToken: UUID, metadataRefreshToken: UUID = Self.defaultMetadataRefreshToken, forceLoad: Bool = false) {
 		self.url = url
@@ -89,7 +91,7 @@ struct ThumbnailView: View {
 				.frame(maxWidth: size)
 				.foregroundStyle(.primary)
 
-			if let embeddedDescription, !embeddedDescription.isEmpty {
+			if displayDescriptionInGrid, let embeddedDescription, !embeddedDescription.isEmpty {
 				Text(embeddedDescription)
 					.font(.caption2)
 					.lineLimit(2)
@@ -98,7 +100,7 @@ struct ThumbnailView: View {
 					.foregroundStyle(.secondary)
 			}
 
-			if !embeddedKeywords.isEmpty {
+			if displayKeywordsInGrid, !embeddedKeywords.isEmpty {
 				Text(embeddedKeywords.joined(separator: ", "))
 					.font(.caption2)
 					.lineLimit(1)

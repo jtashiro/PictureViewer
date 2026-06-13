@@ -117,6 +117,7 @@ struct PictureViewerApp: App {
 		}
 		.commands {
 			VaultFileCommands()
+			ViewDisplayCommands()
 			WindowMergeCommands()
 			AboutCommands(isShowingAboutSheet: $isShowingAboutSheet)
 		}
@@ -336,6 +337,20 @@ struct WindowMergeCommands: Commands {
 			Button("Merge All Windows") {
 				PictureViewerWindowTabber.mergeAllWindows()
 			}
+		}
+	}
+}
+
+/// View menu toggles that control which metadata strings appear under each
+/// thumbnail in the grid. The two toggles are independent.
+struct ViewDisplayCommands: Commands {
+	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
+	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
+
+	var body: some Commands {
+		CommandGroup(after: .toolbar) {
+			Toggle("Display Description", isOn: $displayDescriptionInGrid)
+			Toggle("Display Keywords", isOn: $displayKeywordsInGrid)
 		}
 	}
 }
