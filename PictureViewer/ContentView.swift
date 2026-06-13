@@ -754,6 +754,8 @@ struct ContentView: View {
 	@AppStorage("ollamaLastPrompt") private var ollamaPrompt: String = OllamaRecognizer.defaultPrompt
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
 	@AppStorage("ollamaUpdateMetadata") private var ollamaUpdateMetadata: Bool = true
+	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
+	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
 	@State private var vaultUnlockPassword: String = ""
 	@State private var vaultUnlockConfirmation: String = ""
 	@State private var vaultUnlockMessage: String?
