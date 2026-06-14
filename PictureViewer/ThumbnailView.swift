@@ -33,8 +33,8 @@ struct ThumbnailView: View {
 	// Default to false so thumbnails load by default. Setting this to true
 	// defers thumbnail loading at app launch (can help avoid startup spikes).
 	@AppStorage("disableThumbnailLoadingAtLaunch") private var disableThumbnailLoadingAtLaunch: Bool = false
-	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
-	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayDescriptionInGrid) private var displayDescriptionInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayKeywordsInGrid) private var displayKeywordsInGrid: Bool = false
 
 	init(url: URL, size: CGFloat, refreshToken: UUID, metadataRefreshToken: UUID = Self.defaultMetadataRefreshToken, forceLoad: Bool = false) {
 		self.url = url

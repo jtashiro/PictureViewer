@@ -35,10 +35,10 @@ enum PhotoDisplayMode: String, CaseIterable, Identifiable, Sendable {
 
 struct SettingsView: View {
 	@AppStorage("photoDisplayMode") private var displayMode: PhotoDisplayMode = .fullScreen
-	@AppStorage("useVLCForVideoPlayback") private var useVLCForVideoPlayback: Bool = false
-	@AppStorage("saveOpenWindows") private var saveOpenWindows: Bool = false
+	@AppStorage(AppSettingsKey.useVLCForVideoPlayback) private var useVLCForVideoPlayback: Bool = false
+	@AppStorage(AppSettingsKey.saveOpenWindows) private var saveOpenWindows: Bool = false
 	@AppStorage("requirePasswordAtLaunch") private var requirePasswordAtLaunch: Bool = true
-	@AppStorage("deferAtLaunchBackgroundWork") private var deferAtLaunchBackgroundWork: Bool = true
+	@AppStorage(AppSettingsKey.deferAtLaunchBackgroundWork) private var deferAtLaunchBackgroundWork: Bool = true
 	@AppStorage(AppLogLevel.userDefaultsKey) private var logLevelRaw: String = AppLogLevel.defaultLevel.rawValue
 	@AppStorage(AppWorkingDirectory.directoryPathKey) private var appWorkingDirectoryPath: String = ""
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel

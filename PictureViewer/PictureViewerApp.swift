@@ -24,17 +24,17 @@ struct PictureViewerApp: App {
 		let embeddedVLCIsAvailable = EmbeddedVLCPlayerView.isAvailable
 		EmbeddedVLCPlayerView.logAvailabilityResult(context: "app launch")
 		if embeddedVLCIsAvailable {
-			UserDefaults.standard.set(true, forKey: "useVLCForVideoPlayback")
+			UserDefaults.standard.set(true, forKey: AppSettingsKey.useVLCForVideoPlayback)
 			logger.log("vlc embedded: auto-enabled setting useVLCForVideoPlayback=true at launch")
 		} else {
-			let currentSetting = UserDefaults.standard.bool(forKey: "useVLCForVideoPlayback")
+			let currentSetting = UserDefaults.standard.bool(forKey: AppSettingsKey.useVLCForVideoPlayback)
 			logger.log("vlc embedded: not auto-enabling setting at launch; embedded runtime unavailable currentSetting=\(currentSetting, privacy: .public)")
 		}
 		// Respect a runtime toggle to defer potentially expensive background
 		// work at launch while debugging responsiveness. Set the UserDefault
 		// key "deferAtLaunchBackgroundWork" to false to re-enable the
 		// default background work (thumbnail cache sweep).
-		let deferAtLaunch = UserDefaults.standard.object(forKey: "deferAtLaunchBackgroundWork") as? Bool ?? true
+		let deferAtLaunch = UserDefaults.standard.object(forKey: AppSettingsKey.deferAtLaunchBackgroundWork) as? Bool ?? true
 		if deferAtLaunch {
 			logger.log("Deferring at-launch background work: thumbnail sweep disabled")
 		} else {
@@ -68,7 +68,7 @@ struct PictureViewerApp: App {
 
 	@MainActor
 	private static func snapshotSessionOnTermination() {
-		let save = UserDefaults.standard.bool(forKey: "saveOpenWindows")
+		let save = UserDefaults.standard.bool(forKey: AppSettingsKey.saveOpenWindows)
 		let logger = Logger(subsystem: "com.example.PictureViewer", category: "app")
 		WindowStateStore.shared.markAppTerminating()
 		PhotoVault.clearWorkingCopiesOnDisk()
@@ -344,8 +344,8 @@ struct WindowMergeCommands: Commands {
 /// View menu toggles that control which metadata strings appear under each
 /// thumbnail in the grid. The two toggles are independent.
 struct ViewDisplayCommands: Commands {
-	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
-	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayDescriptionInGrid) private var displayDescriptionInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayKeywordsInGrid) private var displayKeywordsInGrid: Bool = false
 
 	var body: some Commands {
 		CommandGroup(after: .toolbar) {

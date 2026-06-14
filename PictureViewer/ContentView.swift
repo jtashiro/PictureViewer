@@ -12,40 +12,14 @@ import CryptoKit
 import os
 import UniformTypeIdentifiers
 
-private struct PhotoGridSection: Identifiable {
-	let id: String
-	let title: String
-	let photos: [PhotoItem]
-}
-
 struct ContentView: View {
 	@StateObject private var library = PhotoLibrary()
 	@StateObject private var faceScanProgress = FaceScanProgress.shared
 	@ObservedObject private var ollamaProgress = OllamaProgress.shared
 	@StateObject private var personFilterState = PersonFilterState.shared
 	@State private var thumbnailSize: CGFloat = 160
-	@AppStorage("sortMode") private var sortModeRaw: Int = 0
-	@AppStorage("groupGridByDescription") private var groupGridByDescription = false
-	private enum SortMode: Int, CaseIterable, Identifiable {
-		case alphaAsc = 0
-		case alphaDesc = 1
-		case fileDate = 2
-		case imageDate = 3
-		case descriptionAsc = 4
-		case descriptionDesc = 5
-
-		var id: Int { rawValue }
-		var title: String {
-			switch self {
-			case .alphaAsc: return "Name ↑"
-			case .alphaDesc: return "Name ↓"
-			case .fileDate: return "File Date"
-			case .imageDate: return "Image Date"
-			case .descriptionAsc: return "Description ↑"
-			case .descriptionDesc: return "Description ↓"
-			}
-		}
-	}
+	@AppStorage(AppSettingsKey.sortMode) private var sortModeRaw: Int = 0
+	@AppStorage(AppSettingsKey.groupGridByDescription) private var groupGridByDescription = false
 
 	private enum KeywordEditOperation: Sendable {
 		case append
@@ -221,7 +195,7 @@ struct ContentView: View {
 								library.photos.append(contentsOf: slice)
 								library.lastScanDate = Date()
 							}
-							warmFilesystemThumbnails(for: slice)
+							ThumbnailWarmService.warmFilesystemThumbnails(for: slice)
 
 							idx = end
 							try? await Task.sleep(nanoseconds: 10_000_000) // 10ms gap between batches
@@ -243,7 +217,7 @@ struct ContentView: View {
 									// Read the AppStorage-backed flag from UserDefaults here
 									// because this is a static context and instance
 									// properties (like @AppStorage) aren't available.
-									if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
+									if UserDefaults.standard.bool(forKey: AppSettingsKey.deferAtLaunchBackgroundWork) {
 										logger.log("launch folder refresh: source=legacy-bookmark storage=filesystem result=deferred folder=\(url.path, privacy: .public)")
 									} else {
 										logger.log("launch folder refresh: source=legacy-bookmark storage=filesystem result=started folder=\(url.path, privacy: .public)")
@@ -608,9 +582,7 @@ struct ContentView: View {
 	@State private var searchText: String = ""
 	@State private var isRefreshing = false
 	@State private var selectionMode: Bool = false
-	@State private var selectedItems: Set<URL> = []
-	@State private var isAllDisplayedSelectionActive: Bool = false
-	@State private var deselectedItemsFromAll: Set<URL> = []
+	@State private var selection = GallerySelectionModel()
 	@State private var thumbnailFrames: [URL: CGRect] = [:]
 	@State private var pendingThumbnailFrames: [URL: CGRect] = [:]
 	@State private var thumbnailFrameTask: Task<Void, Never>? = nil
@@ -673,11 +645,11 @@ struct ContentView: View {
 	// Use a dedicated window for People; open via `openWindow(id:value:)`
 	@State private var lastRefreshDuration: TimeInterval?
 	@State private var lastRefreshDate: Date?
-	@AppStorage("saveOpenWindows") private var saveOpenWindows: Bool = false
+	@AppStorage(AppSettingsKey.saveOpenWindows) private var saveOpenWindows: Bool = false
 	@Environment(\.openWindow) private var openWindow
-	@AppStorage("disableAutoRestoreWindows") private var disableAutoRestoreWindows: Bool = true
-	@AppStorage("deferAtLaunchBackgroundWork") private var deferAtLaunchBackgroundWork: Bool = true
-	@AppStorage("useVLCForVideoPlayback") private var useVLCForVideoPlayback: Bool = false
+	@AppStorage(AppSettingsKey.disableAutoRestoreWindows) private var disableAutoRestoreWindows: Bool = true
+	@AppStorage(AppSettingsKey.deferAtLaunchBackgroundWork) private var deferAtLaunchBackgroundWork: Bool = true
+	@AppStorage(AppSettingsKey.useVLCForVideoPlayback) private var useVLCForVideoPlayback: Bool = false
 
 	private let logger = Logger(subsystem: "com.example.PictureViewer", category: "ui")
 	// Persisted security-scoped bookmark keys
@@ -754,8 +726,8 @@ struct ContentView: View {
 	@AppStorage("ollamaLastPrompt") private var ollamaPrompt: String = OllamaRecognizer.defaultPrompt
 	@AppStorage("ollamaSelectedModel") private var ollamaSelectedModel: String = OllamaRecognizer.defaultModel
 	@AppStorage("ollamaUpdateMetadata") private var ollamaUpdateMetadata: Bool = true
-	@AppStorage("displayDescriptionInGrid") private var displayDescriptionInGrid: Bool = false
-	@AppStorage("displayKeywordsInGrid") private var displayKeywordsInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayDescriptionInGrid) private var displayDescriptionInGrid: Bool = false
+	@AppStorage(AppSettingsKey.displayKeywordsInGrid) private var displayKeywordsInGrid: Bool = false
 	@State private var vaultUnlockPassword: String = ""
 	@State private var vaultUnlockConfirmation: String = ""
 	@State private var vaultUnlockMessage: String?
@@ -2177,10 +2149,7 @@ struct ContentView: View {
 	}
 
 	private var selectedPhotoCount: Int {
-		if isAllDisplayedSelectionActive {
-			return max(0, displayedPhotos.count - deselectedItemsFromAll.count)
-		}
-		return selectedItems.count
+		selection.selectedCount(displayedPhotos: displayedPhotos)
 	}
 
 	private var hasSelectedPhotos: Bool {
@@ -2199,8 +2168,6 @@ struct ContentView: View {
 		groupGridByDescription
 	}
 
-	private static let noDescriptionSectionKey = "\u{0000}No Description"
-
 	private func isPhotoSectionCollapsed(_ section: PhotoGridSection) -> Bool {
 		collapsedPhotoSectionIDs.contains(section.id)
 	}
@@ -2215,59 +2182,31 @@ struct ContentView: View {
 
 	@ViewBuilder
 	private func photoGridSectionHeader(_ section: PhotoGridSection) -> some View {
-		Button {
-			withAnimation(.easeInOut(duration: 0.2)) {
-				togglePhotoSectionCollapse(section.id)
-			}
-		} label: {
-			HStack(spacing: 8) {
-				Image(systemName: isPhotoSectionCollapsed(section) ? "chevron.right" : "chevron.down")
-					.font(.caption.weight(.semibold))
-					.foregroundStyle(.secondary)
-					.frame(width: 12)
-				Text(section.title)
-					.font(.headline)
-					.foregroundStyle(.primary)
-				Text("\(section.photos.count)")
-					.font(.caption)
-					.foregroundStyle(.secondary)
-					.monospacedDigit()
-				Spacer()
-			}
-			.frame(maxWidth: .infinity, alignment: .leading)
-			.contentShape(Rectangle())
-		}
-		.buttonStyle(.plain)
-		.help(isPhotoSectionCollapsed(section) ? "Expand section" : "Collapse section")
+		PhotoGridSectionHeader(
+			section: section,
+			isCollapsed: isPhotoSectionCollapsed(section),
+			onToggle: { togglePhotoSectionCollapse(section.id) }
+		)
 	}
 
 	@ViewBuilder
 	private func photoGridCells(for photos: [PhotoItem]) -> some View {
-		LazyVGrid(
-			columns: [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize * 1.4), spacing: 10)],
-			spacing: 10
-		) {
-			ForEach(photos) { photo in
-				PhotoGridCell(
-					url: photo.url,
-					size: thumbnailSize,
-					refreshToken: refreshToken,
-					metadataRefreshToken: metadataRefreshTokens[photo.url] ?? refreshToken,
-					forceLoad: forceThumbnailLoading,
-					isSelected: isPhotoSelected(photo.url),
-					selectionMode: selectionMode,
-					contextActionURLs: { contextActionURLs(for: photo.url) },
-					onSingleClick: { handleThumbnailSingleClick(photo.url) },
-					onDoubleClick: { openPhotoViewer(photo.url) },
-					onCopyFiles: copyFilesToPasteboard,
-					onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: photo.url)) },
-					onRepairMetadata: { triggerRepairMetadata(for: photo.url) },
-					onRecognizeWithOllama: {
-						recognizeContextImagesWithOllama(contextActionURLs(for: photo.url))
-					}
-				)
-			}
-		}
+		PhotoGridCellsView(
+			photos: photos,
+			thumbnailSize: thumbnailSize,
+			refreshToken: refreshToken,
+			metadataRefreshTokens: metadataRefreshTokens,
+			forceThumbnailLoading: forceThumbnailLoading,
+			selectionMode: selectionMode,
+			isPhotoSelected: isPhotoSelected,
+			contextActionURLs: { contextActionURLs(for: $0) },
+			onSingleClick: handleThumbnailSingleClick,
+			onDoubleClick: openPhotoViewer,
+			onCopyFiles: copyFilesToPasteboard,
+			onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: $0)) },
+			onRepairMetadata: triggerRepairMetadata,
+			onRecognizeWithOllama: { recognizeContextImagesWithOllama(contextActionURLs(for: $0)) }
+		)
 	}
 
 	private var galleryStatusText: String? {
@@ -2294,50 +2233,31 @@ struct ContentView: View {
 	}
 
 	private var selectedPhotoURLs: [URL] {
-		if isAllDisplayedSelectionActive {
-			let excluded = deselectedItemsFromAll
-			return displayedPhotos.map(\.url).filter { !excluded.contains($0) }
-		}
-		return Array(selectedItems)
+		selection.selectedURLs(displayedPhotos: displayedPhotos)
 	}
 
 	private func selectedPhotoURLsInDisplayOrder() -> [URL] {
-		let orderedURLs = displayedPhotos.map(\.url)
-		let orderIndex = Dictionary(uniqueKeysWithValues: orderedURLs.enumerated().map { ($1, $0) })
-		return selectedPhotoURLs.sorted {
-			(orderIndex[$0] ?? Int.max) < (orderIndex[$1] ?? Int.max)
-		}
+		selection.selectedURLsInDisplayOrder(displayedPhotos: displayedPhotos)
 	}
 
 	private func isPhotoSelected(_ url: URL) -> Bool {
-		if isAllDisplayedSelectionActive {
-			return !deselectedItemsFromAll.contains(url)
-		}
-		return selectedItems.contains(url)
+		selection.isSelected(url)
 	}
 
 	private func clearSelection() {
-		selectedItems.removeAll()
-		deselectedItemsFromAll.removeAll()
-		isAllDisplayedSelectionActive = false
+		selection.clear()
 	}
 
 	private func selectSinglePhoto(_ url: URL) {
-		selectedItems = [url]
-		deselectedItemsFromAll.removeAll()
-		isAllDisplayedSelectionActive = false
+		selection.selectSingle(url)
 	}
 
 	private func removeFromSelection(_ url: URL) {
-		if isAllDisplayedSelectionActive {
-			deselectedItemsFromAll.insert(url)
-		} else {
-			selectedItems.remove(url)
-		}
+		selection.remove(url)
 	}
 
 	private func selectedSetForMarqueeBase() -> Set<URL> {
-		Set(selectedPhotoURLs)
+		selection.selectedSetForCurrentDisplay(displayedPhotos: displayedPhotos)
 	}
 
 	private func loadExistingPersonNamesForAssignment() {
@@ -2384,7 +2304,7 @@ struct ContentView: View {
 		let keywords: [String]
 		switch operation {
 		case .append, .replace:
-			keywords = Self.parseKeywordInput(editKeywordsText)
+			keywords = PhotoMetadataService.parseKeywordInput(editKeywordsText)
 		case .clear:
 			keywords = []
 		}
@@ -2477,57 +2397,24 @@ struct ContentView: View {
 	}
 
 	private func thumbnailColumnCount() -> Int {
-		let sortedFrames = displayedPhotos.compactMap { photo -> (url: URL, frame: CGRect)? in
-			guard let frame = thumbnailFrames[photo.url] else { return nil }
-			return (photo.url, frame)
-		}
-		guard let first = sortedFrames.min(by: {
-			if abs($0.frame.minY - $1.frame.minY) > 0.5 {
-				return $0.frame.minY < $1.frame.minY
-			}
-			return $0.frame.minX < $1.frame.minX
-		}) else {
-			return 1
-		}
-		let rowY = first.frame.minY
-		let threshold: CGFloat = 1
-		let count = sortedFrames.filter { abs($0.frame.minY - rowY) < threshold }.count
-		return max(1, count)
+		GalleryGridSelectionGeometry.columnCount(
+			displayedPhotos: displayedPhotos,
+			thumbnailFrames: thumbnailFrames
+		)
 	}
 
 	private func moveGridSelection(in direction: GridNavigationDirection) {
 		guard !displayedPhotos.isEmpty else { return }
-		guard !isAllDisplayedSelectionActive else { return }
+		guard !selection.isAllDisplayedSelectionActive else { return }
 
 		let orderedPhotos = displayedPhotos.map(\.url)
 		let orderedSelection = selectedPhotoURLsInDisplayOrder()
-		guard orderedSelection.count <= 1 else { return }
-
-		guard let currentURL = orderedSelection.first else {
-			guard let firstURL = orderedPhotos.first else { return }
-			selectSinglePhoto(firstURL)
-			return
-		}
-
-		guard let currentIndex = orderedPhotos.firstIndex(of: currentURL) else { return }
-
-		let nextIndex: Int?
-		switch direction {
-		case .left:
-			nextIndex = currentIndex > 0 ? currentIndex - 1 : nil
-		case .right:
-			nextIndex = currentIndex + 1 < orderedPhotos.count ? currentIndex + 1 : nil
-		case .up:
-			let step = thumbnailColumnCount()
-			nextIndex = currentIndex >= step ? currentIndex - step : nil
-		case .down:
-			let step = thumbnailColumnCount()
-			nextIndex = currentIndex + step < orderedPhotos.count ? currentIndex + step : nil
-		}
-
-		guard let nextIndex, orderedPhotos.indices.contains(nextIndex) else { return }
-		let targetURL = orderedPhotos[nextIndex]
-
+		guard let targetURL = GalleryGridSelectionGeometry.nextSelectionURL(
+			orderedURLs: orderedPhotos,
+			orderedSelection: orderedSelection,
+			direction: direction,
+			columnCount: thumbnailColumnCount()
+		) else { return }
 		selectSinglePhoto(targetURL)
 	}
 
@@ -2585,9 +2472,7 @@ struct ContentView: View {
 	}
 
 	private func selectAllDisplayedPhotos() {
-		selectedItems.removeAll()
-		deselectedItemsFromAll.removeAll()
-		isAllDisplayedSelectionActive = true
+		selection.selectAllDisplayed()
 	}
 
 	private func recognizeDisplayedImagesWithOllama() {
@@ -2890,9 +2775,7 @@ struct ContentView: View {
 		suppressMarqueeDuringItemDrag = false
 		let modifierMode = marqueeSelectionModeForCurrentModifiers()
 		if !selectionMode && modifierMode == .replace {
-			selectedItems = [url]
-			deselectedItemsFromAll.removeAll()
-			isAllDisplayedSelectionActive = false
+			selection.selectSingle(url)
 			return
 		}
 
@@ -2900,9 +2783,7 @@ struct ContentView: View {
 		case .replace where selectionMode:
 			toggleSinglePhotoSelection(url)
 		case .replace:
-			selectedItems = [url]
-			deselectedItemsFromAll.removeAll()
-			isAllDisplayedSelectionActive = false
+			selection.selectSingle(url)
 		case .add:
 			addSinglePhotoSelection(url)
 		case .subtract:
@@ -2913,76 +2794,34 @@ struct ContentView: View {
 	}
 
 	private func addSinglePhotoSelection(_ url: URL) {
-		if isAllDisplayedSelectionActive {
-			deselectedItemsFromAll.remove(url)
-		} else {
-			selectedItems.insert(url)
-		}
+		selection.add(url)
 	}
 
 	private func toggleSinglePhotoSelection(_ url: URL) {
-		if isAllDisplayedSelectionActive {
-			if deselectedItemsFromAll.contains(url) {
-				deselectedItemsFromAll.remove(url)
-			} else {
-				deselectedItemsFromAll.insert(url)
-			}
-		} else if selectedItems.contains(url) {
-			selectedItems.remove(url)
-		} else {
-			selectedItems.insert(url)
-		}
+		selection.toggle(url)
 	}
 
 	private var currentSelectionRect: CGRect? {
-		guard let start = selectionDragStart, let current = selectionDragCurrent else { return nil }
-		let origin = CGPoint(x: min(start.x, current.x), y: min(start.y, current.y))
-		let size = CGSize(width: abs(current.x - start.x), height: abs(current.y - start.y))
-		if size.width < 2, size.height < 2 { return nil }
-		return CGRect(origin: origin, size: size)
+		GalleryGridSelectionGeometry.selectionRect(start: selectionDragStart, current: selectionDragCurrent)
 	}
 
 	private func updateDragSelection() {
 		guard let selectionRect = currentSelectionRect else { return }
-		let hits = thumbnailFrames.compactMap { (url, frame) -> URL? in
-			frame.intersects(selectionRect) ? url : nil
-		}
-		let hitSet = Set(hits)
-		isAllDisplayedSelectionActive = false
-		deselectedItemsFromAll.removeAll()
-		switch selectionDragMode {
-		case .replace:
-			selectedItems = hitSet
-		case .add:
-			selectedItems = selectionDragBase.union(hitSet)
-		case .subtract:
-			selectedItems = selectionDragBase.subtracting(hitSet)
-		case .toggle:
-			var next = selectionDragBase
-			for url in hitSet {
-				if next.contains(url) {
-					next.remove(url)
-				} else {
-					next.insert(url)
-				}
-			}
-			selectedItems = next
-		}
+		let hits = GalleryGridSelectionGeometry.hitURLs(in: selectionRect, thumbnailFrames: thumbnailFrames)
+		let nextSelection = GalleryGridSelectionGeometry.dragSelection(
+			base: selectionDragBase,
+			hits: hits,
+			mode: selectionDragMode
+		)
+		selection.replaceExplicitSelection(with: nextSelection)
 	}
 
 	private func marqueeSelectionModeForCurrentModifiers() -> MarqueeSelectionMode {
-		let flags = NSEvent.modifierFlags
-		if flags.contains(.command) { return .toggle }
-		if flags.contains(.option) { return .subtract }
-		if flags.contains(.shift) { return .add }
-		return .replace
+		GalleryGridSelectionGeometry.marqueeSelectionMode(for: NSEvent.modifierFlags)
 	}
 
 	private func thumbnailURL(at point: CGPoint) -> URL? {
-		for (url, frame) in thumbnailFrames where frame.contains(point) {
-			return url
-		}
-		return nil
+		GalleryGridSelectionGeometry.thumbnailURL(at: point, thumbnailFrames: thumbnailFrames)
 	}
 
 	private func beginSystemFileDrag(urls: [URL]) -> Bool {
@@ -3240,24 +3079,6 @@ struct ContentView: View {
 					vaultAlertMessage = "Thumbnail backfill failed: \(error.localizedDescription)"
 					showVaultAlert = true
 				}
-			}
-		}
-	}
-
-	private func warmFilesystemThumbnails(for items: [PhotoItem]) {
-		Task.detached(priority: .utility) {
-			for item in items {
-				if Task.isCancelled { break }
-				if ThumbnailCache.shared.memoryImage(for: item.url) != nil { continue }
-				if ThumbnailCache.shared.hydrateFromDiskIfAvailable(for: item.url) != nil { continue }
-				guard PhotoLibrary.shouldGenerateFilesystemThumbnail(for: item.url, forceLoad: false) else {
-					_ = ThumbnailCache.shared.hydrateFromDiskIfAvailable(for: item.url, requireFresh: false)
-					continue
-				}
-				do {
-					let img = try await ThumbnailGenerator.shared.generateThumbnail(for: item.url)
-					ThumbnailCache.shared.store(img, for: item.url)
-				} catch { }
 			}
 		}
 	}
@@ -3825,8 +3646,7 @@ struct ContentView: View {
 		activeSQLiteStoreName = storeNameForOpen
 		activeFolderNames = [storeNameForOpen]
 		WindowStateStore.shared.recordOpenSQLiteStore(named: storeNameForOpen)
-		selectedItems.removeAll()
-		deselectedItemsFromAll.removeAll()
+		selection.clear()
 		vaultStoreTask?.cancel()
 
 		let openedStoreName = storeNameForOpen
@@ -4297,22 +4117,8 @@ struct ContentView: View {
 		guard alert.runModal() == .alertFirstButtonReturn else { return nil }
 		return VaultImportOptions(
 			ignoreDuplicates: checkbox.state == .on,
-			keywords: Self.parseKeywordInput(field.stringValue)
+			keywords: PhotoMetadataService.parseKeywordInput(field.stringValue)
 		)
-	}
-
-	private static func parseKeywordInput(_ input: String) -> [String] {
-		var keywords: [String] = []
-		var seen: Set<String> = []
-		for part in input.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
-			let keyword = part.trimmingCharacters(in: .whitespacesAndNewlines)
-			guard !keyword.isEmpty else { continue }
-			let key = keyword.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-			if seen.insert(key).inserted {
-				keywords.append(keyword)
-			}
-		}
-		return keywords
 	}
 
 	private func importFolderToVault() {
@@ -4459,7 +4265,7 @@ struct ContentView: View {
 
 	private func importSelectedImagesToVault() {
 		let urls = selectedPhotoURLs
-		logger.log("vault store selected: requested selectedCount=\(urls.count, privacy: .public) allDisplayedActive=\(isAllDisplayedSelectionActive, privacy: .public)")
+		logger.log("vault store selected: requested selectedCount=\(urls.count, privacy: .public) allDisplayedActive=\(selection.isAllDisplayedSelectionActive, privacy: .public)")
 		guard !urls.isEmpty else { return }
 		storeImagesInVault(urls, progressMessage: "Storing selected photos...")
 	}
@@ -5173,7 +4979,7 @@ struct ContentView: View {
 					activeFolderNames = [vaultName]
 					vaultStatus = status
 					forceThumbnailLoading = true
-					selectedItems.removeAll()
+					selection.clear()
 				}
 
 				let workingURLs = try await PhotoVault.shared.loadWorkingCopies { completed, total, currentFile, loadedURLs in
@@ -5218,7 +5024,8 @@ struct ContentView: View {
 		panel.message = "Choose where exported photo files should be restored"
 		panel.prompt = "Export"
 		guard panel.runModal() == .OK, let folder = panel.url else { return }
-		let urls = selectedItems.isEmpty ? displayedPhotos.map(\.url) : Array(selectedItems)
+		let selectedURLs = selectedPhotoURLs
+		let urls = selectedURLs.isEmpty ? displayedPhotos.map(\.url) : selectedURLs
 		guard !urls.isEmpty else { return }
 
 		isVaultWorking = true
@@ -5395,7 +5202,7 @@ struct ContentView: View {
 												await MainActor.run { self.logger.log("scan:batch yielded=\(batchCopy.count, privacy: .public) total=\(library.photos.count, privacy: .public)") }
 												Task.detached { await Telemetry.shared.recordFound(batchCopy.count) }
 
-							warmFilesystemThumbnails(for: batchCopy)
+							ThumbnailWarmService.warmFilesystemThumbnails(for: batchCopy)
 											}
 										}
 									}
@@ -5626,7 +5433,7 @@ struct ContentView: View {
 					deleteErrorMessages[u] = errorCopy
 					deleteProgressCount += 1
 					if res {
-						selectedItems.remove(u)
+						selection.remove(u)
 						library.photos.removeAll { $0.url == u }
 						displayedPhotos.removeAll { $0.url == u }
 					}
@@ -5701,7 +5508,7 @@ struct ContentView: View {
 					deleteProgressCount += 1
 					if succeeded {
 						successCount += 1
-						selectedItems.remove(u)
+						selection.remove(u)
 						library.photos.removeAll { $0.url == u }
 						displayedPhotos.removeAll { $0.url == u }
 					} else {
@@ -5756,7 +5563,7 @@ struct ContentView: View {
 		if filter.isEmpty, activeSortMode == .alphaAsc {
 			displayedPhotos = library.photos
 			displayedPhotoSections = shouldGroupGridByDescription
-				? buildQuickPhotoSections(from: library.photos, sortMode: activeSortMode)
+				? GalleryPhotoSorter.quickSections(from: library.photos, sortMode: activeSortMode)
 				: []
 			return
 		}
@@ -5795,35 +5602,10 @@ struct ContentView: View {
 			return
 		}
 
-		// Quick-pass: update displayedPhotos with a filename-only match
-		// performed on the main actor so typing feels snappy.
-		if filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-			switch mode {
-			case .alphaAsc:
-				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending }
-			case .alphaDesc:
-				displayedPhotos = photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedDescending }
-			case .fileDate, .imageDate, .descriptionAsc, .descriptionDesc:
-				displayedPhotos = photos
-			}
-		} else {
-			// Quick pass uses cached filename + description + metadata when
-			// available; the debounced pass fills in uncached items.
-			if let regex = try? NSRegularExpression(pattern: filter, options: [.caseInsensitive]) {
-				let quick = photos.filter { p in
-					Self.matchesRegex(regex, in: MetadataCache.shared.cachedSearchCandidate(for: p.url))
-				}
-				displayedPhotos = quick
-			} else {
-				let needle = filter.lowercased()
-				displayedPhotos = photos.filter { p in
-					MetadataCache.shared.cachedSearchCandidate(for: p.url).lowercased().contains(needle)
-				}
-			}
-		}
+		displayedPhotos = GalleryPhotoSorter.quickSortedPhotos(photos, mode: mode, filter: filter)
 
 		if groupByDescription {
-			displayedPhotoSections = buildQuickPhotoSections(from: displayedPhotos, sortMode: mode)
+			displayedPhotoSections = GalleryPhotoSorter.quickSections(from: displayedPhotos, sortMode: mode)
 		} else {
 			displayedPhotoSections = []
 		}
@@ -5834,87 +5616,15 @@ struct ContentView: View {
 			// Short debounce window to avoid firing for every keystroke.
 			try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
 			if Task.isCancelled { return }
-			let sorted = await Self.computeSorted(photos: photos, mode: mode, filter: filter)
+			let sorted = await GalleryPhotoSorter.computeSorted(photos: photos, mode: mode, filter: filter)
 			if Task.isCancelled { return }
 			let sections = groupByDescription
-				? await Self.buildPhotoSections(from: sorted, sortMode: mode)
+				? await GalleryPhotoSorter.sections(from: sorted, sortMode: mode)
 				: []
 			await MainActor.run {
 				displayedPhotos = sorted
 				displayedPhotoSections = sections
 			}
-		}
-	}
-
-	private func buildQuickPhotoSections(from photos: [PhotoItem], sortMode: SortMode) -> [PhotoGridSection] {
-		var buckets: [String: [PhotoItem]] = [:]
-		var insertionOrder: [String] = []
-		for photo in photos {
-			let raw = MetadataCache.shared.cachedDescription(for: photo.url)?
-				.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-			let key = raw.isEmpty ? Self.noDescriptionSectionKey : raw
-			if buckets[key] == nil {
-				insertionOrder.append(key)
-				buckets[key] = []
-			}
-			buckets[key]?.append(photo)
-		}
-		return Self.orderedPhotoSections(
-			buckets: buckets,
-			insertionOrder: insertionOrder,
-			sortMode: sortMode
-		)
-	}
-
-	private static func buildPhotoSections(from photos: [PhotoItem], sortMode: SortMode) async -> [PhotoGridSection] {
-		var buckets: [String: [PhotoItem]] = [:]
-		var insertionOrder: [String] = []
-		for photo in photos {
-			let raw = await MetadataCache.shared.description(for: photo.url)?
-				.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-			let key = raw.isEmpty ? noDescriptionSectionKey : raw
-			if buckets[key] == nil {
-				insertionOrder.append(key)
-				buckets[key] = []
-			}
-			buckets[key]?.append(photo)
-		}
-		return orderedPhotoSections(
-			buckets: buckets,
-			insertionOrder: insertionOrder,
-			sortMode: sortMode
-		)
-	}
-
-	private static func orderedPhotoSections(
-		buckets: [String: [PhotoItem]],
-		insertionOrder: [String],
-		sortMode: SortMode
-	) -> [PhotoGridSection] {
-		let namedKeys = insertionOrder.filter { $0 != noDescriptionSectionKey }
-		var orderedKeys: [String]
-		switch sortMode {
-		case .descriptionAsc:
-			orderedKeys = namedKeys.sorted {
-				$0.localizedCaseInsensitiveCompare($1) == .orderedAscending
-			}
-		case .descriptionDesc:
-			orderedKeys = namedKeys.sorted {
-				$0.localizedCaseInsensitiveCompare($1) == .orderedDescending
-			}
-		default:
-			orderedKeys = namedKeys
-		}
-		if buckets[noDescriptionSectionKey] != nil {
-			orderedKeys.append(noDescriptionSectionKey)
-		}
-		return orderedKeys.compactMap { key in
-			guard let sectionPhotos = buckets[key], !sectionPhotos.isEmpty else { return nil }
-			return PhotoGridSection(
-				id: key,
-				title: key == noDescriptionSectionKey ? "No Description" : key,
-				photos: sectionPhotos
-			)
 		}
 	}
 
@@ -6011,306 +5721,19 @@ struct ContentView: View {
 		}
 	}
 
-	private static func matchesRegex(_ regex: NSRegularExpression, in text: String) -> Bool {
-		let range = NSRange(text.startIndex..<text.endIndex, in: text)
-		return regex.firstMatch(in: text, options: [], range: range) != nil
-	}
-
-	private static func computeSorted(photos: [PhotoItem], mode: SortMode, filter: String) async -> [PhotoItem] {
-		// If no filter provided, just sort normally.
-		let filtered: [PhotoItem]
-		if filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-			filtered = photos
-		} else {
-			// Attempt to compile the filter as a regular expression. If
-			// compilation fails, fall back to a case-insensitive substring
-			// match on filename, description, and other metadata.
-			if let regex = try? NSRegularExpression(pattern: filter, options: [.caseInsensitive]) {
-				var matches: [PhotoItem] = []
-				for p in photos {
-					let filename = p.url.lastPathComponent
-					if matchesRegex(regex, in: filename) {
-						matches.append(p)
-						continue
-					}
-					if let description = await MetadataCache.shared.description(for: p.url),
-					   !description.isEmpty,
-					   matchesRegex(regex, in: description) {
-						matches.append(p)
-						continue
-					}
-					let fullCandidate = await MetadataCache.shared.candidateString(for: p.url)
-					if matchesRegex(regex, in: fullCandidate) {
-						matches.append(p)
-					}
-				}
-				filtered = matches
-			} else {
-				let needle = filter.lowercased()
-				var matches: [PhotoItem] = []
-				for p in photos {
-					let filename = p.url.lastPathComponent.lowercased()
-					if filename.contains(needle) {
-						matches.append(p)
-						continue
-					}
-					if let description = await MetadataCache.shared.description(for: p.url),
-					   description.lowercased().contains(needle) {
-						matches.append(p)
-						continue
-					}
-					let full = await MetadataCache.shared.candidateString(for: p.url)
-					if full.lowercased().contains(needle) {
-						matches.append(p)
-					}
-				}
-				filtered = matches
-			}
-		}
-
-		return await Self.sortPhotos(filtered, mode: mode)
-	}
-
-	private static func sortPhotos(_ photos: [PhotoItem], mode: SortMode) async -> [PhotoItem] {
-		switch mode {
-		case .alphaAsc:
-			return photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedAscending }
-		case .alphaDesc:
-			return photos.sorted { $0.url.lastPathComponent.localizedCaseInsensitiveCompare($1.url.lastPathComponent) == .orderedDescending }
-		case .fileDate:
-			// Fetch file modification dates off the main thread.
-			return photos.sorted { a, b in
-				let da = (try? a.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-				let db = (try? b.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-				return da > db
-			}
-		case .imageDate:
-			// Try to read embedded image date metadata (EXIF/TIFF) and fall back
-			// to the file modification date.
-			let formatter = DateFormatter()
-			formatter.locale = Locale(identifier: "en_US_POSIX")
-			formatter.timeZone = .current
-			formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-
-			func imageDate(for url: URL) -> Date? {
-				guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-				guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else { return nil }
-				// EXIF
-				if let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any] {
-					if let dt = exif[kCGImagePropertyExifDateTimeOriginal] as? String, let d = formatter.date(from: dt) { return d }
-				}
-				// TIFF
-				if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-					if let dt = tiff[kCGImagePropertyTIFFDateTime] as? String, let d = formatter.date(from: dt) { return d }
-				}
-				return nil
-			}
-
-			return photos.sorted { a, b in
-				let da = imageDate(for: a.url) ?? (try? a.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-				let db = imageDate(for: b.url) ?? (try? b.url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-				return da > db
-			}
-		case .descriptionAsc, .descriptionDesc:
-			var descriptions: [String: String] = [:]
-			for photo in photos {
-				descriptions[photo.url.path] = await MetadataCache.shared.description(for: photo.url) ?? ""
-			}
-			return photos.sorted { a, b in
-				let da = descriptions[a.url.path] ?? ""
-				let db = descriptions[b.url.path] ?? ""
-				let aEmpty = da.isEmpty
-				let bEmpty = db.isEmpty
-				if aEmpty != bEmpty {
-					return !aEmpty && bEmpty
-				}
-				let cmp = da.localizedCaseInsensitiveCompare(db)
-				return mode == .descriptionAsc ? cmp == .orderedAscending : cmp == .orderedDescending
-			}
-		}
-	}
-
-	/// Builds a concatenated candidate string of filename and common image
-	/// metadata fields for regex matching. This may perform a lightweight
-	/// read of image properties and should be invoked off the main actor.
-	private static func buildMetadataCandidate(for url: URL, filename: String) async -> String {
-		var pieces: [String] = [filename]
-		guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-			return pieces.joined(separator: " ")
-		}
-		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
-			return pieces.joined(separator: " ")
-		}
-		func appendDict(_ key: CFString) {
-			if let dict = props[key] as? [CFString: Any] {
-				for (_, value) in dict {
-					if let s = value as? String {
-						pieces.append(s)
-					} else if let arr = value as? [String] {
-						pieces.append(contentsOf: arr)
-					}
-				}
-			}
-		}
-		appendDict(kCGImagePropertyExifDictionary)
-		appendDict(kCGImagePropertyTIFFDictionary)
-		appendDict(kCGImagePropertyIPTCDictionary)
-		// Also include any general title/description fields if present.
-		if let t = props[kCGImagePropertyPNGDictionary] as? [CFString: Any], let text = t[kCGImagePropertyPNGTitle] as? String {
-			pieces.append(text)
-		}
-		// Note: sidecars are not considered for search — keywords are only
-		// matched from embedded image metadata per application policy.
-
-		return pieces.joined(separator: " ")
-	}
-
 	/// Writes IPTC keywords to the image at `url`. Returns true on success.
 	/// This performs a best-effort rewrite of the image file with updated
 	/// metadata. It should be invoked off the main actor.
 	static func writeKeywords(to url: URL, keywords: [String]) async -> Bool {
-		await updateKeywords(on: url, keywords: keywords, mode: .append)
+		await PhotoMetadataService.writeKeywords(to: url, keywords: keywords)
 	}
 
 	static func replaceKeywords(on url: URL, keywords: [String]) async -> Bool {
-		await updateKeywords(on: url, keywords: keywords, mode: .replace)
+		await PhotoMetadataService.replaceKeywords(on: url, keywords: keywords)
 	}
 
 	static func readKeywords(from url: URL) async -> [String] {
-		await Task.detached(priority: .utility) {
-			guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-				  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-				  let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
-			else {
-				return []
-			}
-			return Self.mergedKeywords([], Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords]))
-		}.value
-	}
-
-	private enum KeywordWriteMode: Sendable {
-		case append
-		case replace
-	}
-
-	private static func updateKeywords(on url: URL, keywords: [String], mode: KeywordWriteMode) async -> Bool {
-		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
-		let targetURL: URL
-		if SQLiteObjectStore.isWorkingCopyURL(url) {
-			_ = AppWorkingDirectory.ensureAccess()
-			do {
-				targetURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
-			} catch {
-				logger.error("writeKeywords: failed to materialize sqlite working copy filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-				return false
-			}
-		} else {
-			targetURL = url
-		}
-		// Ensure security-scoped access if available
-		_ = await Self.ensureSecurityScopedAccess(for: targetURL)
-		// Read source
-		guard let src = CGImageSourceCreateWithURL(targetURL as CFURL, nil), let type = CGImageSourceGetType(src) else {
-			logger.log("writeKeywords: cannot create CGImageSource")
-			return false
-		}
-
-		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
-			logger.log("writeKeywords: cannot copy properties")
-			return false
-		}
-
-		var metadata = props
-		var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
-		let existingKeywords = Self.keywordStrings(from: iptc[kCGImagePropertyIPTCKeywords])
-		let nextKeywords: [String]
-		switch mode {
-		case .append:
-			nextKeywords = Self.mergedKeywords(existingKeywords, keywords)
-		case .replace:
-			nextKeywords = Self.mergedKeywords([], keywords)
-		}
-		iptc[kCGImagePropertyIPTCKeywords] = nextKeywords as CFArray
-		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
-
-		// Create a temporary file next to the original so moves are atomic
-		// and don't fail across volumes. Use a hidden filename to avoid
-		// exposing partial artifacts.
-		let fm = FileManager.default
-		let dir = targetURL.deletingLastPathComponent()
-		let tempFilename = ".pvtmp-\(UUID().uuidString)"
-		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(targetURL.pathExtension)
-
-		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
-			logger.error("writeKeywords: cannot create CGImageDestination")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
-			// Embedded write failed; do not fall back to sidecar per policy.
-			return false
-		}
-
-		CGImageDestinationAddImageFromSource(dest, src, 0, metadata as CFDictionary)
-		if !CGImageDestinationFinalize(dest) {
-			logger.error("writeKeywords: CGImageDestinationFinalize failed")
-			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
-			// Finalize failed; do not write sidecar – report failure so caller
-			// can surface an error or request additional permissions.
-			return false
-		}
-
-		do {
-			// Replace original file with temp file
-			let backupURL = targetURL.appendingPathExtension("backup")
-			if fm.fileExists(atPath: backupURL.path) { try? fm.removeItem(at: backupURL) }
-			try fm.moveItem(at: targetURL, to: backupURL)
-			try fm.moveItem(at: tempURL, to: targetURL)
-			try? fm.removeItem(at: backupURL)
-			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
-			if SQLiteObjectStore.isWorkingCopyURL(url) {
-				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
-				// Bytes are safely re-stored in the .sqlite database, so the
-				// materialized working copy doesn't need to persist on disk.
-				try? fm.removeItem(at: targetURL)
-			}
-			return true
-		} catch {
-			logger.error("writeKeywords: failed to replace original file: \(error.localizedDescription, privacy: .public)")
-			// Attempt to cleanup
-			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeKeywords", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
-			// Do not fall back to sidecar; surface failure to caller.
-			return false
-		}
-	}
-
-	private nonisolated static func keywordStrings(from value: Any?) -> [String] {
-		if let strings = value as? [String] {
-			return strings
-		}
-		if let array = value as? [Any] {
-			return array.compactMap { $0 as? String }
-		}
-		if let array = value as? NSArray {
-			return array.compactMap { $0 as? String }
-		}
-		if let string = value as? String {
-			return [string]
-		}
-		return []
-	}
-
-	private nonisolated static func mergedKeywords(_ existing: [String], _ appended: [String]) -> [String] {
-		var result: [String] = []
-		var seen: Set<String> = []
-		for keyword in existing + appended {
-			let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-			guard !trimmed.isEmpty else { continue }
-			let key = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-			if seen.insert(key).inserted {
-				result.append(trimmed)
-			}
-		}
-		return result
+		await PhotoMetadataService.readKeywords(from: url)
 	}
 
 	// MARK: - Description (person name) metadata writing
@@ -6319,88 +5742,7 @@ struct ContentView: View {
 	/// Person names (manual assignment or via recognition) are stored here.
 	/// Sets TIFF ImageDescription and IPTC Caption/Abstract.
 	static func writeDescription(to url: URL, description: String) async -> Bool {
-		await updateDescription(on: url, description: description)
-	}
-
-	private static func updateDescription(on url: URL, description: String) async -> Bool {
-		let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
-		let targetURL: URL
-		if SQLiteObjectStore.isWorkingCopyURL(url) {
-			_ = AppWorkingDirectory.ensureAccess()
-			do {
-				targetURL = try await SQLiteObjectStore.shared.materializeWorkingCopyIfNeeded(url)
-			} catch {
-				logger.error("writeDescription: failed to materialize sqlite working copy filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-				return false
-			}
-		} else {
-			targetURL = url
-		}
-		_ = await Self.ensureSecurityScopedAccess(for: targetURL)
-
-		guard let src = CGImageSourceCreateWithURL(targetURL as CFURL, nil),
-			  let type = CGImageSourceGetType(src) else {
-			logger.log("writeDescription: cannot create CGImageSource")
-			return false
-		}
-
-		guard let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
-			logger.log("writeDescription: cannot copy properties")
-			return false
-		}
-
-		var metadata = props
-
-		// Primary: TIFF ImageDescription (surfaced by app in thumbnails/search and commonly used for description)
-		var tiff = (metadata[kCGImagePropertyTIFFDictionary] as? [CFString: Any]) ?? [:]
-		tiff[kCGImagePropertyTIFFImageDescription] = description
-		metadata[kCGImagePropertyTIFFDictionary] = tiff as CFDictionary
-
-		// Also set standard IPTC caption field for interoperability with other tools
-		var iptc = (metadata[kCGImagePropertyIPTCDictionary] as? [CFString: Any]) ?? [:]
-		iptc[kCGImagePropertyIPTCCaptionAbstract] = description
-		metadata[kCGImagePropertyIPTCDictionary] = iptc as CFDictionary
-
-		// Create temp + atomic replace (same pattern as keywords)
-		let fm = FileManager.default
-		let dir = targetURL.deletingLastPathComponent()
-		let tempFilename = ".pvtmp-\(UUID().uuidString)"
-		let tempURL = dir.appendingPathComponent(tempFilename).appendingPathExtension(targetURL.pathExtension)
-
-		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
-			logger.error("writeDescription: cannot create CGImageDestination")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "CGImageDestinationCreateWithURL failed when attempting to write embedded metadata."])
-			return false
-		}
-
-		CGImageDestinationAddImageFromSource(dest, src, 0, metadata as CFDictionary)
-		if !CGImageDestinationFinalize(dest) {
-			logger.error("writeDescription: CGImageDestinationFinalize failed")
-			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "CGImageDestinationFinalize failed when attempting to write embedded metadata."])
-			return false
-		}
-
-		do {
-			let backupURL = targetURL.appendingPathExtension("backup")
-			if fm.fileExists(atPath: backupURL.path) { try? fm.removeItem(at: backupURL) }
-			try fm.moveItem(at: targetURL, to: backupURL)
-			try fm.moveItem(at: tempURL, to: targetURL)
-			try? fm.removeItem(at: backupURL)
-			await PhotoVault.shared.reencryptWorkingCopyIfNeeded(targetURL)
-			if SQLiteObjectStore.isWorkingCopyURL(url) {
-				try await SQLiteObjectStore.shared.storeObjectFile(at: targetURL)
-				// Bytes are safely re-stored in the .sqlite database, so the
-				// materialized working copy doesn't need to persist on disk.
-				try? fm.removeItem(at: targetURL)
-			}
-			return true
-		} catch {
-			logger.error("writeDescription: failed to replace original file: \(error.localizedDescription, privacy: .public)")
-			try? fm.removeItem(at: tempURL)
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": targetURL.path, "op": "writeDescription", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
-			return false
-		}
+		await PhotoMetadataService.writeDescription(to: url, description: description)
 	}
 
 	private func restoreSavedWindowsIfNeeded(skipSavedFolder: Bool) {
@@ -6470,7 +5812,7 @@ struct ContentView: View {
 							library.photos.append(contentsOf: slice)
 							library.lastScanDate = Date()
 						}
-						warmFilesystemThumbnails(for: slice)
+						ThumbnailWarmService.warmFilesystemThumbnails(for: slice)
 						idx = end
 						try? await Task.sleep(nanoseconds: 10_000_000) // 10ms gap between batches
 					}
@@ -6488,7 +5830,7 @@ struct ContentView: View {
 							// Ensure we still have the same folder before
 							// starting a potentially expensive re-scan.
 							if library.folderURL == folder {
-								if UserDefaults.standard.bool(forKey: "deferAtLaunchBackgroundWork") {
+								if UserDefaults.standard.bool(forKey: AppSettingsKey.deferAtLaunchBackgroundWork) {
 									logger.log("launch folder refresh: source=saved-window-state storage=filesystem result=deferred folder=\(folder.path, privacy: .public)")
 								} else {
 									logger.log("launch folder refresh: source=saved-window-state storage=filesystem result=started folder=\(folder.path, privacy: .public)")

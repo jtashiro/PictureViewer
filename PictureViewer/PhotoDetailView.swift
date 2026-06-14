@@ -125,7 +125,7 @@ struct FullScreenPhotoView: View {
 	}
 
 	@AppStorage("photoDisplayMode") private var displayMode: PhotoDisplayMode = .fullScreen
-	@AppStorage("useVLCForVideoPlayback") private var useVLCForVideoPlayback: Bool = false
+	@AppStorage(AppSettingsKey.useVLCForVideoPlayback) private var useVLCForVideoPlayback: Bool = false
 
 	@State private var image: NSImage?
 	@State private var player: AVPlayer?
