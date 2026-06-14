@@ -461,7 +461,7 @@ struct ContentView: View {
 
 		guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
 			logger.error("rotateImageFile: cannot create destination")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "CGImageDestinationCreateWithURL failed when attempting to rewrite image for rotation."])
+			EmbedWriteFailure(url: url, operation: "rotateImageFile", message: "CGImageDestinationCreateWithURL failed when attempting to rewrite image for rotation.").post()
 			// Embedded rewrite failed; do not fall back to sidecar per policy.
 			return false
 		}
@@ -473,7 +473,7 @@ struct ContentView: View {
 		if !CGImageDestinationFinalize(dest) {
 			try? fm.removeItem(at: tempURL)
 			logger.error("rotateImageFile: finalize failed")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "CGImageDestinationFinalize failed when attempting to rewrite image for rotation."])
+			EmbedWriteFailure(url: url, operation: "rotateImageFile", message: "CGImageDestinationFinalize failed when attempting to rewrite image for rotation.").post()
 			// Do not persist sidecar; report failure to the caller.
 			return false
 		}
@@ -490,7 +490,7 @@ struct ContentView: View {
 		} catch {
 			try? fm.removeItem(at: tempURL)
 			logger.error("rotateImageFile: failed to replace original file: \(error.localizedDescription, privacy: .public)")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": url.path, "op": "rotateImageFile", "message": "Failed to replace original file after writing temp file: \(error.localizedDescription)"])
+			EmbedWriteFailure(url: url, operation: "rotateImageFile", message: "Failed to replace original file after writing temp file: \(error.localizedDescription)").post()
 			// Do not fall back to sidecar; surface failure.
 			return false
 		}
@@ -536,18 +536,14 @@ struct ContentView: View {
 				.appendingPathExtension(url.pathExtension)
 			guard let dest = CGImageDestinationCreateWithURL(tempURL as CFURL, type, 1, nil) else {
 				logger.error("adjustBrightnessFile: cannot create destination")
-				NotificationCenter.default.post(name: .embedWriteFailed, object: nil,
-					userInfo: ["url": url.path, "op": "adjustBrightness",
-							   "message": "CGImageDestinationCreateWithURL failed"])
+				EmbedWriteFailure(url: url, operation: "adjustBrightness", message: "CGImageDestinationCreateWithURL failed").post()
 				return false
 			}
 			CGImageDestinationAddImage(dest, cgOut, props as CFDictionary?)
 			guard CGImageDestinationFinalize(dest) else {
 				try? fm.removeItem(at: tempURL)
 				logger.error("adjustBrightnessFile: finalize failed")
-				NotificationCenter.default.post(name: .embedWriteFailed, object: nil,
-					userInfo: ["url": url.path, "op": "adjustBrightness",
-							   "message": "CGImageDestinationFinalize failed"])
+				EmbedWriteFailure(url: url, operation: "adjustBrightness", message: "CGImageDestinationFinalize failed").post()
 				return false
 			}
 
@@ -857,8 +853,8 @@ struct ContentView: View {
 			copy: { copySelectedFiles() },
 			paste: { pasteFilesToVault() },
 			selectAll: { selectAllDisplayedPhotos() },
-			recognizeDisplayed: { recognizeDisplayedImagesWithOllama() },
-			recognizeSelected: { recognizeSelectedImagesWithOllama() },
+			recognizeDisplayed: { recognizeDisplayedMediaWithOllama() },
+			recognizeSelected: { recognizeSelectedMediaWithOllama() },
 			canCloseVault: isSQLiteObjectStoreView || isActiveVaultView || vaultStatus.isUnlocked,
 			canRenameVault: isActiveVaultView && library.folderURL != nil,
 			canImportSelected: hasSelectedPhotos,
@@ -871,8 +867,8 @@ struct ContentView: View {
 			canCopy: hasSelectedPhotos,
 			canPaste: canPasteFilesToVault,
 			canSelectAll: !displayedPhotos.isEmpty,
-			canRecognize: !displayedPhotos.isEmpty,
-			canRecognizeSelected: hasSelectedPhotos
+			canRecognize: !ollamaRecognitionURLs(selectedOnly: false).isEmpty,
+			canRecognizeSelected: !ollamaRecognitionURLs(selectedOnly: true).isEmpty
 		)
 	}
 
@@ -1367,10 +1363,10 @@ struct ContentView: View {
 			.padding()
 			.frame(minWidth: 360, minHeight: 140)
 		}
-		.onReceive(NotificationCenter.default.publisher(for: .embedWriteFailed)) { n in
-			if let info = n.userInfo as? [String: String] {
-				embedFailMessage = info["message"]
-				if let path = info["url"] { embedFailURL = URL(fileURLWithPath: path) }
+		.onReceive(NotificationCenter.default.publisher(for: .embedWriteFailed)) { notification in
+			if let failure = EmbedWriteFailure(notification: notification) {
+				embedFailMessage = failure.message
+				embedFailURL = failure.url
 			}
 			showEmbedWriteAlert = true
 		}
@@ -1393,7 +1389,7 @@ struct ContentView: View {
 		}
 		.sheet(isPresented: $isShowingOllamaPromptSheet) {
 			OllamaPromptSheet(
-				imageCount: ollamaRecognitionURLs(
+				mediaCount: ollamaRecognitionURLs(
 					selectedOnly: ollamaSheetUsesSelection,
 					explicit: ollamaSheetExplicitURLs
 				).count,
@@ -2205,7 +2201,7 @@ struct ContentView: View {
 			onCopyFiles: copyFilesToPasteboard,
 			onEditKeywords: { beginKeywordEditing(for: contextActionURLs(for: $0)) },
 			onRepairMetadata: triggerRepairMetadata,
-			onRecognizeWithOllama: { recognizeContextImagesWithOllama(contextActionURLs(for: $0)) }
+			onRecognizeWithOllama: { recognizeContextMediaWithOllama(contextActionURLs(for: $0)) }
 		)
 	}
 
@@ -2475,14 +2471,14 @@ struct ContentView: View {
 		selection.selectAllDisplayed()
 	}
 
-	private func recognizeDisplayedImagesWithOllama() {
+	private func recognizeDisplayedMediaWithOllama() {
 		guard !ollamaRecognitionURLs(selectedOnly: false).isEmpty else { return }
 		ollamaSheetUsesSelection = false
 		ollamaSheetExplicitURLs = nil
 		isShowingOllamaPromptSheet = true
 	}
 
-	private func recognizeSelectedImagesWithOllama() {
+	private func recognizeSelectedMediaWithOllama() {
 		guard !ollamaRecognitionURLs(selectedOnly: true).isEmpty else { return }
 		ollamaSheetUsesSelection = true
 		ollamaSheetExplicitURLs = nil
@@ -2498,16 +2494,21 @@ struct ContentView: View {
 		} else {
 			candidates = displayedPhotos.map(\.url)
 		}
-		return candidates.filter { url in
-			let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
-			return !PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
+		return candidates.filter(Self.isOllamaRecognitionEligible)
+	}
+
+	private nonisolated static func isOllamaRecognitionEligible(_ url: URL) -> Bool {
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if PhotoLibrary.isVideoMediaFile(url, contentType: contentType) {
+			return SQLiteObjectStore.isWorkingCopyURL(url)
 		}
+		return true
 	}
 
 	/// Invoked from a thumbnail's right-click context menu. `urls` is the set
 	/// returned by `contextActionURLs(for:)` — either the single right-clicked
 	/// photo or the current selection if the click happened on a selected cell.
-	private func recognizeContextImagesWithOllama(_ urls: [URL]) {
+	private func recognizeContextMediaWithOllama(_ urls: [URL]) {
 		let filtered = ollamaRecognitionURLs(selectedOnly: false, explicit: urls)
 		guard !filtered.isEmpty else { return }
 		ollamaSheetUsesSelection = false
@@ -2726,9 +2727,15 @@ struct ContentView: View {
 					guard shouldUpdateMetadata else { return }
 					let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 					guard !trimmed.isEmpty, trimmed.lowercased() != "none" else { return }
-					_ = await ContentView.writeKeywords(to: url, keywords: [trimmed])
-					await MainActor.run {
-						OllamaProgress.shared.markMetadataUpdated(for: url)
+					let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+					if PhotoLibrary.isVideoMediaFile(url, contentType: contentType),
+					   !SQLiteObjectStore.isWorkingCopyURL(url) {
+						return
+					}
+					if await ContentView.writeKeywords(to: url, keywords: [trimmed]) {
+						await MainActor.run {
+							OllamaProgress.shared.markMetadataUpdated(for: url)
+						}
 					}
 				}
 			)
@@ -4498,7 +4505,7 @@ struct ContentView: View {
 			operations.append(message.isEmpty ? "Person recognition" : message)
 		}
 		if isOllamaRecognitionRunning {
-			operations.append("Ollama image recognition")
+			operations.append("Ollama media recognition")
 		}
 		if isDeleting {
 			operations.append("Deleting files")

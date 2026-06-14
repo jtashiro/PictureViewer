@@ -1377,6 +1377,67 @@ actor SQLiteObjectStore {
         }
     }
 
+    func updateDescription(_ description: String, forWorkingFile url: URL) async -> Bool {
+        guard Self.isWorkingCopyURL(url),
+              let match = findLazyFile(for: url) else {
+            return false
+        }
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try withDatabase(at: match.file.dbURL) { db in
+                try Self.execPrepared(in: db, sql: "UPDATE objects SET description = ? WHERE id = ?;") { stmt, storage in
+                    try storage.bindText(trimmed.isEmpty ? nil : trimmed, at: 1, in: stmt)
+                    sqlite3_bind_int64(stmt, 2, match.file.id)
+                }
+            }
+            refreshMetadataCache(for: match, description: trimmed.isEmpty ? nil : trimmed, replaceDescription: true, keywords: nil, url: url)
+            return true
+        } catch {
+            logger.error("sqlite object store: description update failed filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    func updateKeywords(_ keywords: [String], forWorkingFile url: URL, replace: Bool) async -> Bool {
+        guard Self.isWorkingCopyURL(url),
+              let match = findLazyFile(for: url) else {
+            return false
+        }
+        do {
+            var nextKeywords: [String] = []
+            try withDatabase(at: match.file.dbURL) { db in
+                let existing = replace ? [] : (try Self.objectKeywords(id: match.file.id, in: db))
+                let merged = Self.normalizedKeywords(existing + keywords)
+                try Self.replaceKeywords(merged, forObjectID: match.file.id, in: db)
+                nextKeywords = merged
+            }
+            refreshMetadataCache(for: match, description: nil, replaceDescription: false, keywords: nextKeywords, url: url)
+            return true
+        } catch {
+            logger.error("sqlite object store: keyword update failed filename=\(url.lastPathComponent, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    private func refreshMetadataCache(
+        for match: (dbKey: String, file: LazyWorkingFile),
+        description: String?,
+        replaceDescription: Bool,
+        keywords: [String]?,
+        url: URL
+    ) {
+        let existing = loadedStoreContexts[match.dbKey]?.metadataCacheByObjectID[match.file.id]
+        let metadata = StoredObjectMetadata(
+            description: replaceDescription ? description : existing?.description,
+            keywords: keywords ?? existing?.keywords ?? []
+        )
+        if var context = loadedStoreContexts[match.dbKey] {
+            context.metadataCacheByObjectID[match.file.id] = metadata
+            loadedStoreContexts[match.dbKey] = context
+        }
+        MetadataCache.shared.seedDescription(metadata.description, for: url)
+    }
+
     func materializeWorkingCopyIfNeeded(_ url: URL) async throws -> URL {
         guard Self.isWorkingCopyURL(url) else { return url }
         let workingKey = Self.workingCopyKey(for: url)

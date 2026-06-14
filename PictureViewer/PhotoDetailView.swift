@@ -689,7 +689,7 @@ struct FullScreenPhotoView: View {
 			guard let dest = CGImageDestinationCreateWithURL(destinationURL as CFURL, type, 1, nil) else {
 				let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 				logger.error("photo-detail: cannot create CGImageDestination for destinationURL=\(destinationURL.path, privacy: .public) type=\(String(describing: type), privacy: .public)")
-				NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": sourceURL.path, "op": "photoDetailSave", "message": "CGImageDestinationCreateWithURL failed when attempting to save edited image."])
+				EmbedWriteFailure(url: sourceURL, operation: "photoDetailSave", message: "CGImageDestinationCreateWithURL failed when attempting to save edited image.").post()
 				// Per policy, do not write sidecars; report failure.
 				return nil
 			}
@@ -701,7 +701,7 @@ struct FullScreenPhotoView: View {
 			if !CGImageDestinationFinalize(dest) {
 				let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 				logger.error("photo-detail: CGImageDestinationFinalize failed for destinationURL=\(destinationURL.path, privacy: .public)")
-				NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": sourceURL.path, "op": "photoDetailSave", "message": "CGImageDestinationFinalize failed when attempting to save edited image."])
+				EmbedWriteFailure(url: sourceURL, operation: "photoDetailSave", message: "CGImageDestinationFinalize failed when attempting to save edited image.").post()
 				// Do not write sidecar; surface failure.
 				return nil
 			}
@@ -747,7 +747,7 @@ struct FullScreenPhotoView: View {
 			// not write a sidecar — log and surface failure.
 			let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
 			logger.error("photo-detail: saveEdits failed for \(sourceURL.path, privacy: .public)")
-			NotificationCenter.default.post(name: .embedWriteFailed, object: nil, userInfo: ["url": sourceURL.path, "op": "photoDetailSave", "message": "Failed to save edited image (pixel rewrite failed or permission error). "])
+			EmbedWriteFailure(url: sourceURL, operation: "photoDetailSave", message: "Failed to save edited image (pixel rewrite failed or permission error). ").post()
 		}
 	}
 }

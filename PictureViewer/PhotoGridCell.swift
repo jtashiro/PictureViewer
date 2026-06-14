@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct PhotoGridCell: View {
 	let url: URL
@@ -77,7 +78,16 @@ struct PhotoGridCell: View {
 			Button("Repair metadata", action: onRepairMetadata)
 			Divider()
 			Button(contextURLs.count > 1 ? "Recognize Selected with Ollama" : "Recognize with Ollama", action: onRecognizeWithOllama)
+				.disabled(!contextURLs.contains(where: Self.isOllamaRecognitionEligible))
 		}
+	}
+
+	private nonisolated static func isOllamaRecognitionEligible(_ url: URL) -> Bool {
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if PhotoLibrary.isVideoMediaFile(url, contentType: contentType) {
+			return SQLiteObjectStore.isWorkingCopyURL(url)
+		}
+		return true
 	}
 }
 

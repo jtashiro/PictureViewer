@@ -9,8 +9,8 @@ import ImageIO
 import UniformTypeIdentifiers
 import os
 
-/// Drives Ollama vision-model recognition for image files and logs the result
-/// as a single line per image via `os.Logger`. Sequential by design — vision
+/// Drives Ollama vision-model recognition for image and video files and logs the result
+/// as a single line per media item via `os.Logger`. Sequential by design — vision
 /// models are GPU-bound and parallel requests on a local Ollama server tend to
 /// starve resources.
 actor OllamaRecognizer {
@@ -61,7 +61,7 @@ actor OllamaRecognizer {
 		}
 	}
 	static let defaultModel = "llava"
-	static let defaultPrompt = "Describe this image in one sentence."
+	static let defaultPrompt = "Describe this image or video frame in one sentence."
 	private static let maxEdgePixels: CGFloat = 1024
 	private static let requestTimeout: TimeInterval = 120
 	private static let discoveryTimeout: TimeInterval = 15
@@ -142,16 +142,15 @@ actor OllamaRecognizer {
 	}
 
 	/// Sends `url` to Ollama and returns the recognition text, or throws.
-	/// The caller is responsible for skipping non-image files; this method
-	/// will throw if the URL can't be decoded as an image. The URL must point
-	/// to an on-disk file — batch callers should use `recognizeAndLog`, which
+	/// Images are encoded directly; videos are represented by a decoded frame.
+	/// The URL must point to an on-disk file — batch callers should use `recognizeAndLog`, which
 	/// materializes lazy SQLite working copies on demand and removes them
 	/// after the post-recognition callback completes.
 	/// `numCtx` overrides the Settings-stored value (used by retry logic on
 	/// truncation); pass nil to use the configured default.
 	func recognize(imageURL url: URL, prompt: String, model: String, numCtx: Int? = nil) async throws -> String {
 		try Task.checkCancellation()
-		guard let base64 = Self.encodedImageData(for: url) else {
+		guard let base64 = await Self.encodedMediaData(for: url) else {
 			throw RecognizerError.imageEncodingFailed
 		}
 		try Task.checkCancellation()
@@ -215,8 +214,8 @@ actor OllamaRecognizer {
 			|| lowered.contains("truncat")
 	}
 
-	/// Recognizes a sequence of image URLs sequentially, logging one line per
-	/// image and publishing progress to `OllamaProgress.shared`. Cancellation
+	/// Recognizes a sequence of media URLs sequentially, logging one line per
+	/// item and publishing progress to `OllamaProgress.shared`. Cancellation
 	/// cooperatively stops the sequence between items. `onRecognized` is
 	/// invoked after each successful recognition; the caller is responsible
 	/// for any post-processing (e.g. writing metadata + refreshing UI).
@@ -393,6 +392,47 @@ actor OllamaRecognizer {
 		return knownVisionPrefixes.contains { base.hasPrefix($0) }
 	}
 
+	/// Loads an image or representative video frame and returns base64-encoded
+	/// JPEG data suitable for Ollama's `images` field.
+	private static func encodedMediaData(for url: URL) async -> String? {
+		let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+		if PhotoLibrary.isVideoMediaFile(url, contentType: contentType) {
+			return await encodedVideoFrameData(for: url)
+		}
+		return encodedImageData(for: url)
+	}
+
+	private static func encodedVideoFrameData(for url: URL) async -> String? {
+		if let cached = await existingVideoThumbnailData(for: url) {
+			return cached.base64EncodedString()
+		}
+		do {
+			let image = try await ThumbnailGenerator.shared.generateRepresentativeVideoFrame(for: url, maxEdgePixels: maxEdgePixels)
+			guard let jpeg = ThumbnailCache.jpegData(from: image, compressionFactor: 0.8) else {
+				return nil
+			}
+			return jpeg.base64EncodedString()
+		} catch {
+			return nil
+		}
+	}
+
+	private static func existingVideoThumbnailData(for url: URL) async -> Data? {
+		if let hydrated = SQLiteObjectStore.peekHydratedThumbnailJPEGData(for: url), !hydrated.isEmpty {
+			return hydrated
+		}
+		if let cached = ThumbnailCache.shared.existingJPEGData(for: url), !cached.isEmpty {
+			return cached
+		}
+		if SQLiteObjectStore.isWorkingCopyURL(url),
+		   let stored = await SQLiteObjectStore.shared.thumbnailJPEGData(forWorkingFile: url),
+		   !stored.isEmpty {
+			ThumbnailCache.shared.storeJPEGData(stored, for: url)
+			return stored
+		}
+		return nil
+	}
+
 	/// Loads the image at `url`, downsizes if needed, and returns base64-encoded
 	/// JPEG data suitable for Ollama's `images` field. Returns nil if the file
 	/// can't be decoded as an image.
@@ -430,7 +470,7 @@ actor OllamaRecognizer {
 		var errorDescription: String? {
 			switch self {
 			case .imageEncodingFailed:
-				return "Could not decode image for Ollama"
+				return "Could not decode media for Ollama"
 			case .invalidResponse:
 				return "Ollama returned a non-HTTP response"
 			case .httpError(let status, let body):

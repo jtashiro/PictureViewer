@@ -285,7 +285,6 @@ struct ThumbnailView: View {
 
 	private func updateMetadataState() async {
 		if SQLiteObjectStore.isWorkingCopyURL(url),
-		   !FileManager.default.fileExists(atPath: url.path),
 		   let stored = await SQLiteObjectStore.shared.metadataForWorkingFile(url) {
 			await MainActor.run {
 				embeddedDescription = stored.description

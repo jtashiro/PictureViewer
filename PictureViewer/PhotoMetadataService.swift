@@ -5,6 +5,7 @@
 
 import Foundation
 import ImageIO
+import UniformTypeIdentifiers
 import os
 
 enum PhotoMetadataService {
@@ -36,7 +37,11 @@ enum PhotoMetadataService {
     }
 
     static func readKeywords(from url: URL) async -> [String] {
-        await Task.detached(priority: .utility) {
+        if SQLiteObjectStore.isWorkingCopyURL(url),
+           let stored = await SQLiteObjectStore.shared.metadataForWorkingFile(url) {
+            return stored.keywords
+        }
+        return await Task.detached(priority: .utility) {
             guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
                   let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
                   let iptc = props[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
@@ -53,6 +58,22 @@ enum PhotoMetadataService {
 
     private static func updateKeywords(on url: URL, keywords: [String], mode: KeywordWriteMode) async -> Bool {
         let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
+        let originalContentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        if PhotoLibrary.isVideoMediaFile(url, contentType: originalContentType) {
+            guard SQLiteObjectStore.isWorkingCopyURL(url) else {
+                logger.log("writeKeywords: embedded keyword writes are not supported for video files")
+                return false
+            }
+            let shouldReplace: Bool
+            switch mode {
+            case .append:
+                shouldReplace = false
+            case .replace:
+                shouldReplace = true
+            }
+            return await SQLiteObjectStore.shared.updateKeywords(keywords, forWorkingFile: url, replace: shouldReplace)
+        }
+
         let targetURL: URL
         if SQLiteObjectStore.isWorkingCopyURL(url) {
             _ = AppWorkingDirectory.ensureAccess()
@@ -103,6 +124,15 @@ enum PhotoMetadataService {
 
     private static func updateDescription(on url: URL, description: String) async -> Bool {
         let logger = Logger(subsystem: "com.example.PictureViewer", category: "metadata")
+        let originalContentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        if PhotoLibrary.isVideoMediaFile(url, contentType: originalContentType) {
+            guard SQLiteObjectStore.isWorkingCopyURL(url) else {
+                logger.log("writeDescription: embedded description writes are not supported for video files")
+                return false
+            }
+            return await SQLiteObjectStore.shared.updateDescription(description, forWorkingFile: url)
+        }
+
         let targetURL: URL
         if SQLiteObjectStore.isWorkingCopyURL(url) {
             _ = AppWorkingDirectory.ensureAccess()
@@ -211,11 +241,7 @@ enum PhotoMetadataService {
     }
 
     private static func postEmbedWriteFailure(url: URL, operation: String, message: String) {
-        NotificationCenter.default.post(
-            name: .embedWriteFailed,
-            object: nil,
-            userInfo: ["url": url.path, "op": operation, "message": message]
-        )
+        EmbedWriteFailure(url: url, operation: operation, message: message).post()
     }
 
     private nonisolated static func keywordStrings(from value: Any?) -> [String] {

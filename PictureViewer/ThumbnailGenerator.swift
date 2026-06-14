@@ -106,6 +106,42 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		}
 	}
 
+	func generateRepresentativeVideoFrame(for url: URL, maxEdgePixels: CGFloat = 1024) async throws -> NSImage {
+		_ = SecurityScopedResourceAccess.ensureAccess(for: url)
+		let maximumSize = CGSize(width: maxEdgePixels, height: maxEdgePixels)
+
+		if PhotoLibrary.requiresExternalVideoPlayer(url) {
+			guard EmbeddedVLCPlayerView.isAvailable else {
+				throw NSError(domain: "ThumbnailGenerator", code: 2, userInfo: [NSLocalizedDescriptionKey: "VLC is required to read this video format."])
+			}
+			await vlcLimiter.acquire()
+			defer { Task { await self.vlcLimiter.release() } }
+			return try await EmbeddedVLCPlayerView.generateThumbnail(for: url)
+		}
+
+		await limiter.acquire()
+		defer { Task { await limiter.release() } }
+
+		do {
+			let request = QLThumbnailGenerator.Request(fileAt: url, size: maximumSize, scale: screenScale, representationTypes: .thumbnail)
+			let representation = try await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
+			return representation.nsImage
+		} catch {
+			if AppLogLevel.current.allows(.debug) {
+				qlLogger.debug("generateRepresentativeVideoFrame: QuickLook failed url=\(url.path, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+			}
+		}
+
+		do {
+			return try await Self.generateVideoFrameThumbnail(for: url, maximumSize: maximumSize)
+		} catch {
+			guard EmbeddedVLCPlayerView.isAvailable else { throw error }
+			await vlcLimiter.acquire()
+			defer { Task { await self.vlcLimiter.release() } }
+			return try await EmbeddedVLCPlayerView.generateThumbnail(for: url)
+		}
+	}
+
 	private func generateStandardVideoThumbnail(for url: URL, quickLookError: Error) async throws -> NSImage {
 		do {
 			let fallback = try await Self.generateVideoFrameThumbnail(for: url)
@@ -142,11 +178,14 @@ final class ThumbnailGenerator: @unchecked Sendable {
 		return PhotoLibrary.isVideoMediaFile(url, contentType: contentType)
 	}
 
-	private static func generateVideoFrameThumbnail(for url: URL) async throws -> NSImage {
+	private static func generateVideoFrameThumbnail(
+		for url: URL,
+		maximumSize: CGSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
+	) async throws -> NSImage {
 		let asset = AVURLAsset(url: url)
 		let generator = AVAssetImageGenerator(asset: asset)
 		generator.appliesPreferredTrackTransform = true
-		generator.maximumSize = CGSize(width: ThumbnailCache.canonicalSize, height: ThumbnailCache.canonicalSize)
+		generator.maximumSize = maximumSize
 		let duration = try await asset.load(.duration)
 		let durationSeconds = duration.seconds.isFinite ? duration.seconds : 0
 		let requestedSeconds = durationSeconds > 31 ? 30 : max(0.1, durationSeconds * 0.5)

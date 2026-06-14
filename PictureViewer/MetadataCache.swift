@@ -165,6 +165,15 @@ nonisolated final class MetadataCache: @unchecked Sendable {
 		var parts: [String] = []
 		parts.append(url.lastPathComponent)
 
+		if SQLiteObjectStore.isWorkingCopyURL(url),
+		   let stored = await SQLiteObjectStore.shared.metadataForWorkingFile(url) {
+			if let description = stored.description, !description.isEmpty {
+				parts.append(description)
+			}
+			parts.append(contentsOf: stored.keywords)
+			return parts.joined(separator: " ")
+		}
+
 		let description = await readDescription(for: url)
 		if let description, !description.isEmpty {
 			parts.append(description)
@@ -213,8 +222,7 @@ nonisolated final class MetadataCache: @unchecked Sendable {
 	}
 
 	private static func readDescription(for url: URL) async -> String? {
-		if SQLiteObjectStore.isWorkingCopyURL(url),
-		   !FileManager.default.fileExists(atPath: url.path) {
+		if SQLiteObjectStore.isWorkingCopyURL(url) {
 			return await SQLiteObjectStore.shared.metadataForWorkingFile(url)?.description
 		}
 		return ImageEmbeddedMetadataReader.read(from: url).description

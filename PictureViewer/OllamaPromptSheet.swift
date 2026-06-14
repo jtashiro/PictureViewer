@@ -6,7 +6,7 @@
 import SwiftUI
 
 struct OllamaPromptSheet: View {
-	let imageCount: Int
+	let mediaCount: Int
 	let modelName: String
 	@Binding var prompt: String
 	@Binding var updateMetadata: Bool
@@ -17,10 +17,10 @@ struct OllamaPromptSheet: View {
 
 	var body: some View {
 		VStack(alignment: .leading, spacing: 14) {
-			Text("Recognize Images with Ollama")
+			Text("Recognize Media with Ollama")
 				.font(.headline)
 
-			Text("This prompt will be sent to \(modelName) together with each of the \(imageCount) displayed image\(imageCount == 1 ? "" : "s"). Use it to provide context (e.g. \"These are wedding photos from 2023. Describe each image and name visible people if you can.\"). Change the model in Settings → Ollama.")
+			Text("This prompt will be sent to \(modelName) together with each of the \(mediaCount) displayed media item\(mediaCount == 1 ? "" : "s"). Videos are recognized from a representative frame. Change the model in Settings → Ollama.")
 				.font(.caption)
 				.foregroundStyle(.secondary)
 				.fixedSize(horizontal: false, vertical: true)
@@ -56,8 +56,8 @@ struct OllamaPromptSheet: View {
 						.stroke(Color.secondary.opacity(0.3), lineWidth: 1)
 				}
 
-			Toggle("Update image metadata (keywords) with recognition result", isOn: $updateMetadata)
-				.help("When enabled, each recognition result is appended to the image's IPTC Keywords. Existing entries are preserved and duplicates are skipped.")
+			Toggle("Update media metadata (keywords) with recognition result", isOn: $updateMetadata)
+				.help("When enabled, each recognition result is appended to the file's IPTC Keywords where supported. Existing entries are preserved and duplicates are skipped.")
 
 			HStack {
 				Button("Reset to Default") {
