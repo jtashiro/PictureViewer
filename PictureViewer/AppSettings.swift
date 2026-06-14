@@ -1,4 +1,4 @@
-d//
+//
 //  AppSettings.swift
 //  PictureViewer
 //

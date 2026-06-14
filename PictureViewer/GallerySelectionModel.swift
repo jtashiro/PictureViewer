@@ -3,14 +3,14 @@
 //  PictureViewer
 //
 
-import SwiftUI
+import Combine
+import Foundation
 
 @MainActor
-@Observable
-final class GallerySelectionModel {
-    var selectedItems: Set<URL> = []
-    var isAllDisplayedSelectionActive = false
-    var deselectedItemsFromAll: Set<URL> = []
+final class GallerySelectionModel: ObservableObject {
+    @Published var selectedItems: Set<URL> = []
+    @Published var isAllDisplayedSelectionActive = false
+    @Published var deselectedItemsFromAll: Set<URL> = []
 
     func selectedCount(displayedPhotos: [PhotoItem]) -> Int {
         if isAllDisplayedSelectionActive {

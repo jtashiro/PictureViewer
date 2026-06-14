@@ -582,7 +582,7 @@ struct ContentView: View {
 	@State private var searchText: String = ""
 	@State private var isRefreshing = false
 	@State private var selectionMode: Bool = false
-	@State private var selection = GallerySelectionModel()
+	@StateObject private var selection = GallerySelectionModel()
 	@State private var thumbnailFrames: [URL: CGRect] = [:]
 	@State private var pendingThumbnailFrames: [URL: CGRect] = [:]
 	@State private var thumbnailFrameTask: Task<Void, Never>? = nil

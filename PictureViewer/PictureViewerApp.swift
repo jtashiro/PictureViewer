@@ -363,79 +363,74 @@ struct VaultFileCommands: Commands {
 
 	var body: some Commands {
 		CommandGroup(after: .newItem) {
-			Button("New…") {
-				vaultActions?.newItem()
-			}
-			.disabled(vaultActions == nil)
+				Button("New…") {
+					vaultActions?.newItem()
+				}
+				.disabled(vaultActions == nil)
 
-			Button("Open…") {
-				vaultActions?.openItem()
-			}
-			.disabled(vaultActions == nil)
+				Button("Open…") {
+					vaultActions?.openItem()
+				}
+				.disabled(vaultActions == nil)
 
-			Menu("Open Recent") {
-				ForEach(fileNavigation.recentFolders) { entry in
-					Button(entry.title) {
-						openFolderEntry(entry)
+				Menu("Open Recent") {
+					ForEach(fileNavigation.recentFolders) { entry in
+						Button(entry.title) {
+							openFolderEntry(entry)
+						}
+					}
+					if fileNavigation.recentFolders.isEmpty {
+						Button("No Recent Folders") {}
+							.disabled(true)
 					}
 				}
-				if fileNavigation.recentFolders.isEmpty {
-					Button("No Recent Folders") {}
-						.disabled(true)
-				}
-			}
 
-			Menu("Bookmarks") {
-				ForEach(fileNavigation.bookmarks) { entry in
-					Button(entry.title) {
-						openFolderEntry(entry)
+				Menu("Bookmarks") {
+					ForEach(fileNavigation.bookmarks) { entry in
+						Button(entry.title) {
+							openFolderEntry(entry)
+						}
 					}
+					if fileNavigation.bookmarks.isEmpty {
+						Button("No Bookmarks") {}
+							.disabled(true)
+					}
+					Divider()
+					Button("Manage Bookmarks…") {
+						fileNavigationActions?.showBookmarkManager()
+					}
+					.disabled(fileNavigationActions == nil)
 				}
-				if fileNavigation.bookmarks.isEmpty {
-					Button("No Bookmarks") {}
-						.disabled(true)
+
+				Menu("Open Session") {
+					ForEach(fileNavigation.sessionEntries) { entry in
+						Button(entry.title) {
+							openSessionEntry(entry)
+						}
+					}
+					if fileNavigation.sessionEntries.isEmpty {
+						Button("No Saved Session") {}
+							.disabled(true)
+					}
+					Divider()
+					Button("Restore Gallery Session") {
+						fileNavigationActions?.restoreSavedGallerySession()
+					}
+					.disabled(fileNavigation.sessionEntries.isEmpty || fileNavigationActions == nil)
 				}
+
 				Divider()
-				Button("Manage Bookmarks…") {
-					fileNavigationActions?.showBookmarkManager()
+
+				Button("Rename…") {
+					vaultActions?.renameVault()
 				}
-				.disabled(fileNavigationActions == nil)
-			}
+				.disabled(vaultActions?.canRenameVault != true)
 
-			Menu("Open Session") {
-				ForEach(fileNavigation.sessionEntries) { entry in
-					Button(entry.title) {
-						openSessionEntry(entry)
-					}
+				Button("Manage…") {
+					vaultActions?.manageVaults()
 				}
-				if fileNavigation.sessionEntries.isEmpty {
-					Button("No Saved Session") {}
-						.disabled(true)
-				}
-				Divider()
-				Button("Restore Gallery Session") {
-					fileNavigationActions?.restoreSavedGallerySession()
-				}
-				.disabled(fileNavigation.sessionEntries.isEmpty || fileNavigationActions == nil)
+				.disabled(vaultActions == nil)
 			}
-
-			Divider()
-
-			Button("Close") {
-				vaultActions?.closeVault()
-			}
-			.disabled(vaultActions?.canCloseVault != true)
-
-			Button("Rename…") {
-				vaultActions?.renameVault()
-			}
-			.disabled(vaultActions?.canRenameVault != true)
-
-			Button("Manage…") {
-				vaultActions?.manageVaults()
-			}
-			.disabled(vaultActions == nil)
-		}
 
 		CommandGroup(after: .importExport) {
 			Divider()
